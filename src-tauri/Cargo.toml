@@ -1,0 +1,36 @@
+[package]
+name = "nexora-game-studio"
+version = "0.1.0"
+description = "Local-first visual production studio foundation"
+authors = ["Nexora"]
+license = "Apache-2.0"
+edition = "2024"
+
+[lib]
+name = "nexora_game_studio_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = { version = "2", features = [] }
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+whoami = "1"
+dunce = "1"
+dirs = "6"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "ico"] }
+sha2 = "0.10"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
+tokio = { version = "1", features = ["time", "sync"] }
+which = "6"
+
+[dev-dependencies]
+tempfile = "3"
