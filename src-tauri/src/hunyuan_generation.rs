@@ -1,7 +1,6 @@
-use crate::{model3d_validation, project::ProjectState};
+use crate::project::ProjectState;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use reqwest::blocking::Client;
-use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use sha2::{Digest, Sha256};
@@ -106,7 +105,7 @@ pub fn resolve_source(
         return Ok(None);
     };
     let (path, registered_size, registered_checksum): (String, u64, String) = project.db.lock().unwrap().query_row(
-        "SELECT managed_master_path,file_size,checksum FROM assets WHERE asset_id=?1 AND project_id=?2 AND status='ready' AND media_kind='image'",
+        "SELECT managed_master_path,file_size,checksum FROM assets WHERE asset_id=?1 AND project_id=?2 AND status='ready' AND media_kind='image' AND (COALESCE(source_type, '') <> 'generated' OR EXISTS (SELECT 1 FROM asset_approvals WHERE asset_id=assets.asset_id AND status='approved'))",
         rusqlite::params![id, project.manifest.project_id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ).map_err(|_| HunyuanError::InvalidRequest("sourceAssetId must reference a READY image in the current project".into()))?;
@@ -246,7 +245,7 @@ pub fn run_hunyuan_generation(
         };
         let db = project.db.lock().unwrap();
         db.query_row(
-            "SELECT managed_master_path FROM assets WHERE asset_id=?1 AND project_id=?2 AND status='ready' AND media_kind='image'",
+            "SELECT managed_master_path FROM assets WHERE asset_id=?1 AND project_id=?2 AND status='ready' AND media_kind='image' AND (COALESCE(source_type, '') <> 'generated' OR EXISTS (SELECT 1 FROM asset_approvals WHERE asset_id=assets.asset_id AND status='approved'))",
             rusqlite::params![source_asset_id, project.manifest.project_id],
             |row| row.get::<_, String>(0),
         ).map_err(|_| HunyuanError::InvalidRequest("source asset not found".into()))?
@@ -260,18 +259,31 @@ pub fn run_hunyuan_generation(
         None
     };
 
-    // Call Hunyuan API
-    let client = Client::new();
+    // Call Hunyuan API. Per-request timeouts are mandatory: the Hunyuan
+    // server can crash mid-response (observed on 4 GB GPUs during mesh
+    // export), and without a total timeout the worker blocks forever in a
+    // socket read, freezing the job at its last progress step.
+    let client = Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(15 * 60))
+        .build()
+        .map_err(|e| HunyuanError::InvalidRequest(format!("http client: {e}")))?;
     let mut request_json = serde_json::json!({
-        "prompt": payload.request.prompt,
-        "negative_prompt": payload.request.negative_prompt,
-        "seed": payload.request.seed,
+        "text": payload.request.prompt,
     });
+    if let Some(seed) = payload.request.seed {
+        request_json["seed"] = serde_json::Value::Number(seed.into());
+    }
 
     if let Some(path) = input_path_buf {
         let image_bytes = fs::read(&path)?;
-        let b64 = BASE64_STANDARD.encode(&image_bytes);
-        request_json["source_image"] = serde_json::Value::String(b64);
+        // Normalize before sending: Hunyuan3D reconstructs whatever it is given,
+        // so scene details (streets, grass, neon haze) become garbage geometry.
+        // Isolate the subject onto a clean white square; on any failure the
+        // original bytes flow through unchanged.
+        let normalized = crate::source_normalization::normalize_source_image(&image_bytes);
+        let b64 = BASE64_STANDARD.encode(&normalized);
+        request_json["image"] = serde_json::Value::String(b64);
     }
 
     let response = client
@@ -296,7 +308,33 @@ pub fn run_hunyuan_generation(
     let mut asset_ids = Vec::new();
     let mut error_message: Option<String> = None;
 
+    let start_time = std::time::Instant::now();
+    // Shape generation on low-VRAM GPUs (4 GB) can take 30-45 minutes for a
+    // 20-step job, so allow up to 90 minutes before giving up.
+    let max_poll_duration = std::time::Duration::from_secs(90 * 60);
+    let mut last_progress_update = std::time::Instant::now();
+    let mut poll_failures: u32 = 0;
+
     while status == "pending" || status == "processing" {
+        if start_time.elapsed() > max_poll_duration {
+            return Err(HunyuanError::Unavailable(
+                "Hunyuan3D generation timed out after 90 minutes".into(),
+            ));
+        }
+
+        // Keep the UI informed: scale progress 5% -> 85% across the expected
+        // generation window so the job does not look stuck at 5%.
+        if last_progress_update.elapsed() >= std::time::Duration::from_secs(15) {
+            let elapsed_ms = start_time.elapsed().as_millis() as i64;
+            let window_ms = 45 * 60 * 1000; // expected duration on low-VRAM hardware
+            let scaled = 5 + ((elapsed_ms * 80) / window_ms).min(80);
+            let _ = project.db.lock().unwrap().execute(
+                "UPDATE jobs SET progress=?1, updated_at_ms=?2 WHERE job_id=?3 AND status='running' AND owner_token=?4",
+                rusqlite::params![scaled as i64, now_ms(), job_id, owner],
+            );
+            last_progress_update = std::time::Instant::now();
+        }
+
         // Check cancellation
         let cancelled = {
             let db = project.db.lock().unwrap();
@@ -312,10 +350,31 @@ pub fn run_hunyuan_generation(
         }
 
         std::thread::sleep(std::time::Duration::from_secs(5));
-        let status_response = client
+        // The status poll is best-effort: a transient failure (server busy,
+        // brief crash-restart) must not kill the job, but a persistently dead
+        // server should. Timeouts on the client bound each attempt.
+        let status_json: serde_json::Value = match client
             .get(&format!("http://127.0.0.1:8081/status/{}", uid))
-            .send()?;
-        let status_json: serde_json::Value = status_response.json()?;
+            .send()
+            .and_then(|r| r.error_for_status())
+            .and_then(|r| r.json())
+        {
+            Ok(value) => value,
+            Err(error) => {
+                poll_failures += 1;
+                eprintln!("[hunyuan-job {job_id}] /status failed ({poll_failures} consecutive): {error}");
+                // ~2 minutes of consecutive failures means the server is gone
+                // (observed crash during mesh export on 4 GB GPUs).
+                if poll_failures >= 24 || start_time.elapsed() > max_poll_duration {
+                    return Err(HunyuanError::Unavailable(format!(
+                        "Hunyuan3D unreachable during generation ({} consecutive poll failures): {error}",
+                        poll_failures
+                    )));
+                }
+                continue;
+            }
+        };
+        poll_failures = 0;
         status = status_json["status"]
             .as_str()
             .unwrap_or("unknown")
@@ -343,7 +402,7 @@ pub fn run_hunyuan_generation(
             let mut db = project.db.lock().unwrap();
             let tx = db.transaction()?;
             tx.execute(
-                "INSERT INTO assets (asset_id, project_id, original_filename, managed_master_path, file_size, checksum, imported_at_ms, status, source_type, media_kind, media_container, media_format, validation_level, model_metadata_schema_version, model_metadata_json) VALUES (?1,?2,'generated-model.glb',?3,?4,?5,?6,'ready','generated','model3d','GLB','glTF 2.0',?6,1,?7)",
+                "INSERT INTO assets (asset_id, project_id, original_filename, managed_master_path, file_size, checksum, imported_at_ms, status, source_type, media_kind, media_container, media_format, validation_level, model_metadata_schema_version, model_metadata_json) VALUES (?1,?2,'generated-model.glb',?3,?4,?5,?6,'ready','generated','model3d','GLB','glTF 2.0',?7,1,?8)",
                 rusqlite::params![
                     asset_id,
                     project.manifest.project_id,
@@ -374,6 +433,7 @@ pub fn run_hunyuan_generation(
                         "outputFormat": "glb",
                         "validationLevel": "structural"
                     }).to_string(),
+                    job_id,
                     now
                 ],
             )?;

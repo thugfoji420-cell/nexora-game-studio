@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 
-import { archiveProject, closeProject, createProject, getCurrentProject, getRecentProjects, openProject, presentProjectError } from "./core";
+import { archiveProject, closeProject, createProject, deleteProject, getCurrentProject, getRecentProjects, openProject, presentProjectError } from "./core";
 
 describe("project core service", () => {
   beforeEach(() => invoke.mockReset());
@@ -17,14 +17,28 @@ describe("project core service", () => {
     await getCurrentProject();
     await getRecentProjects();
     await archiveProject("C:\\Games\\Nexora");
+    await deleteProject("C:\\Games\\Nexora");
 
     expect(invoke.mock.calls).toEqual([
-      ["create_project", { root: "C:\\Games\\Nexora", name: "Nexora" }],
-      ["open_project", { root: "C:\\Games\\Nexora" }],
+      ["create_project", { root: "C:\\Games\\Nexora", name: "Nexora", engineScope: null }],
+      ["open_project", { root: "C:\\Games\\Nexora", engineScope: null }],
       ["close_project"],
       ["get_current_project"],
       ["get_recent_projects"],
       ["archive_project", { root: "C:\\Games\\Nexora" }],
+      ["delete_project", { root: "C:\\Games\\Nexora" }],
+    ]);
+  });
+
+  it("forwards the engine scope when one is provided", async () => {
+    invoke.mockResolvedValue(undefined);
+
+    await createProject("C:\\Games\\Nexora", "Nexora", "3d");
+    await openProject("C:\\Games\\Nexora", "image");
+
+    expect(invoke.mock.calls).toEqual([
+      ["create_project", { root: "C:\\Games\\Nexora", name: "Nexora", engineScope: "3d" }],
+      ["open_project", { root: "C:\\Games\\Nexora", engineScope: "image" }],
     ]);
   });
 

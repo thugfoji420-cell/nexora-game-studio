@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AppInfo, AppSettings, CreateProjectResult, ProjectInfo, RecentProjectInfo, UnityConfig, UnityProjectValidation } from "../types/core";
+import type { AppInfo, AppSettings, CreateProjectResult, EngineProjectScope, ProjectInfo, RecentProjectInfo } from "../types/core";
 
 export const getAppInfo = () => invoke<AppInfo>("get_app_info");
 
@@ -10,11 +10,11 @@ export const saveSettings = (settings: AppSettings) =>
 
 export const getLogLocation = () => invoke<string>("get_log_location");
 
-export const createProject = (root: string, name: string) =>
-  invoke<CreateProjectResult>("create_project", { root, name });
+export const createProject = (root: string, name: string, scope?: EngineProjectScope) =>
+  invoke<CreateProjectResult>("create_project", { root, name, engineScope: scope ?? null });
 
-export const openProject = (root: string) =>
-  invoke<CreateProjectResult>("open_project", { root });
+export const openProject = (root: string, scope?: EngineProjectScope) =>
+  invoke<CreateProjectResult>("open_project", { root, engineScope: scope ?? null });
 
 export const closeProject = () =>
   invoke<boolean>("close_project");
@@ -28,17 +28,17 @@ export const getRecentProjects = () =>
 export const archiveProject = (root: string) =>
   invoke<boolean>("archive_project", { root });
 
-export const discoverUnityProject = () =>
-  invoke<string | null>("discover_unity_project");
-
-export const validateUnityProject = (projectRoot: string) =>
-  invoke<UnityProjectValidation>("validate_unity_project", { projectRoot });
-
-export const saveUnityConfig = (config: UnityConfig) =>
-  invoke<UnityConfig>("save_unity_config", { config });
+export const deleteProject = (root: string) =>
+  invoke<boolean>("delete_project", { root });
 
 export const presentProjectError = (error: unknown): string => {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;
   return "Project operation failed.";
 };
+
+export const getSkipRuntimeStartup = () =>
+  invoke<boolean>("get_skip_runtime_startup");
+
+export const setSkipRuntimeStartup = (enabled: boolean) =>
+  invoke<boolean>("set_skip_runtime_startup", { enabled });

@@ -7,9 +7,13 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use tauri::Emitter;
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 use which::which;
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -145,6 +149,32 @@ impl RuntimeManager {
         self.app_handle = Some(handle);
     }
 
+    fn emit_status_changed(&self, runtime_id: &str, status: RuntimeStatus) {
+        if let Some(handle) = &self.app_handle {
+            let _ = handle.emit(
+                "runtime://status-changed",
+                serde_json::json!({
+                    "runtimeId": runtime_id,
+                    "status": status,
+                }),
+            );
+        }
+    }
+
+    fn emit_init_log(&self, level: &str, message: &str, runtime_id: Option<&str>) {
+        if let Some(handle) = &self.app_handle {
+            let _ = handle.emit(
+                "runtime://init-log",
+                serde_json::json!({
+                    "timestamp": Utc::now().to_rfc3339(),
+                    "level": level,
+                    "message": message,
+                    "runtimeId": runtime_id,
+                }),
+            );
+        }
+    }
+
     pub async fn register_runtime(&self, config: RuntimeConfig) -> Result<(), RuntimeError> {
         let mut runtimes = self.runtimes.lock().await;
         if runtimes.contains_key(&config.runtime_id) {
@@ -180,8 +210,18 @@ impl RuntimeManager {
         let state = runtimes
             .get_mut(runtime_id)
             .ok_or_else(|| RuntimeError::NotFound(runtime_id.to_string()))?;
+        let old_status = state.status;
         f(state);
-        Ok(state.clone())
+        let new_status = state.status;
+        let runtime_id_owned = state.config.runtime_id.clone();
+        if old_status != new_status {
+            drop(runtimes);
+            self.emit_status_changed(&runtime_id_owned, new_status);
+            let runtimes = self.runtimes.lock().await;
+            Ok(runtimes.get(runtime_id).cloned().unwrap())
+        } else {
+            Ok(state.clone())
+        }
     }
 
     pub async fn check_health(&self, runtime_id: &str) -> Result<RuntimeStatus, RuntimeError> {
@@ -190,6 +230,8 @@ impl RuntimeManager {
             state.config
         };
 
+        self.emit_init_log("info", &format!("Checking {} health", config.display_name), Some(runtime_id));
+
         let status = match config.runtime_type {
             RuntimeType::Automatic1111 => self.check_a1111_health(&config).await,
             RuntimeType::Hunyuan3D => self.check_hunyuan_health(&config).await,
@@ -197,9 +239,13 @@ impl RuntimeManager {
         };
 
         let (new_status, error_str) = match &status {
-            Ok(()) => (RuntimeStatus::Ready, None),
+            Ok(()) => {
+                self.emit_init_log("info", &format!("{} health check passed", config.display_name), Some(runtime_id));
+                (RuntimeStatus::Ready, None)
+            }
             Err(e) => {
                 let err_str = e.to_string();
+                self.emit_init_log("error", &format!("{} health check failed: {}", config.display_name, err_str), Some(runtime_id));
                 if err_str.contains("timeout") || err_str.contains("connection") {
                     (RuntimeStatus::Unavailable, Some(err_str))
                 } else {
@@ -247,19 +293,46 @@ impl RuntimeManager {
             .base_url
             .as_deref()
             .unwrap_or("http://127.0.0.1:8081");
+
+        // The /health endpoint can hang while the model is loading or under
+        // load, even though the service is listening. Try the HTTP health
+        // check first, but fall back to a TCP connect so a listening service
+        // is still detected as ready instead of being marked offline.
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15))
             .build()?;
+        match client.get(format!("{}/health", base_url)).send().await {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(response) => {
+                return Err(RuntimeError::HealthCheck(format!(
+                    "Hunyuan3D returned {}",
+                    response.status()
+                )))
+            }
+            Err(_) => {
+                // HTTP check failed (timeout or connect error). Fall back to a
+                // plain TCP connect — if the port answers, the service is up.
+            }
+        }
 
-        let response = client.get(format!("{}/docs", base_url)).send().await?;
-
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(RuntimeError::HealthCheck(format!(
-                "Hunyuan3D returned {}",
-                response.status()
-            )))
+        let host_port = base_url
+            .trim_start_matches("http://")
+            .trim_start_matches("https://");
+        let tcp_target = host_port.split('/').next().unwrap_or("127.0.0.1:8081");
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpStream::connect(tcp_target),
+        )
+        .await
+        {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(err)) => Err(RuntimeError::HealthCheck(format!(
+                "Hunyuan3D port not reachable: {}",
+                err
+            ))),
+            Err(_) => Err(RuntimeError::HealthCheck(
+                "Hunyuan3D health check timed out".into(),
+            )),
         }
     }
 
@@ -272,7 +345,17 @@ impl RuntimeManager {
                 RuntimeError::HealthCheck("Blender executable not configured".to_string())
             })?;
 
-        let output = Command::new(executable).arg("--version").output()?;
+        let mut cmd = Command::new(executable);
+        cmd.arg("--version");
+        // These are long-running services. Do not leave piped streams unread:
+        // Hunyuan3D emits enough startup logs to fill the OS pipe buffer and
+        // stall before its HTTP server becomes ready. The process is tracked
+        // below for shutdown, while its output is intentionally discarded.
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+        let output = cmd.output()?;
 
         if output.status.success() {
             Ok(())
@@ -299,6 +382,8 @@ impl RuntimeManager {
             ));
         }
 
+        self.emit_init_log("info", &format!("Starting {} service", config.display_name), Some(runtime_id));
+
         self.update_runtime_state(runtime_id, |state| {
             state.status = RuntimeStatus::Starting;
             state.startup_timestamp = Some(Utc::now());
@@ -314,16 +399,17 @@ impl RuntimeManager {
 
         let launcher_path = PathBuf::from(launcher);
         if !launcher_path.exists() {
+            let error_msg = format!("Launcher not found: {}", launcher_path.display());
+            self.emit_init_log("error", &error_msg, Some(runtime_id));
             self.update_runtime_state(runtime_id, |state| {
                 state.status = RuntimeStatus::Failed;
-                state.error = Some(format!("Launcher not found: {}", launcher_path.display()));
+                state.error = Some(error_msg.clone());
             })
             .await?;
-            return Err(RuntimeError::ProcessSpawn(format!(
-                "Launcher not found: {}",
-                launcher_path.display()
-            )));
+            return Err(RuntimeError::ProcessSpawn(error_msg));
         }
+
+        self.emit_init_log("info", &format!("Launcher found: {}", launcher_path.display()), Some(runtime_id));
 
         let working_dir = config
             .working_directory
@@ -342,12 +428,16 @@ impl RuntimeManager {
         cmd.envs(&config.environment);
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
 
         let mut child = cmd
             .spawn()
             .map_err(|e| RuntimeError::ProcessSpawn(e.to_string()))?;
 
         let pid = child.id();
+
+        self.emit_init_log("info", &format!("Process started (PID: {})", pid), Some(runtime_id));
 
         {
             let mut processes = self.child_processes.lock().await;
@@ -363,23 +453,31 @@ impl RuntimeManager {
         let start_time = Instant::now();
         let timeout = Duration::from_secs(180);
         let poll_interval = Duration::from_secs(2);
+        let mut poll_count = 0;
 
         while start_time.elapsed() < timeout {
             tokio::time::sleep(poll_interval).await;
+            poll_count += 1;
+
+            self.emit_init_log("info", &format!("Health check attempt {} ({}s elapsed)", poll_count, start_time.elapsed().as_secs()), Some(runtime_id));
 
             let health = self.check_health(runtime_id).await?;
             if health == RuntimeStatus::Ready {
+                let readiness_ms = start_time.elapsed().as_millis() as u64;
+                self.emit_init_log("info", &format!("{} ready ({}ms)", config.display_name, readiness_ms), Some(runtime_id));
                 self.update_runtime_state(runtime_id, |state| {
-                    state.readiness_time_ms = Some(start_time.elapsed().as_millis() as u64);
+                    state.readiness_time_ms = Some(readiness_ms);
                 })
                 .await?;
                 return Ok(());
             }
         }
 
+        let error_msg = format!("Timeout waiting for {} to become ready (180s)", config.display_name);
+        self.emit_init_log("error", &error_msg, Some(runtime_id));
         self.update_runtime_state(runtime_id, |state| {
             state.status = RuntimeStatus::Failed;
-            state.error = Some("Timeout waiting for service to become ready".to_string());
+            state.error = Some(error_msg);
         })
         .await?;
 
@@ -416,10 +514,14 @@ impl RuntimeManager {
     }
 
     pub async fn initialize_all(&self) -> Vec<(String, RuntimeStatus)> {
+        self.emit_init_log("info", "Starting runtime initialization", None);
+
         let runtime_ids: Vec<String> = {
             let runtimes = self.runtimes.lock().await;
             runtimes.keys().cloned().collect()
         };
+
+        self.emit_init_log("info", &format!("Found {} registered runtimes", runtime_ids.len()), None);
 
         let mut results = Vec::new();
         for runtime_id in runtime_ids {
@@ -428,21 +530,31 @@ impl RuntimeManager {
                 state.config.clone()
             };
 
+            self.emit_init_log("info", &format!("Processing {}", config.display_name), Some(&runtime_id));
+
             if !config.auto_start {
+                self.emit_init_log("info", &format!("{} is on-demand, checking health", config.display_name), Some(&runtime_id));
                 let status = self
                     .check_health(&runtime_id)
                     .await
                     .unwrap_or(RuntimeStatus::Failed);
+                self.emit_init_log(
+                    if status == RuntimeStatus::Ready { "info" } else { "warn" },
+                    &format!("{} status: {:?}", config.display_name, status),
+                    Some(&runtime_id),
+                );
                 results.push((runtime_id, status));
                 continue;
             }
 
+            self.emit_init_log("info", &format!("Checking if {} is already running", config.display_name), Some(&runtime_id));
             let health = self
                 .check_health(&runtime_id)
                 .await
                 .unwrap_or(RuntimeStatus::Failed);
 
             if health == RuntimeStatus::Ready {
+                self.emit_init_log("info", &format!("{} is already running", config.display_name), Some(&runtime_id));
                 self.update_runtime_state(&runtime_id, |state| {
                     state.started_by_nexora = false;
                 })
@@ -450,16 +562,24 @@ impl RuntimeManager {
                 .ok();
                 results.push((runtime_id, RuntimeStatus::Ready));
             } else {
+                self.emit_init_log("info", &format!("{} not running, starting...", config.display_name), Some(&runtime_id));
                 let start_result = self.start_runtime(&runtime_id).await;
                 let final_status = if start_result.is_ok() {
                     RuntimeStatus::Ready
                 } else {
                     RuntimeStatus::Failed
                 };
+                self.emit_init_log(
+                    if final_status == RuntimeStatus::Ready { "info" } else { "error" },
+                    &format!("{} initialization: {:?}", config.display_name, final_status),
+                    Some(&runtime_id),
+                );
                 results.push((runtime_id, final_status));
             }
         }
 
+        let ready_count = results.iter().filter(|(_, s)| *s == RuntimeStatus::Ready).count();
+        self.emit_init_log("info", &format!("Runtime initialization completed: {}/{} ready", ready_count, results.len()), None);
         results
     }
 
@@ -481,9 +601,33 @@ impl RuntimeManager {
 
     pub fn discover_a1111() -> Option<RuntimeConfig> {
         let base_path = PathBuf::from(r"C:\AI\stable-diffusion-webui");
+        let venv_python = base_path.join("venv").join("Scripts").join("python.exe");
+        let launch_py = base_path.join("launch.py");
         let launcher = base_path.join("webui-user.bat");
 
-        if launcher.exists() {
+        if venv_python.exists() && launch_py.exists() {
+            Some(RuntimeConfig {
+                runtime_id: "automatic1111".to_string(),
+                display_name: "Automatic1111".to_string(),
+                runtime_type: RuntimeType::Automatic1111,
+                kind: RuntimeKind::LongRunningService,
+                install_path: Some(base_path.to_string_lossy().to_string()),
+                launcher_path: Some(venv_python.to_string_lossy().to_string()),
+                base_url: Some("http://127.0.0.1:7860".to_string()),
+                health_endpoint: Some("/sdapi/v1/options".to_string()),
+                auto_start: true,
+                startup_args: vec![
+                    "launch.py".to_string(),
+                    "--api".to_string(),
+                    "--medvram".to_string(),
+                    "--nowebui".to_string(),
+                    "--port".to_string(),
+                    "7860".to_string(),
+                ],
+                working_directory: Some(base_path.to_string_lossy().to_string()),
+                environment: HashMap::new(),
+            })
+        } else if launcher.exists() {
             Some(RuntimeConfig {
                 runtime_id: "automatic1111".to_string(),
                 display_name: "Automatic1111".to_string(),
@@ -517,7 +661,7 @@ impl RuntimeManager {
                 install_path: Some(base_path.to_string_lossy().to_string()),
                 launcher_path: Some(python.to_string_lossy().to_string()),
                 base_url: Some("http://127.0.0.1:8081".to_string()),
-                health_endpoint: Some("/docs".to_string()),
+                health_endpoint: Some("/health".to_string()),
                 auto_start: true,
                 startup_args: vec![
                     entrypoint.to_string_lossy().to_string(),

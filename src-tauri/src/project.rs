@@ -53,10 +53,12 @@ pub struct ProjectManifest {
     pub name: String,
     pub created_at_ms: u128,
     pub format_version: String,
+    #[serde(default)]
+    pub engine_scope: Option<String>,
 }
 
 impl ProjectManifest {
-    pub fn new(name: String) -> Self {
+    pub fn new_scoped(name: String, engine_scope: Option<String>) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -67,7 +69,12 @@ impl ProjectManifest {
             name,
             created_at_ms: now,
             format_version: env!("CARGO_PKG_VERSION").to_string(),
+            engine_scope,
         }
+    }
+
+    pub fn new(name: String) -> Self {
+        Self::new_scoped(name, None)
     }
 
     pub fn validate(&self) -> Result<(), ProjectError> {
@@ -109,13 +116,31 @@ pub struct ProjectState {
 
 impl ProjectState {
     pub fn open(root: &Path) -> Result<Self, ProjectError> {
+        Self::open_scoped(root, None)
+    }
+
+    pub fn open_scoped(root: &Path, expected_scope: Option<&str>) -> Result<Self, ProjectError> {
         let canonical_root = canonicalize_path(root)?;
         let manifest_path = canonical_root.join(MANIFEST_FILENAME);
         let database_path = canonical_root.join(DATABASE_FILENAME);
         let lock_path = canonical_root.join(LOCK_FILENAME);
 
-        let manifest = load_manifest(&manifest_path)?;
+        let mut manifest = load_manifest(&manifest_path)?;
         manifest.validate()?;
+        if let Some(expected_scope) = expected_scope {
+            match manifest.engine_scope.as_deref() {
+                Some(actual_scope) if actual_scope != expected_scope => {
+                    return Err(ProjectError::InvalidRoot(format!(
+                        "project belongs to the {actual_scope} engine, not {expected_scope}"
+                    )));
+                }
+                None => {
+                    manifest.engine_scope = Some(expected_scope.to_string());
+                    save_manifest(&manifest_path, &manifest)?;
+                }
+                _ => {}
+            }
+        }
 
         let db = rusqlite::Connection::open(&database_path)?;
         Self::run_migrations(&db)?;
@@ -137,6 +162,10 @@ impl ProjectState {
     }
 
     pub fn create(root: &Path, name: &str) -> Result<Self, ProjectError> {
+        Self::create_scoped(root, name, None)
+    }
+
+    pub fn create_scoped(root: &Path, name: &str, engine_scope: Option<&str>) -> Result<Self, ProjectError> {
         let canonical_root = canonicalize_path(root)?;
 
         let manifest_path = canonical_root.join(MANIFEST_FILENAME);
@@ -151,7 +180,7 @@ impl ProjectState {
 
         fs::create_dir_all(&canonical_root)?;
 
-        let manifest = ProjectManifest::new(name.to_string());
+        let manifest = ProjectManifest::new_scoped(name.to_string(), engine_scope.map(str::to_string));
         save_manifest(&manifest_path, &manifest)?;
 
         let db = rusqlite::Connection::open(&database_path)?;
@@ -271,6 +300,29 @@ impl ProjectState {
             )?;
         }
 
+        // Migration 12: allow hunyuan.generate job type (feature shipped in
+        // code but the jobs CHECK constraint was never updated)
+        let version: u32 = db.query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+            row.get(0)
+        })?;
+        if version < 12 {
+            let migration = db.execute_batch(include_str!("../migrations/012_hunyuan_jobs.sql"));
+            db.pragma_update(None, "foreign_keys", true)?;
+            migration?;
+        }
+
+        // Migration 13: widen material_status on model3d_processing_jobs (the old
+        // CHECK rejected real Blender states like 'standard_pbr', silently dropping
+        // every persisted processing result)
+        let version: u32 = db.query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+            row.get(0)
+        })?;
+        if version < 13 {
+            let migration = db.execute_batch(include_str!("../migrations/013_material_status_widen.sql"));
+            db.pragma_update(None, "foreign_keys", true)?;
+            migration?;
+        }
+
         Ok(())
     }
 
@@ -292,10 +344,21 @@ impl ProjectState {
         if metadata.len() > 0 {
             let existing: LockData = serde_json::from_slice(&fs::read(&self.lock_path)?)
                 .map_err(|_| ProjectError::Lock("corrupt lock file".into()))?;
-            return Err(ProjectError::StaleLock(format!(
-                "project locked by pid {} on {} since {}",
-                existing.pid, existing.host, existing.acquired_at_ms
-            )));
+            // A lock left behind by a process that is no longer running is a
+            // stale lock (e.g. after a crash or force-kill). Verify the PID is
+            // still alive on this host before honoring the lock; otherwise
+            // take it over by truncating the file and continuing below.
+            if existing.host == whoami::username() && Self::process_is_alive(existing.pid) {
+                return Err(ProjectError::StaleLock(format!(
+                    "project locked by pid {} on {} since {}",
+                    existing.pid, existing.host, existing.acquired_at_ms
+                )));
+            }
+            let mut lock_file = fs::OpenOptions::new()
+                .write(true)
+                .open(&self.lock_path)?;
+            lock_file.set_len(0)?;
+            lock_file.flush()?;
         }
 
         serde_json::to_writer(&mut lock_file, &lock_data)?;
@@ -312,6 +375,32 @@ impl ProjectState {
             let _ = file.flush();
         }
         Ok(())
+    }
+
+    /// Best-effort check whether a process with the given PID exists on this
+    /// machine. Used to detect stale project locks left by crashed or
+    /// force-killed app instances. PIDs can be recycled, so this can rarely
+    /// produce a false positive; the user can always remove `.nexora.lock`
+    /// manually in that case.
+    fn process_is_alive(pid: u32) -> bool {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            let output = std::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+            match output {
+                Ok(out) => String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\"")),
+                Err(_) => true, // Cannot verify; assume alive rather than stealing an active lock.
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = pid;
+            true // Cannot verify portably; assume alive rather than stealing an active lock.
+        }
     }
 
     pub fn execution_enabled(&self) -> bool {
@@ -404,6 +493,61 @@ pub fn save_manifest(path: &Path, manifest: &ProjectManifest) -> Result<(), Proj
     Ok(())
 }
 
+/// Characters Windows forbids in a file or directory name.
+const INVALID_WINDOWS_NAME_CHARS: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+
+/// Windows reserved device names that cannot be used as a directory name.
+const RESERVED_WINDOWS_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Validate a project name for use as a single directory name.
+///
+/// The trimmed name is used verbatim so the on-disk folder matches what the
+/// user typed. Names that cannot be represented safely on the filesystem are
+/// rejected with a clear error rather than silently rewritten.
+pub fn sanitize_project_dir_name(name: &str) -> Result<String, ProjectError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(ProjectError::InvalidRoot("project name is empty".into()));
+    }
+    if trimmed == "." || trimmed == ".." {
+        return Err(ProjectError::InvalidRoot(format!(
+            "project name '{trimmed}' is not a valid folder name"
+        )));
+    }
+    if trimmed
+        .chars()
+        .any(|c| (c as u32) < 0x20 || INVALID_WINDOWS_NAME_CHARS.contains(&c))
+    {
+        return Err(ProjectError::InvalidRoot(format!(
+            "project name '{trimmed}' contains characters that are not allowed in a folder name"
+        )));
+    }
+    if trimmed.ends_with('.') {
+        return Err(ProjectError::InvalidRoot(format!(
+            "project name '{trimmed}' cannot end with a dot"
+        )));
+    }
+    let stem = trimmed.split('.').next().unwrap_or(trimmed);
+    if RESERVED_WINDOWS_NAMES.contains(&stem.to_ascii_uppercase().as_str()) {
+        return Err(ProjectError::InvalidRoot(format!(
+            "project name '{trimmed}' is a reserved Windows device name"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Build the final project root from a user-selected PARENT directory and the
+/// project name: `<parent>/<sanitized name>`. Treating the selected location as
+/// the parent gives every project its own independent directory, so creating a
+/// second project under the same parent never collides with the first.
+pub fn resolve_new_project_root(parent: &Path, name: &str) -> Result<PathBuf, ProjectError> {
+    let dir_name = sanitize_project_dir_name(name)?;
+    Ok(parent.join(dir_name))
+}
+
 fn check_no_overlap(root: &Path) -> Result<(), ProjectError> {
     let canonical_root = canonicalize_path(root)?;
 
@@ -484,6 +628,80 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_rejects_unsafe_dir_names() {
+        for bad in ["", "   ", ".", "..", "a/b", "a\\b", "bad:name", "pipe|name", "star*name", "CON", "nul.txt", "trailing."] {
+            assert!(
+                matches!(sanitize_project_dir_name(bad), Err(ProjectError::InvalidRoot(_))),
+                "expected '{bad}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_trims_and_accepts_safe_names() {
+        assert_eq!(sanitize_project_dir_name("  Neon Racing  ").unwrap(), "Neon Racing");
+        assert_eq!(sanitize_project_dir_name("Project-B_1").unwrap(), "Project-B_1");
+    }
+
+    #[test]
+    fn resolve_new_project_root_joins_parent_and_name() {
+        let root = resolve_new_project_root(Path::new("D:\\NexoraProjects"), "Neon Racing").unwrap();
+        assert_eq!(root.file_name().unwrap(), "Neon Racing");
+        assert_eq!(root.parent().unwrap(), Path::new("D:\\NexoraProjects"));
+    }
+
+    #[test]
+    fn create_second_project_while_first_is_open_stays_independent() {
+        let parent = tempdir().unwrap();
+        let root_a = resolve_new_project_root(parent.path(), "Project A").unwrap();
+        let a = ProjectState::create_scoped(&root_a, "Project A", Some("3d")).unwrap();
+        let a_id = a.manifest.project_id.clone();
+        let a_root = a.root().clone();
+        // Project A is intentionally left open (its lock is held in A's folder).
+
+        let root_b = resolve_new_project_root(parent.path(), "Project B").unwrap();
+        let b = ProjectState::create_scoped(&root_b, "Project B", Some("image")).unwrap();
+        let b_id = b.manifest.project_id.clone();
+        let b_root = b.root().clone();
+
+        // Independent identities, roots, and scopes — nothing reused from A.
+        assert_ne!(a_id, b_id);
+        assert_ne!(a_root, b_root);
+        assert_eq!(a_root.parent(), b_root.parent());
+        assert_eq!(a_root.file_name().unwrap(), "Project A");
+        assert_eq!(b_root.file_name().unwrap(), "Project B");
+        assert_eq!(b.manifest.engine_scope.as_deref(), Some("image"));
+        assert!(a_root.join(MANIFEST_FILENAME).exists());
+        assert!(b_root.join(MANIFEST_FILENAME).exists());
+        assert!(b_root.join(DATABASE_FILENAME).exists());
+
+        b.close().unwrap();
+        a.close().unwrap();
+
+        // Reopening each yields its own manifest/scope with no cross-leakage.
+        let ra = ProjectState::open_scoped(&a_root, Some("3d")).unwrap();
+        assert_eq!(ra.manifest.project_id, a_id);
+        assert_eq!(ra.manifest.engine_scope.as_deref(), Some("3d"));
+        ra.close().unwrap();
+        let rb = ProjectState::open_scoped(&b_root, Some("image")).unwrap();
+        assert_eq!(rb.manifest.project_id, b_id);
+        assert_eq!(rb.manifest.engine_scope.as_deref(), Some("image"));
+        rb.close().unwrap();
+    }
+
+    #[test]
+    fn create_same_name_under_parent_reports_already_exists() {
+        let parent = tempdir().unwrap();
+        let root = resolve_new_project_root(parent.path(), "Dup").unwrap();
+        ProjectState::create_scoped(&root, "Dup", None)
+            .unwrap()
+            .close()
+            .unwrap();
+        let err = ProjectState::create_scoped(&root, "Dup", None).unwrap_err();
+        assert!(matches!(err, ProjectError::AlreadyExists(_)));
+    }
+
+    #[test]
     fn reject_duplicate_project() {
         let dir = tempdir().unwrap();
         let root = dir.path().join("TestProject");
@@ -545,6 +763,7 @@ mod tests {
             name: "Bad".into(),
             created_at_ms: 0,
             format_version: "0.0.0".into(),
+            engine_scope: None,
         };
         save_manifest(&root.join(MANIFEST_FILENAME), &manifest).unwrap();
         let err = ProjectState::open(&root).unwrap_err();
@@ -593,7 +812,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             (assets, jobs, events, version, source.as_str()),
-            (1, 0, 0, 11, "imported")
+            (1, 0, 0, 13, "imported")
         );
     }
 
@@ -626,7 +845,7 @@ mod tests {
             db.query_row("SELECT COUNT(*) FROM job_events WHERE job_id='job-1'", [], |row| row.get(0))?,
             db.query_row("SELECT MAX(version) FROM schema_version", [], |row| row.get(0))?,
         ))).unwrap();
-        assert_eq!(preserved, (1, 1, 1, 11));
+        assert_eq!(preserved, (1, 1, 1, 13));
         project.with_db(|db| {
             db.execute("INSERT INTO jobs (job_id, job_type, status, payload_json, created_at_ms, updated_at_ms, max_attempts) VALUES ('job-2', 'provider.diagnostic', 'queued', '{}', 3, 3, 1)", [])?;
             Ok(())
@@ -665,7 +884,7 @@ mod tests {
             db.query_row("SELECT media_width FROM assets WHERE asset_id='image-asset'", [], |row| row.get(0))?,
             db.query_row("SELECT MAX(version) FROM schema_version", [], |row| row.get(0))?,
         ))).unwrap();
-        assert_eq!(preserved, (1, 1, 1, "image".into(), Some(64), 11));
+        assert_eq!(preserved, (1, 1, 1, "image".into(), Some(64), 13));
     }
 
     #[test]

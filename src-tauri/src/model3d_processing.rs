@@ -1,20 +1,11 @@
 use crate::{model3d_validation, project::ProjectState};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf};
+use std::fs;
 use thiserror::Error;
 use uuid::Uuid;
 
 pub const MODEL3D_PROCESSING_PROFILE_ID: &str = "foundation.processing.v1";
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProcessingProfile {
-    #[serde(rename = "generic")]
-    Generic,
-    #[serde(rename = "vehicle")]
-    Vehicle,
-}
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -30,7 +21,7 @@ pub enum ProcessingQuality {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Model3dProcessingResult {
     pub job_id: String,
     pub status: String,
@@ -50,7 +41,7 @@ pub struct Model3dProcessingResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ProcessingReport {
     pub vertices_before: u64,
     pub vertices_after: u64,
@@ -74,6 +65,22 @@ pub struct ProcessingReport {
     pub lod0_triangles: Option<u64>,
     pub lod1_triangles: Option<u64>,
     pub lod2_triangles: Option<u64>,
+    #[serde(default)]
+    pub collision_generated: Option<bool>,
+    #[serde(default)]
+    pub collision_triangles: Option<u64>,
+    #[serde(default)]
+    pub quality_score: Option<u32>,
+    #[serde(default)]
+    pub quality_rating: Option<String>,
+    #[serde(default)]
+    pub category_detected: String,
+    #[serde(default)]
+    pub category_confidence: f32,
+    #[serde(default)]
+    pub category_needs_review: bool,
+    #[serde(default)]
+    pub category_details: serde_json::Value,
     pub vehicle_detected: bool,
     pub wheel_candidates: u32,
     pub wheel_separation_possible: bool,
@@ -111,7 +118,7 @@ pub fn get_result(
         Option<String>,
     )> = {
         db.query_row(
-            "SELECT status, processing_stage, progress, output_master_path, lod0_path, lod1_path, lod2_path, vehicle_analysis_path, material_status, error_code, error_message, blender_log_path FROM model3d_processing_jobs WHERE job_id=?1",
+            "SELECT j.status, p.processing_stage, p.progress, p.output_master_path, p.lod0_path, p.lod1_path, p.lod2_path, p.vehicle_analysis_path, p.material_status, p.error_code, p.error_message, p.blender_log_path FROM model3d_processing_jobs p JOIN jobs j ON j.job_id = p.job_id WHERE p.job_id=?1",
             rusqlite::params![job_id],
             |row| Ok((
                 row.get(0)?,

@@ -12,12 +12,18 @@ import {
   canApproveAsset,
   canRejectAsset,
   canReprocessAsset,
+  discoverUnityProject,
+  detectEngineTargets,
+  validateUnityProject,
+  deployModel3dToUnity,
 } from "../services/model3dProcessing";
 import { formatCapability, listProviders, presentFit, presentHealth } from "../services/providers";
 import { Model3dViewer } from "../components/Model3dViewer";
+import { AssetReadinessReport } from "../components/AssetReadinessReport";
 import {
   MODEL3D_PROCESSING_PROFILE_ID,
   type AssetInfo,
+  type EngineTargetInfo,
   type JobInfo,
   type Model3dProcessingProfile,
   type Model3dProcessingQuality,
@@ -25,6 +31,7 @@ import {
   type Model3dProcessingResult,
   type ProcessingReport,
   type ProviderView,
+  type UnityDeploymentDto,
 } from "../types/core";
 
 const POLL_INTERVAL_MS = 1000;
@@ -39,23 +46,48 @@ export function Model3dReviewPage() {
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [jobResult, setJobResult] = useState<Model3dProcessingResult | null>(null);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
+  
+  // Unity Deployment State
+  const [unityProjectRoot, setUnityProjectRoot] = useState<string>("");
+  const [unityCategory, setUnityCategory] = useState<string>("Vehicle");
+  const [unityValidation, setUnityValidation] = useState<{ isValid: boolean; unityVersion: string | null; error?: string | null } | null>(null);
+  const [deploying, setDeploying] = useState(false);
+  const [deploymentResult, setDeploymentResult] = useState<UnityDeploymentDto | null>(null);
+  const [deploymentSuccess, setDeploymentSuccess] = useState(false);
+  const [engineTargets, setEngineTargets] = useState<EngineTargetInfo[]>([]);
+
   const activeJobIds = useRef<Set<string>>(new Set());
 
   const loadWorkspaceData = async () => {
     try {
       setError("");
-      const [nextProviders, nextAssets, nextJobs] = await Promise.all([listProviders(), listAssets(), listJobs()]);
+      const [nextProviders, nextAssets, nextJobs, discoveredUnity] = await Promise.all([
+        listProviders(),
+        listAssets(),
+        listJobs(),
+        discoverUnityProject().catch(() => null),
+      ]);
       setProviders(nextProviders);
       setAssets(nextAssets);
-      const processingJobs = nextJobs.filter((item) => item.jobType === "model3d.processing");
+      const processingJobs = nextJobs.filter((item: JobInfo) => item.jobType === "model3d.processing");
       setJobs(processingJobs);
+
+      if (discoveredUnity && !unityProjectRoot) {
+        setUnityProjectRoot(discoveredUnity);
+        try {
+          const val = await validateUnityProject(discoveredUnity);
+          setUnityValidation(val);
+        } catch {
+          // ignore validation fail on discovery
+        }
+      }
       
       // Auto-select the most recent READY_FOR_REVIEW or NEEDS_REVIEW job
-      const reviewJobs = processingJobs.filter(j => 
+      const reviewJobs = processingJobs.filter((j: JobInfo) => 
         j.status === "completed" && (j.errorCode === "READY_FOR_REVIEW" || j.errorCode === "NEEDS_REVIEW")
       );
       if (reviewJobs.length > 0 && !selectedJobId) {
-        reviewJobs.sort((a, b) => b.createdAtMs - a.createdAtMs);
+        reviewJobs.sort((a: JobInfo, b: JobInfo) => b.createdAtMs - a.createdAtMs);
         setSelectedJobId(reviewJobs[0].jobId);
       }
     } catch (nextError) {
@@ -68,19 +100,34 @@ export function Model3dReviewPage() {
 
   useEffect(() => {
     let mounted = true;
-    Promise.all([listProviders(), listAssets(), listJobs()])
-      .then(([nextProviders, nextAssets, nextJobs]) => {
+    Promise.all([
+      listProviders(),
+      listAssets(),
+      listJobs(),
+      discoverUnityProject().catch(() => null),
+    ])
+      .then(async ([nextProviders, nextAssets, nextJobs, discoveredUnity]) => {
         if (!mounted) return;
         setProviders(nextProviders);
         setAssets(nextAssets);
-        const processingJobs = nextJobs.filter((item) => item.jobType === "model3d.processing");
+        const processingJobs = nextJobs.filter((item: JobInfo) => item.jobType === "model3d.processing");
         setJobs(processingJobs);
+
+        if (discoveredUnity) {
+          setUnityProjectRoot(discoveredUnity);
+          try {
+            const val = await validateUnityProject(discoveredUnity);
+            if (mounted) setUnityValidation(val);
+          } catch {
+            // ignore
+          }
+        }
         
-        const reviewJobs = processingJobs.filter(j => 
+        const reviewJobs = processingJobs.filter((j: JobInfo) => 
           j.status === "completed" && (j.errorCode === "READY_FOR_REVIEW" || j.errorCode === "NEEDS_REVIEW")
         );
         if (reviewJobs.length > 0 && !selectedJobId) {
-          reviewJobs.sort((a, b) => b.createdAtMs - a.createdAtMs);
+          reviewJobs.sort((a: JobInfo, b: JobInfo) => b.createdAtMs - a.createdAtMs);
           setSelectedJobId(reviewJobs[0].jobId);
         }
       })
@@ -91,6 +138,10 @@ export function Model3dReviewPage() {
     return () => { mounted = false; };
   }, []);
 
+  useEffect(() => {
+    detectEngineTargets().then(setEngineTargets).catch(() => setEngineTargets([]));
+  }, []);
+
   // Poll for job updates
   useEffect(() => {
     if (jobs.length === 0) return;
@@ -99,7 +150,7 @@ export function Model3dReviewPage() {
     const poll = async () => {
       try {
         const nextJobs = await listJobs();
-        const processingJobs = nextJobs.filter((item) => item.jobType === "model3d.processing");
+        const processingJobs = nextJobs.filter((item: JobInfo) => item.jobType === "model3d.processing");
         setJobs(processingJobs);
       } catch {
         // Ignore poll errors
@@ -114,13 +165,19 @@ export function Model3dReviewPage() {
   useEffect(() => {
     if (!selectedJobId) {
       setJobResult(null);
+      setDeploymentResult(null);
+      setDeploymentSuccess(false);
       return;
     }
     
     let mounted = true;
     getModel3dProcessingResult(selectedJobId)
       .then((result) => {
-        if (mounted) setJobResult(result);
+        if (mounted) {
+          setJobResult(result);
+          setDeploymentResult(null);
+          setDeploymentSuccess(false);
+        }
       })
       .catch(() => {
         if (mounted) setJobResult(null);
@@ -133,15 +190,55 @@ export function Model3dReviewPage() {
     await loadWorkspaceData();
   };
 
+  const handleValidateUnityPath = async (path: string) => {
+    setUnityProjectRoot(path);
+    if (!path.trim()) {
+      setUnityValidation(null);
+      return;
+    }
+    try {
+      const val = await validateUnityProject(path);
+      setUnityValidation(val);
+    } catch (e) {
+      setUnityValidation({ isValid: false, unityVersion: null, error: String(e) });
+    }
+  };
+
+  const handleDeployToUnity = async () => {
+    const approved = jobResult?.assetIds[0] && assets.find((asset) => asset.assetId === jobResult.assetIds[0])?.approvalStatus === "approved";
+    if (!jobResult || jobResult.assetIds.length === 0 || !unityProjectRoot || !approved) {
+      setError("Approve the cleaned 3D asset before deploying it to an engine.");
+      return;
+    }
+    setDeploying(true);
+    setError("");
+    setDeploymentSuccess(false);
+    try {
+      const val = await validateUnityProject(unityProjectRoot);
+      setUnityValidation(val);
+      if (!val.isValid) {
+        throw new Error(val.errorMessage || "Invalid Unity project path");
+      }
+      const assetId = jobResult.assetIds[0];
+      const result = await deployModel3dToUnity(assetId, "default-unity-target", unityCategory);
+      setDeploymentResult(result);
+      setDeploymentSuccess(true);
+      const nextAssets = await listAssets();
+      setAssets(nextAssets);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setDeploying(false);
+    }
+  };
+
   const handleApprove = async () => {
     if (!jobResult || !canApproveAsset(jobResult.status as any)) return;
     setActionLoading("approve");
     try {
       await approveModel3dAsset({ assetId: jobResult.assetIds[0], processingJobId: jobResult.jobId });
-      // Refresh job result
       const updated = await getModel3dProcessingResult(jobResult.jobId);
       setJobResult(updated);
-      // Refresh assets to get updated processing_status
       const nextAssets = await listAssets();
       setAssets(nextAssets);
     } catch (nextError) {
@@ -161,10 +258,8 @@ export function Model3dReviewPage() {
         processingJobId: jobResult.jobId,
         rejectionReason: reason?.trim() || undefined 
       });
-      // Refresh job result
       const updated = await getModel3dProcessingResult(jobResult.jobId);
       setJobResult(updated);
-      // Refresh assets
       const nextAssets = await listAssets();
       setAssets(nextAssets);
     } catch (nextError) {
@@ -182,10 +277,8 @@ export function Model3dReviewPage() {
         assetId: jobResult.assetIds[0], 
         processingJobId: jobResult.jobId 
       });
-      // Refresh jobs list
       const nextJobs = await listJobs();
-      setJobs(nextJobs.filter((item) => item.jobType === "model3d.processing"));
-      // Switch to new job
+      setJobs(nextJobs.filter((item: JobInfo) => item.jobType === "model3d.processing"));
       setSelectedJobId(created.job.jobId);
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Reprocess failed");
@@ -196,19 +289,20 @@ export function Model3dReviewPage() {
 
   if (loading) return <div className="review-panel loading-placeholder">Loading 3D review...</div>;
 
-  const sourceImages = assets.filter((asset) => asset.mediaKind === "image" && asset.status === "ready");
-  const modelAssets = assets.filter((asset) => asset.mediaKind === "model3d");
+  const selectedAssetApproved = Boolean(
+    jobResult?.assetIds[0] && assets.find((asset) => asset.assetId === jobResult.assetIds[0])?.approvalStatus === "approved",
+  );
 
   return (
     <section className="review-page model3d-review-page">
       <div className="review-header">
         <div>
-          <div className="panel-label">3D PROCESSING REVIEW</div>
-          <h2>Review Processed Assets</h2>
-          <p>Inspect, approve, or reprocess assets from the automated Blender pipeline.</p>
+          <div className="panel-label">3D APPROVAL & ENGINE DEPLOYMENT</div>
+          <h2>Approve Cleaned Assets & Deploy</h2>
+          <p>Inspect Blender-cleaned assets, approve the final artifact, then send it to an available engine target.</p>
         </div>
         <button className="btn btn--secondary" type="button" disabled={refreshing} onClick={() => void handleRefresh()}>
-          {refreshing ? "Refreshing..." : "Refresh"}
+          {refreshing ? "Refreshing..." : "🔄 Refresh"}
         </button>
       </div>
 
@@ -280,7 +374,7 @@ export function Model3dReviewPage() {
                     {formatProcessingStatus(jobResult.status).label}
                   </span>
                   <span className={`review-stage ${jobResult.processingStage ? "review-stage--complete" : ""}`}>
-                    {jobResult.processingStage || "Unknown stage"}
+                    {jobResult.processingStage || "Complete"}
                   </span>
                 </div>
               </header>
@@ -296,25 +390,19 @@ export function Model3dReviewPage() {
                   <h4>Source Asset</h4>
                   {jobResult.assetIds.length > 0 && (
                     <div className="asset-reference">
-                      <strong>Generated Asset ID:</strong>
+                      <strong>Generated Master GLB:</strong>
                       <code>{jobResult.assetIds[0]}</code>
                     </div>
                   )}
-                  <div className="metadata-row">
-                    <dt>Processing Profile</dt>
-                    <dd>{jobResult.assetIds[0] || "N/A"}</dd>
-                  </div>
                 </section>
 
                 <section className="review-panel review-panel--outputs">
-                  <h4>Generated Outputs</h4>
+                  <h4>Interactive 3D Preview</h4>
                   {jobResult.assetIds.length > 0 && (
                     <div className="model3d-viewer-wrapper">
                       <Model3dViewer
                         assetId={jobResult.assetIds[0]}
                         presetView="perspective"
-                        onLoad={() => console.log("Model loaded")}
-                        onError={(err) => console.error("Model load error:", err)}
                       />
                     </div>
                   )}
@@ -349,64 +437,125 @@ export function Model3dReviewPage() {
                         <code className="output-path">{jobResult.vehicleAnalysisPath}</code>
                       </div>
                     )}
-                    {!jobResult.outputMasterPath && <p className="no-outputs">No output files generated yet.</p>}
+                  </div>
+                </section>
+
+                {/* Unity Deployment Section */}
+                <section className="review-panel review-panel--unity-deploy">
+                  <h4>🚀 Engine Deployment</h4>
+                  <p>Deployment is available only after final 3D approval. Unity project delivery is supported here; other targets remain unavailable until detected and supported.</p>
+                  <div className="engine-grid" aria-label="Available engine targets">
+                    {engineTargets.map((target) => (
+                      <div className={`engine-card ${target.detected ? "engine-card--ready" : "engine-card--attention"}`} key={target.targetId}>
+                        <div className="engine-card__header">
+                          <div className="engine-card__icon">{target.targetId === "unity" ? "🎮" : target.targetId === "unreal" ? "🛠️" : target.targetId === "godot" ? "🌱" : "🔧"}</div>
+                          <div className="engine-card__info"><h4>{target.displayName}</h4><p>{target.detected ? (target.projectRoot || target.executablePath || "Detected") : "Not detected"}</p></div>
+                        </div>
+                        <div className="engine-card__status">{target.detected && target.deploymentSupported ? "Detected / Ready" : target.detected ? "Detected / Adapter unavailable" : "Unavailable"}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="image-provider-state" role="note">Export formats: <strong>GLB</strong> · FBX · OBJ. Only validated targets are shown as deployable.</div>
+                  
+                  <div className="unity-config-form">
+                    <label className="form-field-label">Unity Project Root Directory:</label>
+                    <div className="unity-path-input-group">
+                      <input
+                        type="text"
+                        className="studio-input"
+                        value={unityProjectRoot}
+                        onChange={(e) => handleValidateUnityPath(e.target.value)}
+                        placeholder="e.g. C:\Users\Mak Tech\development\Games\Neon Velocity 2100"
+                      />
+                      <button
+                        className="btn btn--secondary btn--sm"
+                        type="button"
+                        onClick={async () => {
+                          const disc = await discoverUnityProject();
+                          if (disc) handleValidateUnityPath(disc);
+                        }}
+                      >
+                        🔍 Auto-Detect
+                      </button>
+                    </div>
+
+                    {unityValidation && (
+                      <div className={`unity-validation-tag ${unityValidation.isValid ? "unity-validation--valid" : "unity-validation--invalid"}`}>
+                        {unityValidation.isValid
+                          ? `✅ Valid Unity Project (${unityValidation.unityVersion || "Version detected"})`
+                          : `⚠️ Unity Project Check Failed: ${unityValidation.error || "Missing Assets/ or ProjectSettings/"}`}
+                      </div>
+                    )}
+
+                    <div className="unity-category-picker">
+                      <label className="form-field-label">Asset Category / Unity Subfolder:</label>
+                      <select
+                        value={unityCategory}
+                        onChange={(e) => setUnityCategory(e.target.value)}
+                        className="studio-select"
+                      >
+                        <option value="Vehicle">🚗 Vehicle (Assets/Nexora/Vehicles/)</option>
+                        <option value="Character">👤 Character (Assets/Nexora/Characters/)</option>
+                        <option value="Environment">🌍 Environment (Assets/Nexora/Environment/)</option>
+                        <option value="Prop">📦 Prop (Assets/Nexora/Props/)</option>
+                        <option value="Weapon">🔫 Weapon (Assets/Nexora/Weapons/)</option>
+                        <option value="Building">🏢 Building (Assets/Nexora/Buildings/)</option>
+                        <option value="Vegetation">🌲 Vegetation (Assets/Nexora/Vegetation/)</option>
+                        <option value="Furniture">🪑 Furniture (Assets/Nexora/Furniture/)</option>
+                        <option value="Equipment">🔧 Equipment (Assets/Nexora/Equipment/)</option>
+                        <option value="Material">🎨 Material (Assets/Nexora/Materials/)</option>
+                      </select>
+                    </div>
+
+                    <button
+                      className="btn btn--primary btn--large unity-deploy-btn"
+                      type="button"
+                      disabled={deploying || !selectedAssetApproved || !unityProjectRoot || !unityValidation?.isValid || jobResult.assetIds.length === 0}
+                      onClick={handleDeployToUnity}
+                    >
+                      {deploying ? "📦 Deploying..." : selectedAssetApproved ? "🚀 Deploy Approved Asset" : "🔒 Approve Asset to Deploy"}
+                    </button>
+
+                    {deploymentSuccess && deploymentResult && (
+                      <div className="deployment-success-card">
+                        <div className="deploy-success-badge">✅ DEPLOYMENT VERIFIED</div>
+                        <dl className="deploy-dl">
+                          <div>
+                            <dt>Deployed Asset:</dt>
+                            <dd><code>{deploymentResult.deployedPath}</code></dd>
+                          </div>
+                          <div>
+                            <dt>Unity Meta File:</dt>
+                            <dd><code>{deploymentResult.metaPath}</code></dd>
+                          </div>
+                          <div>
+                            <dt>File Size:</dt>
+                            <dd>{formatFileSize(deploymentResult.fileSize)} ({deploymentResult.bytesWritten} bytes written)</dd>
+                          </div>
+                          <div>
+                            <dt>SHA-256 Checksum:</dt>
+                            <dd><code>{deploymentResult.checksum.slice(0, 16)}...</code></dd>
+                          </div>
+                          <div>
+                            <dt>Destination Folder:</dt>
+                            <dd><code>{deploymentResult.destinationFolder}</code></dd>
+                          </div>
+                        </dl>
+                      </div>
+                    )}
                   </div>
                 </section>
 
                 <section className="review-panel review-panel--reports">
-                  <h4>Processing Reports</h4>
-                  
-                  <div className="report-tabs">
-                    <button 
-                      className="report-tab"
-                      onClick={() => {}}
-                    >
-                      Pre-Processing
-                    </button>
-                    <button 
-                      className="report-tab"
-                      onClick={() => {}}
-                    >
-                      Post-Processing
-                    </button>
-                  </div>
-
-                  <div className="report-content">
-                    <details open>
-                      <summary>Pre-Analysis Report</summary>
-                      <pre>{jobResult.preAnalysisReport ? formatProcessingReport(jobResult.preAnalysisReport).join("\n") : "No pre-analysis report available."}</pre>
-                    </details>
-                    <details open>
-                      <summary>Post-Analysis Report</summary>
-                      <pre>{jobResult.postAnalysisReport ? formatProcessingReport(jobResult.postAnalysisReport).join("\n") : "No post-analysis report available."}</pre>
-                    </details>
-                  </div>
-                </section>
-
-                <section className="review-panel review-panel--materials">
-                  <h4>Material & Vehicle Analysis</h4>
-                  <dl className="review-metadata">
-                    <div className="metadata-row">
-                      <dt>Material Status</dt>
-                      <dd>{jobResult.materialStatus || "Unknown"}</dd>
-                    </div>
-                    <div className="metadata-row">
-                      <dt>Vehicle Detected</dt>
-                      <dd>{jobResult.postAnalysisReport?.vehicleDetected ? "Yes" : "No"}</dd>
-                    </div>
-                    <div className="metadata-row">
-                      <dt>Wheel Candidates</dt>
-                      <dd>{jobResult.postAnalysisReport?.wheelCandidates ?? "N/A"}</dd>
-                    </div>
-                    <div className="metadata-row">
-                      <dt>Wheel Separation Possible</dt>
-                      <dd>{jobResult.postAnalysisReport?.wheelSeparationPossible ? "Yes" : "No"}</dd>
-                    </div>
-                    <div className="metadata-row">
-                      <dt>Vehicle Confidence</dt>
-                      <dd>{jobResult.postAnalysisReport?.vehicleConfidence ? `${(jobResult.postAnalysisReport.vehicleConfidence * 100).toFixed(1)}%` : "N/A"}</dd>
-                    </div>
-                  </dl>
+                  <h4>Asset Readiness Report</h4>
+                  <AssetReadinessReport 
+                    jobResult={jobResult} 
+                    onDeploy={handleDeployToUnity} 
+                  />
+                  <details className="raw-report-details">
+                    <summary>Raw Processing Report (Text)</summary>
+                    <pre>{jobResult.postAnalysisReport ? formatProcessingReport(jobResult.postAnalysisReport).join("\n") : "Analysis report available in processing_report.json"}</pre>
+                  </details>
                 </section>
 
                 <section className="review-panel review-panel--actions">
@@ -418,7 +567,7 @@ export function Model3dReviewPage() {
                         onClick={handleApprove}
                         disabled={actionLoading === "approve"}
                       >
-                        {actionLoading === "approve" ? "Approving..." : "APPROVE FOR UNITY"}
+                        {actionLoading === "approve" ? "Approving..." : "✅ APPROVE ASSET"}
                       </button>
                     )}
                     {canRejectAsset(jobResult.status as any) && (
@@ -427,7 +576,7 @@ export function Model3dReviewPage() {
                         onClick={handleReject}
                         disabled={actionLoading === "reject"}
                       >
-                        {actionLoading === "reject" ? "Rejecting..." : "REJECT"}
+                        {actionLoading === "reject" ? "Rejecting..." : "❌ REJECT"}
                       </button>
                     )}
                     {canReprocessAsset(jobResult.status as any) && (
@@ -436,21 +585,9 @@ export function Model3dReviewPage() {
                         onClick={handleReprocess}
                         disabled={actionLoading === "reprocess"}
                       >
-                        {actionLoading === "reprocess" ? "Reprocessing..." : "REPROCESS"}
+                        {actionLoading === "reprocess" ? "Reprocessing..." : "🔄 REPROCESS"}
                       </button>
                     )}
-                    
-                    <div className="review-action-hint">
-                      {jobResult.status === "ready_for_review" && !actionLoading && (
-                        <p className="review-hint">This asset is ready for review. Click "APPROVE FOR UNITY" to mark it as approved for Unity delivery.</p>
-                      )}
-                      {jobResult.status === "needs_review" && !actionLoading && (
-                        <p className="review-hint warning">This asset needs review (warnings detected). You may approve with caution, reject, or reprocess.</p>
-                      )}
-                      {jobResult.status === "completed" && !actionLoading && (
-                        <p className="review-hint">Processing completed. Check the asset's processing status for approval state.</p>
-                      )}
-                    </div>
                   </div>
                 </section>
               </div>

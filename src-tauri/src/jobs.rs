@@ -660,7 +660,173 @@ pub fn create_model3d_processing(
         1,
     )?;
 
+    // Seed the result row so get_result/retry can find the job from the moment it exists.
+    let now = now_ms();
+    {
+        let db = project.db.lock().unwrap();
+        // Best-effort seed; the worker's persist step upserts anyway.
+        let _ = db.execute(
+            "INSERT INTO model3d_processing_jobs (job_id, source_asset_id, profile, quality, progress, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)",
+            rusqlite::params![
+                job.job_id,
+                payload.request.source_asset_id,
+                payload.request.profile,
+                payload.request.quality,
+                now,
+            ],
+        );
+    }
+
     Ok(CreateModel3dProcessingJobResult { job, compatibility })
+}
+
+/// Persist the outcome of a Blender processing run into model3d_processing_jobs and
+/// register the processed master GLB as a first-class asset with provenance.
+fn persist_model3d_processing_result(
+    db: &Connection,
+    job_id: &str,
+    payload: &Model3dProcessingJobPayload,
+    result: &crate::model3d_processing::Model3dProcessingResult,
+) {
+    use sha2::{Digest, Sha256};
+
+    let now = now_ms();
+    let source_asset_id = payload.request.source_asset_id.clone();
+    let output_dir = result
+        .output_master_path
+        .as_deref()
+        .and_then(|p| std::path::Path::new(p).parent().map(|d| d.to_path_buf()));
+
+    // 1. Write pre/post analysis reports next to the outputs so get_result can read them.
+    if let Some(dir) = output_dir.as_ref() {
+        for (name, report) in [
+            ("pre_analysis.json", &result.pre_analysis_report),
+            ("post_analysis.json", &result.post_analysis_report),
+        ] {
+            if let Some(report) = report {
+                let path = dir.join(name);
+                if let Ok(json) = serde_json::to_vec_pretty(report) {
+                    let _ = std::fs::write(&path, json);
+                }
+            }
+        }
+    }
+
+    // 2. Register the processed master GLB as a managed asset with provenance.
+    if let (Some(master_path), Some(bytes)) = (
+        result.output_master_path.as_deref(),
+        result.output_master_path.as_deref().and_then(|p| std::fs::read(p).ok()),
+    ) {
+        if !bytes.is_empty() {
+            let masters_dir = db
+                .query_row(
+                    "SELECT managed_master_path FROM assets WHERE asset_id=?1",
+                    rusqlite::params![source_asset_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|p| std::path::Path::new(&p).parent().map(|d| d.to_path_buf()));
+            if let Some(masters_dir) = masters_dir {
+                let asset_id = Uuid::now_v7().to_string();
+                let dest = masters_dir.join(format!("{}.glb", asset_id));
+                if fs::copy(master_path, &dest).is_ok() {
+                    let size = bytes.len() as u64;
+                    let checksum = format!("{:x}", Sha256::digest(&bytes));
+                    let inserted = db.execute(
+                        "INSERT INTO assets (asset_id, project_id, original_filename, managed_master_path, file_size, checksum, imported_at_ms, status, source_type, media_kind, media_container, media_format, validation_level, model_metadata_schema_version, model_metadata_json, processing_status) VALUES (?1, (SELECT project_id FROM assets WHERE asset_id=?2), 'processed-model.glb', ?3, ?4, ?5, ?6, 'ready', 'generated', 'model3d', 'GLB', 'glTF 2.0', 'structural', 1, '{}', 'ready_for_review')",
+                        rusqlite::params![
+                            asset_id,
+                            source_asset_id,
+                            dest.to_string_lossy(),
+                            size,
+                            checksum,
+                            now,
+                        ],
+                    );
+                    if inserted.is_ok() {
+                        let _ = db.execute(
+                            "INSERT INTO asset_provenance (asset_id, parent_asset_id, source_type, provider_id, provider_version, model_identifier, commercial_use_allowed, prompt, actual_seed, generation_settings_version, generation_settings_json, generating_job_id, generated_at_ms) VALUES (?1, ?2, 'generated', ?3, ?4, 'foundation.processing.v1', 1, 'Blender optimization', 0, 1, ?5, ?6, ?7)",
+                            rusqlite::params![
+                                asset_id,
+                                source_asset_id,
+                                payload.provider_id,
+                                payload.provider_version,
+                                serde_json::json!({
+                                    "schemaVersion": 1,
+                                    "processing": true,
+                                    "profile": payload.request.profile,
+                                    "quality": payload.request.quality,
+                                    "sourceAssetId": source_asset_id,
+                                })
+                                .to_string(),
+                                job_id,
+                                now,
+                            ],
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Mark the source asset's processing_status (persistent signal that processing ran).
+    match result.status.as_str() {
+        "READY_FOR_REVIEW" | "completed" => {
+            let _ = db.execute(
+                "UPDATE assets SET processing_status='ready_for_review' WHERE asset_id=?1 AND media_kind='model3d'",
+                rusqlite::params![source_asset_id],
+            );
+        }
+        "NEEDS_REVIEW" => {
+            let _ = db.execute(
+                "UPDATE assets SET processing_status='needs_review' WHERE asset_id=?1 AND media_kind='model3d'",
+                rusqlite::params![source_asset_id],
+            );
+        }
+        _ => {}
+    }
+
+    // 4. Persist the result row (upsert; the row is seeded at creation but be defensive).
+    let _ = db.execute(
+        "INSERT INTO model3d_processing_jobs (job_id, source_asset_id, profile, quality, blender_log_path, pre_analysis_report_path, post_analysis_report_path, output_master_path, lod0_path, lod1_path, lod2_path, vehicle_analysis_path, material_status, processing_stage, progress, error_code, error_message, created_at_ms, updated_at_ms, started_at_ms, completed_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?18,?18,?18)
+         ON CONFLICT(job_id) DO UPDATE SET
+            blender_log_path=excluded.blender_log_path,
+            pre_analysis_report_path=excluded.pre_analysis_report_path,
+            post_analysis_report_path=excluded.post_analysis_report_path,
+            output_master_path=excluded.output_master_path,
+            lod0_path=excluded.lod0_path,
+            lod1_path=excluded.lod1_path,
+            lod2_path=excluded.lod2_path,
+            vehicle_analysis_path=excluded.vehicle_analysis_path,
+            material_status=excluded.material_status,
+            processing_stage=excluded.processing_stage,
+            progress=excluded.progress,
+            error_code=excluded.error_code,
+            error_message=excluded.error_message,
+            updated_at_ms=excluded.updated_at_ms,
+            started_at_ms=coalesce(model3d_processing_jobs.started_at_ms, excluded.started_at_ms),
+            completed_at_ms=excluded.completed_at_ms",
+        rusqlite::params![
+            job_id,
+            source_asset_id,
+            payload.request.profile,
+            payload.request.quality,
+            output_dir.as_ref().map(|d| d.join("processing.log").to_string_lossy().to_string()),
+            output_dir.as_ref().filter(|_| result.pre_analysis_report.is_some()).map(|d| d.join("pre_analysis.json").to_string_lossy().to_string()),
+            output_dir.as_ref().filter(|_| result.post_analysis_report.is_some()).map(|d| d.join("post_analysis.json").to_string_lossy().to_string()),
+            result.output_master_path.as_deref().map(|p| p.to_string()),
+            result.lod0_path.as_deref().map(|p| p.to_string()),
+            result.lod1_path.as_deref().map(|p| p.to_string()),
+            result.lod2_path.as_deref().map(|p| p.to_string()),
+            result.vehicle_analysis_path.as_deref().map(|p| p.to_string()),
+            result.material_status,
+            result.processing_stage,
+            result.progress as i64,
+            result.error_code,
+            result.error_message,
+            now,
+        ],
+    );
 }
 
 #[cfg(test)]
@@ -1243,13 +1409,48 @@ pub fn tick_with_configs(
         }
         #[cfg(not(test))]
         {
-            finish_model3d_error(
-                project,
-                &job,
-                &model3d_generation::Model3dError::Unavailable(
-                    "no compatible 3D generation provider is configured".into(),
-                ),
-            )?;
+            // Execute via Hunyuan3D API (local.hunyuan provider on port 8081)
+            let hunyuan_request = crate::hunyuan_generation::HunyuanGenerationRequest {
+                schema_version: 1,
+                mode: match payload.request.mode {
+                    crate::model3d_generation::Model3dMode::TextTo3d => crate::hunyuan_generation::HunyuanMode::TextTo3d,
+                    crate::model3d_generation::Model3dMode::ImageTo3d => crate::hunyuan_generation::HunyuanMode::ImageTo3d,
+                },
+                prompt: payload.request.prompt.clone(),
+                negative_prompt: payload.request.negative_prompt.clone(),
+                source_asset_id: payload.request.source_asset_id.clone(),
+                profile: crate::hunyuan_generation::HUNYUAN_PROFILE_ID.to_string(),
+                quality: "standard".to_string(),
+                seed: payload.request.seed,
+                output_format: "glb".to_string(),
+            };
+            let hunyuan_payload = crate::hunyuan_generation::HunyuanJobPayload {
+                provider_id: "local.hunyuan".to_string(),
+                provider_version: "1.0.0".to_string(),
+                request: hunyuan_request,
+            };
+            let result = crate::hunyuan_generation::run_hunyuan_generation(project, &job.job_id, owner, &hunyuan_payload);
+            let mut db = project.db.lock().unwrap();
+            match result {
+                Ok(r) if r.status == "completed" || r.status == "READY_FOR_REVIEW" => {
+                    let tx = db.transaction()?;
+                    transition(&tx, &job.job_id, "running", "completed", "completed", None, None, Some(100))?;
+                    tx.commit()?;
+                }
+                Ok(r) => {
+                    let tx = db.transaction()?;
+                    let code = "MODEL3D_FAILED";
+                    let message = r.status.clone();
+                    transition(&tx, &job.job_id, "running", "failed", "failed", Some(&message), Some((code, &message, false)), None)?;
+                    tx.commit()?;
+                }
+                Err(error) => {
+                    let tx = db.transaction()?;
+                    let message = error.to_string();
+                    transition(&tx, &job.job_id, "running", "failed", "failed", Some(&message), Some(("MODEL3D_ERROR", &message, false)), None)?;
+                    tx.commit()?;
+                }
+            }
             return Ok(true);
         }
         #[cfg(test)]
@@ -1297,8 +1498,16 @@ pub fn tick_with_configs(
     }
 
     let elapsed = now_ms().saturating_sub(job.started_at_ms) as u64;
-    let progress = ((elapsed.saturating_mul(100) / payload.duration_ms()).min(99)) as u32;
-    if elapsed < payload.duration_ms() {
+    // duration_ms() is 0 for payload kinds that report progress internally
+    // (e.g. hunyuan.generate); skip the elapsed-based progress math for them
+    // and fall through to their dispatch arm below.
+    let duration_ms = payload.duration_ms();
+    let progress = if duration_ms > 0 {
+        ((elapsed.saturating_mul(100) / duration_ms).min(99)) as u32
+    } else {
+        0
+    };
+    if duration_ms > 0 && elapsed < duration_ms {
         if progress >= current_progress.saturating_add(5) {
             let timestamp = now_ms();
             let tx = db.transaction()?;
@@ -1421,15 +1630,13 @@ pub fn tick_with_configs(
 
             let result =
                 blender_adapter::run_model3d_processing(project, &job.job_id, owner, &payload);
-            let result = match result {
-                Ok(r) => Ok(r),
-                Err(e) => Err(e),
-            };
 
             // Re-acquire the database lock for post-processing
             let mut db = project.db.lock().unwrap();
             match result {
                 Ok(result) => {
+                    // Persist the processing result so the UI can read it back
+                    persist_model3d_processing_result(&db, &job.job_id, &payload, &result);
                     if result.status == "completed" || result.status == "READY_FOR_REVIEW" {
                         let tx = db.transaction()?;
                         transition(
@@ -1478,7 +1685,6 @@ pub fn tick_with_configs(
                     Ok(true)
                 }
                 Err(e) => {
-                    let mut db = project.db.lock().unwrap();
                     let tx = db.transaction()?;
                     transition(
                         &tx,
@@ -1548,7 +1754,6 @@ pub fn tick_with_configs(
                     Ok(true)
                 }
                 Err(e) => {
-                    let mut db = project.db.lock().unwrap();
                     let tx = db.transaction()?;
                     transition(
                         &tx,
@@ -1959,8 +2164,8 @@ pub fn approve_model3d_asset(
     // Verify processing job exists and is a model3d.processing job
     let job: Option<(String, String)> = tx
         .query_row(
-            "SELECT job_id, job_type FROM jobs WHERE job_id=?1 AND project_id=?2",
-            rusqlite::params![processing_job_id, project.manifest.project_id],
+            "SELECT job_id, job_type FROM jobs WHERE job_id=?1",
+            rusqlite::params![processing_job_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
@@ -2006,10 +2211,69 @@ pub fn approve_model3d_asset(
 
     // Update asset processing_status
     tx.execute(
-        "UPDATE assets SET processing_status = 'approved', updated_at_ms = ?1 WHERE asset_id = ?2",
-        rusqlite::params![now, asset_id],
+        "UPDATE assets SET processing_status = 'approved' WHERE asset_id = ?1",
+        rusqlite::params![asset_id],
     )?;
 
+    tx.commit()?;
+    Ok(())
+}
+
+/// Approve a generated 2D image at the first pipeline gate.
+///
+/// The approval is stored in the same audit table as the final 3D approval,
+/// while the media kind and generating job are checked here so an image
+/// approval cannot be used to unlock an unrelated asset.
+pub fn approve_image_asset(
+    project: &ProjectState,
+    asset_id: &str,
+    generation_job_id: Option<&str>,
+) -> Result<(), JobError> {
+    let mut db = project
+        .db
+        .lock()
+        .map_err(|_| JobError::Database(rusqlite::Error::ExecuteReturnedResults))?;
+    let mut tx = db.transaction()?;
+
+    let asset: Option<(String, String, String)> = tx
+        .query_row(
+            "SELECT asset_id, media_kind, COALESCE(source_type, '') FROM assets WHERE asset_id=?1 AND project_id=?2 AND status='ready'",
+            rusqlite::params![asset_id, project.manifest.project_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let (asset_id, media_kind, _source_type) =
+        asset.ok_or(JobError::InvalidInput("image asset not found or not ready".into()))?;
+    if media_kind != "image" {
+        return Err(JobError::InvalidInput(
+            "only image assets can be approved at the image gate".into(),
+        ));
+    }
+
+    if let Some(job_id) = generation_job_id {
+        let job_type: Option<String> = tx
+            .query_row(
+                "SELECT job_type FROM jobs WHERE job_id=?1",
+                rusqlite::params![job_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if job_type.as_deref() != Some("image.generate") {
+            return Err(JobError::InvalidInput(
+                "image approval must reference an image generation job".into(),
+            ));
+        }
+    }
+
+    let now = now_ms();
+    tx.execute(
+        "INSERT INTO asset_approvals (asset_id, status, approved_by, approved_at_ms, approved_job_id, created_at_ms, updated_at_ms)
+         VALUES (?1, 'approved', 'user', ?2, ?3, ?4, ?5)
+         ON CONFLICT(asset_id) DO UPDATE SET
+           status='approved', approved_by='user', approved_at_ms=?2,
+           approved_job_id=?3, rejection_reason=NULL, updated_at_ms=?5",
+        rusqlite::params![asset_id, now, generation_job_id, now, now],
+    )?;
     tx.commit()?;
     Ok(())
 }
@@ -2043,8 +2307,8 @@ pub fn reject_model3d_asset(
     // Verify processing job exists and is a model3d.processing job
     let job: Option<(String, String)> = tx
         .query_row(
-            "SELECT job_id, job_type FROM jobs WHERE job_id=?1 AND project_id=?2",
-            rusqlite::params![processing_job_id, project.manifest.project_id],
+            "SELECT job_id, job_type FROM jobs WHERE job_id=?1",
+            rusqlite::params![processing_job_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
@@ -2092,8 +2356,8 @@ pub fn reject_model3d_asset(
 
     // Update asset processing_status
     tx.execute(
-        "UPDATE assets SET processing_status = 'rejected', updated_at_ms = ?1 WHERE asset_id = ?2",
-        rusqlite::params![now, asset_id],
+        "UPDATE assets SET processing_status = 'rejected' WHERE asset_id = ?1",
+        rusqlite::params![asset_id],
     )?;
 
     tx.commit()?;
@@ -2130,8 +2394,8 @@ pub fn reprocess_model3d_asset(
     // Verify processing job exists and is a model3d.processing job
     let job: Option<(String, String)> = db
         .query_row(
-            "SELECT job_id, job_type FROM jobs WHERE job_id=?1 AND project_id=?2",
-            rusqlite::params![processing_job_id, project.manifest.project_id],
+            "SELECT job_id, job_type FROM jobs WHERE job_id=?1",
+            rusqlite::params![processing_job_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
@@ -2216,6 +2480,13 @@ fn parse_payload(
             let payload: Model3dProcessingJobPayload = serde_json::from_str(payload_json)
                 .map_err(|_| "invalid model3d processing payload".to_string())?;
             Ok(JobPayload::Model3dProcessing(payload))
+        }
+        hunyuan_generation::HUNYUAN_JOB_TYPE => {
+            let payload: HunyuanJobPayload = serde_json::from_str(payload_json)
+                .map_err(|_| "invalid hunyuan generation payload".to_string())?;
+            hunyuan_generation::validate_payload(&payload)
+                .map_err(|_| "invalid hunyuan generation payload".to_string())?;
+            Ok(JobPayload::Hunyuan(payload))
         }
         _ => Err("unsupported persisted job type".to_string()),
     }
@@ -3603,6 +3874,130 @@ mod tests {
         drop(reopened);
         drop(dir);
     }
+
+    #[test]
+    fn model3d_processing_result_is_persisted_and_queryable() {
+        let (dir, project) = project();
+        let source_id = Uuid::now_v7().to_string();
+        let masters = project.root.join("assets").join("masters");
+        std::fs::create_dir_all(&masters).unwrap();
+        let master = masters.join(format!("{}.glb", source_id));
+        std::fs::write(&master, b"glb-source-bytes").unwrap();
+        project
+            .with_db(|db| {
+                db.execute(
+                    "INSERT INTO assets (asset_id, project_id, original_filename, managed_master_path, file_size, checksum, imported_at_ms, status, source_type, media_kind, media_container, media_format, validation_level, model_metadata_schema_version, model_metadata_json, processing_status) VALUES (?1, ?2, 'raw.glb', ?3, 15, 'abc', 1, 'ready', 'imported', 'model3d', 'GLB', 'glTF 2.0', 'structural', 1, '{}', 'raw')",
+                    rusqlite::params![source_id, project.manifest.project_id, master.to_string_lossy()],
+                )
+            })
+            .unwrap();
+
+        let registry = ProviderRegistry::phase8(false, false, false).unwrap();
+        let snapshot = crate::providers::tests::snapshot(Some(16_000), Some(50_000), None);
+        let input = CreateModel3dProcessingJobInput {
+            schema_version: 1,
+            source_asset_id: source_id.clone(),
+            profile: "vehicle".into(),
+            quality: "master".into(),
+            provider_id: None,
+        };
+        let created =
+            create_model3d_processing(&project, &registry, &snapshot, input).unwrap();
+
+        // The result row must exist from the moment the job is created.
+        let seeded = project
+            .with_db(|db| {
+                db.query_row(
+                    "SELECT source_asset_id, profile FROM model3d_processing_jobs WHERE job_id=?1",
+                    rusqlite::params![created.job.job_id],
+                    |row| Ok((row.get::<_, String>(0), row.get::<_, String>(1))),
+                )
+            })
+            .unwrap();
+        assert_eq!(seeded.0.unwrap(), source_id);
+        assert_eq!(seeded.1.unwrap(), "vehicle");
+
+        // Simulate the worker's persist step (run_model3d_processing is covered by its own adapter tests).
+        let out_dir = project
+            .root
+            .join(".nexora")
+            .join("jobs")
+            .join(&created.job.job_id)
+            .join("model3d_processing");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let processed_master = out_dir.join("clean_master.glb");
+        std::fs::write(&processed_master, b"glb-processed-bytes").unwrap();
+        let result = crate::model3d_processing::Model3dProcessingResult {
+            job_id: created.job.job_id.clone(),
+            status: "READY_FOR_REVIEW".into(),
+            asset_ids: vec![],
+            processing_stage: Some("completed".into()),
+            progress: 100,
+            output_master_path: Some(processed_master.to_string_lossy().to_string()),
+            lod0_path: None,
+            lod1_path: Some(out_dir.join("vehicle_lod1.glb").to_string_lossy().to_string()),
+            lod2_path: None,
+            vehicle_analysis_path: None,
+            material_status: Some("standard_pbr".into()),
+            pre_analysis_report: None,
+            post_analysis_report: None,
+            error_code: None,
+            error_message: None,
+        };
+        {
+            let payload = Model3dProcessingJobPayload {
+                provider_id: "local.blender".into(),
+                provider_version: "1".into(),
+                request: Model3dProcessingJobRequest {
+                    schema_version: 1,
+                    source_asset_id: source_id.clone(),
+                    profile: "vehicle".into(),
+                    quality: "master".into(),
+                },
+            };
+            let db = project.db.lock().unwrap();
+            persist_model3d_processing_result(&db, &created.job.job_id, &payload, &result);
+        }
+
+        // Simulate the worker's post-persist job transition, then get_result must resolve it.
+        project.with_db(|db| {
+            db.execute(
+                "UPDATE jobs SET status='completed', progress=100 WHERE job_id=?1",
+                rusqlite::params![created.job.job_id],
+            )
+        })
+        .unwrap();
+        let view = crate::model3d_processing::get_result(&project, &created.job.job_id).unwrap();
+        assert_eq!(view.status, "completed");
+        assert_eq!(view.progress, 100);
+        assert!(view.output_master_path.is_some());
+
+        // A new managed asset was registered with provenance, parented to the source.
+        let provenance_count: i64 = project
+            .with_db(|db| {
+                db.query_row(
+                    "SELECT count(*) FROM asset_provenance WHERE generating_job_id=?1 AND parent_asset_id=?2",
+                    rusqlite::params![created.job.job_id, source_id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(provenance_count, 1);
+
+        // The source asset is marked ready_for_review so the approval gate can accept it.
+        let src_status: String = project
+            .with_db(|db| {
+                db.query_row(
+                    "SELECT processing_status FROM assets WHERE asset_id=?1",
+                    rusqlite::params![source_id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(src_status, "ready_for_review");
+
+        drop(dir);
+    }
 }
 
 pub fn create_unity_delivery(
@@ -3653,8 +4048,8 @@ pub fn create_unity_delivery(
     // Verify processing job exists and is a model3d.processing job
     let job: Option<(String, String)> = tx
         .query_row(
-            "SELECT job_id, job_type FROM jobs WHERE job_id=?1 AND project_id=?2",
-            rusqlite::params![processing_job_id, project.manifest.project_id],
+            "SELECT job_id, job_type FROM jobs WHERE job_id=?1",
+            rusqlite::params![processing_job_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;

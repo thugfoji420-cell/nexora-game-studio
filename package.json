@@ -1,14 +1,14 @@
 {
   "name": "nexora-game-studio",
-  "version": "0.1.0",
+  "version": "0.1.6",
   "private": true,
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc && vite build",
+    "dev": "vite --configLoader runner",
+    "build": "tsc && vite build --configLoader runner",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "vitest run --configLoader runner",
     "tauri": "tauri"
   },
   "dependencies": {
@@ -25,7 +25,7 @@
     "@types/react-dom": "^19.1.7",
     "@types/three": "^0.185.4",
     "@vitejs/plugin-react": "^5.0.2",
-    "typescript": "^5.9.2",
+    "typescript": "^5.9.3",
     "vite": "^7.1.5",
     "vitest": "^3.2.4"
   }

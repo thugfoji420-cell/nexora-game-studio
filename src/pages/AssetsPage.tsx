@@ -3,6 +3,7 @@ import { importAsset, listAssets, searchAssets, pickAssetFile, isDuplicateError,
 import { classifyAssetPreview, getImagePreviewSource } from "../services/assetPreview";
 import { formatModel3dAssetFormat, formatModel3dBounds, formatModel3dCount, getSupportedModel3dMetadata } from "../services/assetModel3d";
 import { AssetVideoPreview } from "../components/AssetVideoPreview";
+import { Model3dViewer } from "../components/Model3dViewer";
 import type { AssetInfo } from "../types/core";
 
 export function AssetsPage() {
@@ -225,10 +226,9 @@ export function AssetsPage() {
               </header>
 
               <div className="asset-detail__preview">
-                {selectedPreviewKind === "model3d" ? (
+                {selectedPreviewKind === "model3d" && selectedAsset ? (
                   <div className="asset-preview asset-preview--model3d">
-                    <strong>MODEL 3D</strong>
-                    <span>Interactive 3D preview is not available in Phase 8.</span>
+                    <Model3dViewer assetId={selectedAsset.assetId} presetView="perspective" />
                   </div>
                 ) : selectedPreviewKind === "video" ? (
                   <AssetVideoPreview key={selectedAsset.assetId} assetId={selectedAsset.assetId} />

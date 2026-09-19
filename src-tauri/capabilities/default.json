@@ -3,5 +3,5 @@
   "identifier": "main-window",
   "description": "Minimal permissions for the Nexora Phase 1 shell.",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open"]
+  "permissions": ["core:default", "dialog:allow-open", "core:event:allow-listen", "core:event:allow-emit"]
 }

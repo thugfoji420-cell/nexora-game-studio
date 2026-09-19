@@ -10,18 +10,22 @@ mod model3d_generation;
 mod model3d_import;
 mod model3d_processing;
 mod model3d_validation;
+mod openrouter;
 mod project;
+pub mod provider_orchestrator;
 pub mod providers;
 pub mod runtime_manager;
 mod settings;
+mod source_normalization;
 mod video_generation;
 mod video_validation;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs,
     path::PathBuf,
+    process::{Command, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -34,12 +38,13 @@ use tauri::{Manager, RunEvent, State};
 
 use base64::Engine;
 use logging::JsonLogger;
-use project::{MANIFEST_FILENAME, ProjectInfo, ProjectManifest, ProjectState};
+use project::{MANIFEST_FILENAME, ProjectInfo, ProjectManifest, ProjectState, resolve_new_project_root};
 use providers::{Capability, ProviderHealth, ProviderRegistry, ProviderView};
 use runtime_manager::{
     RuntimeConfig, RuntimeKind, RuntimeManager, RuntimeState, RuntimeStatus, RuntimeType,
 };
-use settings::{AppSettings, UnityProjectTarget};
+use settings::AppSettings;
+use tracing_subscriber;
 
 #[derive(Serialize, Clone, Debug)]
 pub struct UnityProjectValidation {
@@ -47,6 +52,220 @@ pub struct UnityProjectValidation {
     pub unity_version: Option<String>,
     pub project_root: String,
     pub error_message: Option<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineTargetInfo {
+    pub target_id: String,
+    pub display_name: String,
+    pub detected: bool,
+    pub executable_path: Option<String>,
+    pub project_root: Option<String>,
+    pub deployment_supported: bool,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineUpdateStatus {
+    pub engine_id: String,
+    pub display_name: String,
+    pub current_version: Option<String>,
+    pub available_version: Option<String>,
+    pub update_available: bool,
+    pub status: String,
+    pub detail: String,
+}
+
+#[derive(Clone)]
+struct EngineUpdateTarget {
+    engine_id: &'static str,
+    display_name: &'static str,
+    root: PathBuf,
+}
+
+fn git_command(root: &PathBuf, args: &[&str]) -> Result<String, String> {
+    let safe_directory = root.to_string_lossy().to_string();
+    let mut cmd = Command::new("git");
+    cmd.arg("-c")
+        .arg(format!("safe.directory={safe_directory}"))
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let output = cmd.output()
+        .map_err(|error| format!("could not run git: {error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() { "git command failed".into() } else { detail });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn git_update_target(target: &EngineUpdateTarget, apply_update: bool) -> EngineUpdateStatus {
+    let current_version = git_command(&target.root, &["rev-parse", "--short", "HEAD"]).ok();
+    if !target.root.join(".git").exists() {
+        return EngineUpdateStatus {
+            engine_id: target.engine_id.into(),
+            display_name: target.display_name.into(),
+            current_version,
+            available_version: None,
+            update_available: false,
+            status: "manual".into(),
+            detail: "This engine is not installed as a Git repository.".into(),
+        };
+    }
+    if let Ok(changes) = git_command(&target.root, &["status", "--porcelain"]) {
+        if !changes.is_empty() {
+            return EngineUpdateStatus {
+                engine_id: target.engine_id.into(),
+                display_name: target.display_name.into(),
+                current_version,
+                available_version: None,
+                update_available: false,
+                status: "skipped".into(),
+                detail: "Local changes detected; automatic update was skipped.".into(),
+            };
+        }
+    }
+    if let Err(error) = git_command(&target.root, &["remote", "get-url", "origin"]) {
+        return EngineUpdateStatus {
+            engine_id: target.engine_id.into(),
+            display_name: target.display_name.into(),
+            current_version,
+            available_version: None,
+            update_available: false,
+            status: "manual".into(),
+            detail: format!("No update source configured: {error}"),
+        };
+    }
+    if let Err(error) = git_command(&target.root, &["fetch", "--quiet", "origin"]) {
+        return EngineUpdateStatus {
+            engine_id: target.engine_id.into(),
+            display_name: target.display_name.into(),
+            current_version,
+            available_version: None,
+            update_available: false,
+            status: "check-failed".into(),
+            detail: format!("Could not check for updates: {error}"),
+        };
+    }
+    let ahead = git_command(&target.root, &["rev-list", "--count", "HEAD..@{upstream}"])
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    if ahead == 0 {
+        return EngineUpdateStatus {
+            engine_id: target.engine_id.into(),
+            display_name: target.display_name.into(),
+            current_version: current_version.clone(),
+            available_version: current_version.clone(),
+            update_available: false,
+            status: "up-to-date".into(),
+            detail: "No engine update is available.".into(),
+        };
+    }
+    if !apply_update {
+        return EngineUpdateStatus {
+            engine_id: target.engine_id.into(),
+            display_name: target.display_name.into(),
+            current_version,
+            available_version: None,
+            update_available: true,
+            status: "available".into(),
+            detail: format!("{ahead} update(s) available."),
+        };
+    }
+    match git_command(&target.root, &["pull", "--ff-only", "--quiet"]) {
+        Ok(_) => {
+            let updated_version = git_command(&target.root, &["rev-parse", "--short", "HEAD"]).ok();
+            EngineUpdateStatus {
+                engine_id: target.engine_id.into(),
+                display_name: target.display_name.into(),
+                current_version,
+                available_version: updated_version,
+                update_available: true,
+                status: "updated".into(),
+                detail: "Engine updated automatically.".into(),
+            }
+        }
+        Err(error) => EngineUpdateStatus {
+            engine_id: target.engine_id.into(),
+            display_name: target.display_name.into(),
+            current_version,
+            available_version: None,
+            update_available: true,
+            status: "update-failed".into(),
+            detail: format!("Automatic update failed: {error}"),
+        },
+    }
+}
+
+fn check_non_git_engine(engine_id: &str, display_name: &str, detail: &str) -> EngineUpdateStatus {
+    EngineUpdateStatus {
+        engine_id: engine_id.into(),
+        display_name: display_name.into(),
+        current_version: None,
+        available_version: None,
+        update_available: false,
+        status: "manual".into(),
+        detail: detail.into(),
+    }
+}
+
+#[tauri::command]
+fn detect_engine_targets(_state: State<'_, AppState>) -> Vec<EngineTargetInfo> {
+    let unity_project = asset_delivery::discover_unity_project_path();
+    let blender = RuntimeManager::discover_blender();
+    let program_files = std::env::var_os("ProgramFiles").map(PathBuf::from);
+    let unreal_editor = program_files.as_ref().and_then(|root| {
+        let epic_root = root.join("Epic Games");
+        std::fs::read_dir(epic_root).ok()?.filter_map(Result::ok).map(|entry| {
+            entry.path().join("Engine").join("Binaries").join("Win64").join("UnrealEditor.exe")
+        }).find(|path| path.exists())
+    });
+    let godot = which::which("godot").ok().or_else(|| which::which("godot4").ok());
+
+    vec![
+        EngineTargetInfo {
+            target_id: "unity".into(),
+            display_name: "Unity".into(),
+            detected: unity_project.is_some(),
+            executable_path: None,
+            project_root: unity_project.map(|path| path.to_string_lossy().into_owned()),
+            deployment_supported: true,
+        },
+        EngineTargetInfo {
+            target_id: "unreal".into(),
+            display_name: "Unreal Engine".into(),
+            detected: unreal_editor.is_some(),
+            executable_path: unreal_editor.map(|path| path.to_string_lossy().into_owned()),
+            project_root: None,
+            deployment_supported: false,
+        },
+        EngineTargetInfo {
+            target_id: "godot".into(),
+            display_name: "Godot".into(),
+            detected: godot.is_some(),
+            executable_path: godot.map(|path| path.to_string_lossy().into_owned()),
+            project_root: None,
+            deployment_supported: false,
+        },
+        EngineTargetInfo {
+            target_id: "blender".into(),
+            display_name: "Blender".into(),
+            detected: blender.is_some(),
+            executable_path: blender.and_then(|config| config.launcher_path),
+            project_root: None,
+            deployment_supported: false,
+        },
+    ]
 }
 
 struct JobWorker {
@@ -110,11 +329,13 @@ struct AppState {
     logger: JsonLogger,
     current_project: Arc<Mutex<Option<Arc<ProjectState>>>>,
     job_worker: JobWorker,
+    recent_projects_path: PathBuf,
     recent_projects: Mutex<Vec<RecentProjectInfo>>,
     hardware_snapshot: Mutex<hardware::HardwareSnapshot>,
     provider_registry: Mutex<ProviderRegistry>,
     media_integrity_cache: asset_delivery::IntegrityCache,
     runtime_manager: Arc<Mutex<RuntimeManager>>,
+    provider_orchestrator: Arc<Mutex<provider_orchestrator::ProviderOrchestrator>>,
 }
 
 #[derive(Serialize)]
@@ -125,6 +346,44 @@ struct AppInfo {
     foundation_status: &'static str,
     local_first: bool,
     telemetry_enabled: bool,
+}
+
+/// Public-facing `AppSettings` shape exchanged with the frontend.
+///
+/// Mirrors `settings::AppSettings` but exposes the masked OpenRouter
+/// configuration so the raw API key never leaves the Rust process.
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicAppSettings {
+    schema_version: u32,
+    theme: settings::ThemePreference,
+    compact_sidebar: bool,
+    telemetry_enabled: bool,
+    a1111: settings::A1111Config,
+    hunyuan: settings::HunyuanConfig,
+    blender: settings::BlenderConfig,
+    unity_targets: HashMap<String, settings::UnityProjectTarget>,
+    active_unity_target: Option<String>,
+    openrouter: openrouter::MaskedOpenRouterConfig,
+    skip_runtime_startup_on_launch: bool,
+}
+
+impl From<settings::AppSettings> for PublicAppSettings {
+    fn from(value: settings::AppSettings) -> Self {
+        Self {
+            schema_version: value.schema_version,
+            theme: value.theme,
+            compact_sidebar: value.compact_sidebar,
+            telemetry_enabled: value.telemetry_enabled,
+            a1111: value.a1111,
+            hunyuan: value.hunyuan,
+            blender: value.blender,
+            unity_targets: value.unity_targets,
+            active_unity_target: value.active_unity_target,
+            openrouter: value.openrouter.masked(),
+            skip_runtime_startup_on_launch: value.skip_runtime_startup_on_launch,
+        }
+    }
 }
 
 fn command_error(state: &AppState, event: &str, error: impl std::fmt::Display) -> String {
@@ -153,19 +412,42 @@ fn get_app_info() -> AppInfo {
 }
 
 #[tauri::command]
-fn load_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
-    settings::load(&state.settings_path)
-        .map_err(|error| command_error(&state, "settings_load_failed", error))
+fn load_settings(state: State<'_, AppState>) -> Result<PublicAppSettings, String> {
+    let loaded = settings::load(&state.settings_path)
+        .map_err(|error| command_error(&state, "settings_load_failed", error))?;
+    Ok(PublicAppSettings::from(loaded))
 }
 
 #[tauri::command]
-fn save_settings(settings: AppSettings, state: State<'_, AppState>) -> Result<AppSettings, String> {
-    settings::save(&state.settings_path, &settings)
+fn save_settings(
+    settings: PublicAppSettings,
+    state: State<'_, AppState>,
+) -> Result<PublicAppSettings, String> {
+    // Persist the supplied settings to disk. The frontend only ever sees the
+    // masked OpenRouter config, so the real API key is preserved from the
+    // current in-memory state.
+    let mut current = state.settings.lock().unwrap();
+    let merged = settings::AppSettings {
+        schema_version: settings.schema_version,
+        theme: settings.theme,
+        compact_sidebar: settings.compact_sidebar,
+        telemetry_enabled: settings.telemetry_enabled,
+        a1111: settings.a1111,
+        hunyuan: settings.hunyuan,
+        blender: settings.blender,
+        unity_targets: settings.unity_targets,
+        active_unity_target: settings.active_unity_target,
+        openrouter: current.openrouter.clone(),
+        skip_runtime_startup_on_launch: settings.skip_runtime_startup_on_launch,
+    };
+    settings::save(&state.settings_path, &merged)
         .map_err(|error| command_error(&state, "settings_save_failed", error))?;
+    *current = merged.clone();
+    drop(current);
     state
         .logger
         .info("settings_saved", "Application settings were updated");
-    Ok(settings)
+    Ok(PublicAppSettings::from(merged))
 }
 
 #[tauri::command]
@@ -189,7 +471,7 @@ fn get_log_location(state: State<'_, AppState>) -> String {
     state.logger.path().display().to_string()
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RecentProjectInfo {
     root: PathBuf,
@@ -206,6 +488,25 @@ fn record_recent_project(
     recent.truncate(10);
 }
 
+fn load_recent_projects(path: &std::path::Path) -> Vec<RecentProjectInfo> {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+
+    serde_json::from_str::<Vec<RecentProjectInfo>>(&contents)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|project| project.root.is_dir())
+        .collect()
+}
+
+fn save_recent_projects(path: &std::path::Path, recent: &[RecentProjectInfo]) {
+    let Ok(contents) = serde_json::to_string_pretty(recent) else {
+        return;
+    };
+    let _ = fs::write(path, contents);
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateProjectResult {
@@ -217,10 +518,18 @@ struct CreateProjectResult {
 fn create_project(
     root: String,
     name: String,
+    engine_scope: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<CreateProjectResult, String> {
-    let project_root = PathBuf::from(root);
-    let project = ProjectState::create(&project_root, &name).map_err(|e| {
+    // The selected location is the PARENT directory; the project itself is
+    // created in `<parent>/<project name>` so every project gets its own
+    // independent root and a second project never collides with the first.
+    let parent = PathBuf::from(root);
+    let project_root = resolve_new_project_root(&parent, &name).map_err(|e| {
+        state.logger.error("project_create_failed", &e.to_string());
+        e.to_string()
+    })?;
+    let project = ProjectState::create_scoped(&project_root, &name, engine_scope.as_deref()).map_err(|e| {
         state.logger.error("project_create_failed", &e.to_string());
         e.to_string()
     })?;
@@ -236,6 +545,7 @@ fn create_project(
 
     let mut recent = state.recent_projects.lock().unwrap();
     record_recent_project(&mut recent, info.root.clone(), manifest.clone());
+    save_recent_projects(&state.recent_projects_path, &recent);
 
     state.logger.info(
         "project_created",
@@ -249,9 +559,9 @@ fn create_project(
 }
 
 #[tauri::command]
-fn open_project(root: String, state: State<'_, AppState>) -> Result<CreateProjectResult, String> {
+fn open_project(root: String, engine_scope: Option<String>, state: State<'_, AppState>) -> Result<CreateProjectResult, String> {
     let project_root = PathBuf::from(root);
-    let project = ProjectState::open(&project_root).map_err(|e| {
+    let project = ProjectState::open_scoped(&project_root, engine_scope.as_deref()).map_err(|e| {
         state.logger.error("project_open_failed", &e.to_string());
         e.to_string()
     })?;
@@ -267,6 +577,7 @@ fn open_project(root: String, state: State<'_, AppState>) -> Result<CreateProjec
 
     let mut recent = state.recent_projects.lock().unwrap();
     record_recent_project(&mut recent, info.root.clone(), manifest.clone());
+    save_recent_projects(&state.recent_projects_path, &recent);
 
     state.logger.info(
         "project_opened",
@@ -384,6 +695,9 @@ pub struct AssetInfo {
     pub codec: Option<String>,
     pub model_metadata_schema_version: Option<u32>,
     pub model_metadata: Option<model3d_validation::Model3dMetadata>,
+    pub processing_status: Option<String>,
+    pub approval_status: Option<String>,
+    pub source_type: Option<String>,
 }
 
 fn serialize_opt_u32<S: serde::Serializer>(
@@ -553,6 +867,9 @@ fn import_asset(path: String, state: State<'_, AppState>) -> Result<AssetInfo, S
         codec: None,
         model_metadata_schema_version: None,
         model_metadata: None,
+        processing_status: None,
+        approval_status: None,
+        source_type: Some("imported".into()),
     };
 
     state.logger.info(
@@ -716,6 +1033,9 @@ fn import_model_asset(
             codec: None,
             model_metadata_schema_version: Some(1),
             model_metadata: Some(validated.metadata),
+            processing_status: Some("raw".into()),
+            approval_status: None,
+            source_type: Some("imported".into()),
         })
     })();
     let _ = fs::remove_dir_all(staging);
@@ -783,7 +1103,8 @@ fn list_assets(state: State<'_, AppState>) -> Result<Vec<AssetInfo>, String> {
                    checksum, image_width, image_height, image_format, has_alpha,
                    imported_at_ms, status, media_kind, media_container, media_format,
                    media_width, media_height, duration_ms, fps_numerator, fps_denominator,
-                    validation_level, codec, model_metadata_schema_version, model_metadata_json
+                    validation_level, codec, model_metadata_schema_version, model_metadata_json,
+                    source_type, processing_status, (SELECT status FROM asset_approvals WHERE asset_id=assets.asset_id)
             FROM assets
             ORDER BY imported_at_ms DESC
         "#,
@@ -824,6 +1145,9 @@ fn list_assets(state: State<'_, AppState>) -> Result<Vec<AssetInfo>, String> {
                         .get::<_, Option<i64>>(21)?
                         .map(|value| value as u32),
                     model_metadata: parse_model_metadata(row.get(22)?)?,
+                    source_type: row.get(23)?,
+                    processing_status: row.get(24)?,
+                    approval_status: row.get(25)?,
                 })
             },
         )
@@ -853,7 +1177,8 @@ fn search_assets(query: String, state: State<'_, AppState>) -> Result<Vec<AssetI
                    checksum, image_width, image_height, image_format, has_alpha,
                    imported_at_ms, status, media_kind, media_container, media_format,
                    media_width, media_height, duration_ms, fps_numerator, fps_denominator,
-                    validation_level, codec, model_metadata_schema_version, model_metadata_json
+                    validation_level, codec, model_metadata_schema_version, model_metadata_json,
+                    source_type, processing_status, (SELECT status FROM asset_approvals WHERE asset_id=assets.asset_id)
             FROM assets
             WHERE original_filename LIKE ?1
             ORDER BY imported_at_ms DESC
@@ -895,6 +1220,9 @@ fn search_assets(query: String, state: State<'_, AppState>) -> Result<Vec<AssetI
                         .get::<_, Option<i64>>(21)?
                         .map(|value| value as u32),
                     model_metadata: parse_model_metadata(row.get(22)?)?,
+                    source_type: row.get(23)?,
+                    processing_status: row.get(24)?,
+                    approval_status: row.get(25)?,
                 })
             },
         )
@@ -999,9 +1327,46 @@ fn archive_project(root: String, state: State<'_, AppState>) -> Result<bool, Str
 
     let mut recent = state.recent_projects.lock().unwrap();
     recent.retain(|project| project.manifest.project_id != manifest.project_id);
+    save_recent_projects(&state.recent_projects_path, &recent);
 
     state.logger.info(
         "project_archived",
+        &format!("{} at {}", manifest.name, canonical.display()),
+    );
+    Ok(true)
+}
+
+#[tauri::command]
+fn delete_project(root: String, state: State<'_, AppState>) -> Result<bool, String> {
+    let project_root = PathBuf::from(root);
+    let canonical =
+        dunce::canonicalize(&project_root).map_err(|e| format!("invalid path: {}", e))?;
+
+    let manifest_path = canonical.join(MANIFEST_FILENAME);
+    if !manifest_path.exists() {
+        return Err("no Nexora project found at path".into());
+    }
+    let manifest = project::load_manifest(&manifest_path).map_err(|e| e.to_string())?;
+
+    // If this project is currently open, retire it first so its lock and
+    // database handles are released before we delete the folder. (Otherwise
+    // remove_dir_all fails on Windows because the lock/DB files are open.)
+    {
+        let mut current_guard = state.current_project.lock().unwrap();
+        if let Some(current) = current_guard.as_ref() {
+            if current.root == canonical {
+                retire_current_project(&mut current_guard)?;
+            }
+        }
+    }
+
+    fs::remove_dir_all(&canonical).map_err(|e| format!("could not delete project folder: {}", e))?;
+
+    let mut recent = state.recent_projects.lock().unwrap();
+    recent.retain(|project| project.manifest.project_id != manifest.project_id);
+    save_recent_projects(&state.recent_projects_path, &recent);
+    state.logger.info(
+        "project_deleted",
         &format!("{} at {}", manifest.name, canonical.display()),
     );
     Ok(true)
@@ -1058,6 +1423,9 @@ fn refresh_provider_health(
     let refresh_video = provider_id
         .as_deref()
         .is_none_or(|id| id == video_generation::PROVIDER_ID);
+    let refresh_openrouter = provider_id
+        .as_deref()
+        .is_none_or(|id| id == openrouter::PROVIDER_ID);
     let mut registry = state.provider_registry.lock().unwrap();
     let mut health = registry
         .refresh_health(provider_id.as_deref())
@@ -1093,6 +1461,68 @@ fn refresh_provider_health(
         health.retain(|value| value.provider_id != video_generation::PROVIDER_ID);
         health.push(item);
     }
+    if refresh_openrouter {
+        let config = state.settings.lock().unwrap().openrouter.clone();
+        let item = registry
+            .set_openrouter_state(
+                config.enabled,
+                if config.enabled && !config.api_key.is_empty() && !config.default_model.is_empty() {
+                    match openrouter::test_connection(&config) {
+                        Ok(_) => providers::HealthState::Healthy,
+                        Err(openrouter::OpenRouterError::InvalidApiKey)
+                        | Err(openrouter::OpenRouterError::Unauthorized)
+                        | Err(openrouter::OpenRouterError::Forbidden) => providers::HealthState::Misconfigured,
+                        Err(openrouter::OpenRouterError::RateLimited) => providers::HealthState::Degraded,
+                        _ => providers::HealthState::Unavailable,
+                    }
+                } else if !config.enabled {
+                    providers::HealthState::Unavailable
+                } else {
+                    providers::HealthState::Misconfigured
+                },
+                None,
+            )
+            .map_err(|error| command_error(&state, "provider_health_refresh_failed", error))?;
+        health.retain(|value| value.provider_id != openrouter::PROVIDER_ID);
+        health.push(item);
+    }
+    // Refresh local Hunyuan3D
+    // Hunyuan3D's /health endpoint can hang while the model is loading, so try
+    // HTTP first but fall back to a TCP connect (same strategy as the runtime
+    // manager) so a listening service is still detected as ready.
+    let hunyuan_reachable = {
+        let http_ok = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .and_then(|c| c.get("http://127.0.0.1:8081/health").send())
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        if http_ok {
+            true
+        } else {
+            // TCP fallback: if port 8081 answers, the service is up
+            std::net::TcpStream::connect_timeout(
+                &"127.0.0.1:8081".parse::<std::net::SocketAddr>().unwrap(),
+                std::time::Duration::from_secs(3),
+            )
+            .is_ok()
+        }
+    };
+    let item = registry
+        .set_local_hunyuan_state(
+            true,
+            hunyuan_reachable,
+            true,
+            if hunyuan_reachable {
+                Some("Hunyuan3D server ready".into())
+            } else {
+                Some("Hunyuan3D server unreachable on http://127.0.0.1:8081".into())
+            },
+        )
+        .map_err(|error| command_error(&state, "provider_health_refresh_failed", error))?;
+    health.retain(|value| value.provider_id != "local.hunyuan");
+    health.push(item);
+
     Ok(health)
 }
 
@@ -1334,6 +1764,18 @@ fn approve_model3d_asset(
 }
 
 #[tauri::command]
+fn approve_image_asset(
+    asset_id: String,
+    generation_job_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let guard = state.current_project.lock().unwrap();
+    let project = guard.as_ref().ok_or("no project open")?;
+    jobs::approve_image_asset(project, &asset_id, generation_job_id.as_deref())
+        .map_err(|error| command_error(&state, "image_asset_approve_failed", error))
+}
+
+#[tauri::command]
 fn reject_model3d_asset(
     asset_id: String,
     processing_job_id: String,
@@ -1394,24 +1836,37 @@ fn get_hunyuan_generation_result(
 }
 
 #[tauri::command]
-fn discover_unity_project(state: State<'_, AppState>) -> Result<Option<String>, String> {
-    // Try to find Unity project at the known Neon Velocity 2100 location
-    let known_path = PathBuf::from(r"C:\Users\Mak Tech\development\Games\Neon Velocity 2100");
-    if known_path.join("ProjectSettings").exists() && known_path.join("Assets").exists() {
-        Ok(Some(known_path.to_string_lossy().to_string()))
-    } else {
-        // Fall back to checking common locations
-        let app_data = dirs::data_local_dir().unwrap_or_default();
-        let dev_path = app_data
-            .join("development")
-            .join("Games")
-            .join("Neon Velocity 2100");
-        if dev_path.join("ProjectSettings").exists() && dev_path.join("Assets").exists() {
-            Ok(Some(dev_path.to_string_lossy().to_string()))
-        } else {
-            Ok(None)
+fn discover_unity_project(_state: State<'_, AppState>) -> Result<Option<String>, String> {
+    // Look for any Unity project under the user's profile, preferring paths under
+    // a "development/Games" layout, then fall back to the Documents folder.
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    candidates.push(home.join("development").join("Games"));
+    candidates.push(home.join("Documents").join("Games"));
+    if let Some(app_data) = dirs::data_local_dir() {
+        candidates.push(app_data.join("development").join("Games"));
+        candidates.push(app_data.join("Games"));
+    }
+
+    for parent in candidates {
+        if let Ok(entries) = std::fs::read_dir(&parent) {
+            for entry in entries.flatten() {
+                let candidate = entry.path();
+                if candidate.join("ProjectSettings").exists()
+                    && candidate.join("Assets").exists()
+                    && candidate.join("Packages").exists()
+                    && candidate
+                        .join("ProjectSettings")
+                        .join("ProjectVersion.txt")
+                        .exists()
+                {
+                    return Ok(Some(candidate.to_string_lossy().to_string()));
+                }
+            }
         }
     }
+
+    Ok(None)
 }
 
 #[tauri::command]
@@ -1548,11 +2003,15 @@ fn validate_unity_project(
     app_settings.active_unity_target = Some(target_id);
 
     drop(app_settings);
-    // Save settings - but we need to re-acquire the lock
+    // Save settings - re-acquire the lock to persist the updated target registry.
+    // Unity validation must not require a Nexora project to be open, so we
+    // only persist when we actually hold a project; otherwise the in-memory
+    // settings are still updated for the current session.
     let settings_path = state.settings_path.clone();
-    let guard = state.current_project.lock().unwrap();
-    let project = guard.as_ref().ok_or("no project open")?;
-    settings::save(&settings_path, &state.settings.lock().unwrap()).map_err(|e| e.to_string())?;
+    if state.current_project.lock().unwrap().is_some() {
+        settings::save(&settings_path, &state.settings.lock().unwrap())
+            .map_err(|e| e.to_string())?;
+    }
 
     Ok(UnityProjectValidation {
         is_valid,
@@ -1695,7 +2154,7 @@ fn install_unity_package(
     project_root: String,
     package_name: String,
     version: String,
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
 ) -> Result<(), String> {
     let project_root = PathBuf::from(project_root);
     let manifest_path = project_root.join("Packages").join("manifest.json");
@@ -1793,6 +2252,89 @@ async fn list_runtimes(state: State<'_, AppState>) -> Result<Vec<RuntimeState>, 
 }
 
 #[tauri::command]
+async fn check_and_update_engines(
+    state: State<'_, AppState>,
+) -> Result<Vec<EngineUpdateStatus>, String> {
+    let git_targets = vec![
+        EngineUpdateTarget {
+            engine_id: "hunyuan3d",
+            display_name: "Hunyuan 3D Engine",
+            root: PathBuf::from(r"C:\AI\Hunyuan3D"),
+        },
+        EngineUpdateTarget {
+            engine_id: "automatic1111",
+            display_name: "Image Engine",
+            root: PathBuf::from(r"C:\AI\stable-diffusion-webui"),
+        },
+    ];
+    let check_targets = git_targets.clone();
+    let mut statuses = tauri::async_runtime::spawn_blocking(move || {
+        check_targets
+            .iter()
+            .map(|target| git_update_target(target, false))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    statuses.push(check_non_git_engine(
+        "blender",
+        "Mesh Pipeline",
+        "Blender updates are managed through its installer.",
+    ));
+    statuses.push(check_non_git_engine(
+        "wan_video",
+        "Video Engine",
+        "No local update source is configured for the video pipeline.",
+    ));
+
+    let runtime_manager = (*state.runtime_manager.lock().unwrap()).clone();
+    let mut restart_after_update = Vec::new();
+    let mut update_ids = Vec::new();
+    for status in &mut statuses {
+        if !status.update_available || status.status != "available" {
+            continue;
+        }
+        update_ids.push(status.engine_id.clone());
+        if let Ok(runtime) = runtime_manager.get_runtime(&status.engine_id).await {
+            if runtime.started_by_nexora {
+                if runtime_manager.stop_runtime(&status.engine_id).await.is_ok() {
+                    restart_after_update.push(status.engine_id.clone());
+                }
+            } else if matches!(runtime.status, RuntimeStatus::Ready | RuntimeStatus::Starting) {
+                status.status = "deferred".into();
+                status.detail = "Engine is running outside Nexora; close it before updating.".into();
+                update_ids.retain(|engine_id| engine_id != &status.engine_id);
+            }
+        }
+    }
+
+    let apply_targets: Vec<EngineUpdateTarget> = git_targets
+        .into_iter()
+        .filter(|target| update_ids.iter().any(|engine_id| engine_id == target.engine_id))
+        .collect();
+    if !apply_targets.is_empty() {
+        let applied = tauri::async_runtime::spawn_blocking(move || {
+            apply_targets
+                .iter()
+                .map(|target| git_update_target(target, true))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        for updated in applied {
+            if let Some(status) = statuses.iter_mut().find(|status| status.engine_id == updated.engine_id) {
+                *status = updated;
+            }
+        }
+    }
+
+    for engine_id in restart_after_update {
+        let _ = runtime_manager.start_runtime(&engine_id).await;
+    }
+    Ok(statuses)
+}
+
+#[tauri::command]
 async fn get_runtime(
     runtime_id: String,
     state: State<'_, AppState>,
@@ -1843,6 +2385,22 @@ async fn initialize_runtimes(
 }
 
 #[tauri::command]
+async fn get_orchestrator_status(
+    state: State<'_, AppState>,
+) -> Result<provider_orchestrator::OrchestratorStatus, String> {
+    let orchestrator = (*state.provider_orchestrator.lock().unwrap()).clone();
+    Ok(orchestrator.get_status().await)
+}
+
+#[tauri::command]
+async fn start_orchestrator(
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let orchestrator = (*state.provider_orchestrator.lock().unwrap()).clone();
+    orchestrator.initialize_sequential().await
+}
+
+#[tauri::command]
 fn get_a1111_config(state: State<'_, AppState>) -> settings::A1111Config {
     state.settings.lock().unwrap().a1111.clone()
 }
@@ -1877,7 +2435,80 @@ fn save_hunyuan_config(
 }
 
 #[tauri::command]
-fn discover_runtimes(state: State<'_, AppState>) -> Vec<RuntimeConfig> {
+fn get_openrouter_config(state: State<'_, AppState>) -> openrouter::MaskedOpenRouterConfig {
+    state.settings.lock().unwrap().openrouter.masked()
+}
+
+#[tauri::command]
+fn save_openrouter_config(
+    config: openrouter::OpenRouterConfig,
+    state: State<'_, AppState>,
+) -> Result<openrouter::MaskedOpenRouterConfig, String> {
+    config.validate().map_err(|e| e.to_string())?;
+    let mut app_settings = state.settings.lock().unwrap();
+    app_settings.openrouter = config.clone();
+    let settings_path = state.settings_path.clone();
+    settings::save(&settings_path, &app_settings).map_err(|e| e.to_string())?;
+    Ok(app_settings.openrouter.masked())
+}
+
+#[tauri::command]
+fn remove_openrouter_key(state: State<'_, AppState>) -> Result<openrouter::MaskedOpenRouterConfig, String> {
+    let mut app_settings = state.settings.lock().unwrap();
+    app_settings.openrouter.api_key.clear();
+    app_settings.openrouter.enabled = false;
+    let settings_path = state.settings_path.clone();
+    settings::save(&settings_path, &app_settings).map_err(|e| e.to_string())?;
+    Ok(app_settings.openrouter.masked())
+}
+
+#[tauri::command]
+fn test_openrouter_connection(
+    state: State<'_, AppState>,
+) -> Result<openrouter::OpenRouterHealth, String> {
+    let config = state.settings.lock().unwrap().openrouter.clone();
+    let health = openrouter::health(&config);
+    Ok(health)
+}
+
+#[tauri::command]
+fn list_openrouter_models(
+    state: State<'_, AppState>,
+) -> Result<Vec<openrouter::OpenRouterModel>, String> {
+    let config = state.settings.lock().unwrap().openrouter.clone();
+    openrouter::list_models(&config).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn openrouter_chat_completion(
+    model_id: String,
+    system_prompt: Option<String>,
+    user_prompt: String,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<openrouter::OpenRouterChatResponse, String> {
+    let config = state.settings.lock().unwrap().openrouter.clone();
+    openrouter::chat_completion(&config, &model_id, system_prompt.as_deref(), &user_prompt, temperature, max_tokens)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_skip_runtime_startup(state: State<'_, AppState>) -> bool {
+    state.settings.lock().unwrap().skip_runtime_startup_on_launch
+}
+
+#[tauri::command]
+fn set_skip_runtime_startup(enabled: bool, state: State<'_, AppState>) -> Result<bool, String> {
+    let mut app_settings = state.settings.lock().unwrap();
+    app_settings.skip_runtime_startup_on_launch = enabled;
+    let settings_path = state.settings_path.clone();
+    settings::save(&settings_path, &app_settings).map_err(|e| e.to_string())?;
+    Ok(enabled)
+}
+
+#[tauri::command]
+fn discover_runtimes(_state: State<'_, AppState>) -> Vec<RuntimeConfig> {
     let mut runtimes = Vec::new();
     if let Some(config) = RuntimeManager::discover_a1111() {
         runtimes.push(config);
@@ -1891,6 +2522,94 @@ fn discover_runtimes(state: State<'_, AppState>) -> Vec<RuntimeConfig> {
     runtimes
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UnityDeploymentDto {
+    delivery_id: String,
+    asset_id: String,
+    target_id: String,
+    unity_project_root: String,
+    destination_folder: String,
+    deployed_path: String,
+    meta_path: String,
+    file_size: u64,
+    bytes_written: u64,
+    checksum: String,
+    category: String,
+}
+
+#[tauri::command]
+fn deploy_model3d_to_unity(
+    asset_id: String,
+    target_id: String,
+    category: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<UnityDeploymentDto, String> {
+    let guard = state.current_project.lock().unwrap();
+    let project = guard.as_ref().ok_or("no project open")?;
+    let cat = match category.as_deref() {
+        Some("vehicle") | Some("Vehicle") => asset_delivery::AssetCategory::Vehicle,
+        Some("character") | Some("Character") => asset_delivery::AssetCategory::Character,
+        Some("environment") | Some("Environment") => asset_delivery::AssetCategory::Environment,
+        Some("prop") | Some("Prop") => asset_delivery::AssetCategory::Prop,
+        Some("weapon") | Some("Weapon") => asset_delivery::AssetCategory::Weapon,
+        Some("building") | Some("Building") => asset_delivery::AssetCategory::Building,
+        Some("vegetation") | Some("Vegetation") => asset_delivery::AssetCategory::Vegetation,
+        Some("furniture") | Some("Furniture") => asset_delivery::AssetCategory::Furniture,
+        Some("equipment") | Some("Equipment") => asset_delivery::AssetCategory::Equipment,
+        Some("texture") | Some("Texture") => asset_delivery::AssetCategory::Texture,
+        Some("material") | Some("Material") => asset_delivery::AssetCategory::Material,
+        _ => {
+            // Auto-classify from the asset's original filename.
+            let db = project.db.lock().map_err(|e| e.to_string())?;
+            let row: Result<(String, String), _> = db.query_row(
+                "SELECT original_filename, media_kind FROM assets WHERE asset_id=?1",
+                rusqlite::params![asset_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            );
+            drop(db);
+            match row {
+                Ok((filename, kind)) => asset_delivery::AssetCategory::classify(&filename, &kind),
+                Err(_) => asset_delivery::AssetCategory::Prop,
+            }
+        }
+    };
+
+    let deployment = asset_delivery::deploy_model3d_to_unity(
+        project,
+        &asset_id,
+        "",
+        &target_id,
+        cat,
+    )
+    .map_err(|e| command_error(&state, "unity_deploy_failed", e))?;
+
+    state.logger.info(
+        "unity_deploy_succeeded",
+        &format!(
+            "{} -> {} ({} bytes, category={:?})",
+            deployment.asset_id,
+            deployment.deployed_path.display(),
+            deployment.bytes_written,
+            cat
+        ),
+    );
+
+    Ok(UnityDeploymentDto {
+        delivery_id: deployment.delivery_id,
+        asset_id: deployment.asset_id,
+        target_id: deployment.target_id,
+        unity_project_root: deployment.unity_project_root.to_string_lossy().into_owned(),
+        destination_folder: deployment.destination_folder.to_string_lossy().into_owned(),
+        deployed_path: deployment.deployed_path.to_string_lossy().into_owned(),
+        meta_path: deployment.meta_path.to_string_lossy().into_owned(),
+        file_size: deployment.file_size,
+        bytes_written: deployment.bytes_written,
+        checksum: deployment.checksum,
+        category: format!("{:?}", cat),
+    })
+}
+
 #[cfg(test)]
 mod recent_project_tests {
     use super::*;
@@ -1902,6 +2621,7 @@ mod recent_project_tests {
             name: format!("Project {project_id}"),
             created_at_ms: 1,
             format_version: "0.1.0".to_string(),
+            engine_scope: None,
         }
     }
 
@@ -2980,26 +3700,45 @@ mod asset_tests {
 }
 
 pub fn run() {
+    // Initialize tracing for structured logging (file only, no console in release)
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("nexora_game_studio=debug".parse().unwrap())
+                .add_directive("runtime_manager=debug".parse().unwrap()),
+        )
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .init();
+
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .register_asynchronous_uri_scheme_protocol("nexora-media", |context, request, responder| {
             asset_delivery::handle_protocol(context.app_handle(), request, responder);
         })
         .setup(|app| {
             let data_dir = app.path().app_local_data_dir()?;
             let settings_dir = data_dir.join("config");
+            let recent_projects_path = settings_dir.join("recent-projects.v1.json");
             let log_dir = data_dir.join("logs");
             std::fs::create_dir_all(&settings_dir)?;
+            std::fs::create_dir_all(&log_dir)?;
             let logger = JsonLogger::new(log_dir.join("nexora-game-studio.jsonl"))?;
             logger.info("application_startup", "Nexora Game Studio is starting");
+            tracing::info!("Nexora Game Studio starting up");
+
             let current_project = Arc::new(Mutex::new(None));
             let hardware_snapshot = hardware::detect(None);
             let image_provider_config_path = settings_dir.join("image-provider.v1.json");
             let image_provider_config = image_generation::load_config(&image_provider_config_path)?;
             let video_provider_config_path = settings_dir.join("video-provider.v1.json");
             let video_provider_config = video_generation::load_config(&video_provider_config_path)?;
-            let provider_registry = ProviderRegistry::phase7(
+            let app_settings =
+                settings::load(&settings_dir.join("settings.json")).unwrap_or_default();
+            let provider_registry = ProviderRegistry::phase8(
                 image_provider_config.enabled,
                 video_provider_config.enabled,
+                app_settings.openrouter.enabled,
             )
             .map_err(|error| std::io::Error::other(error.to_string()))?;
             let image_provider_config = Arc::new(Mutex::new(image_provider_config));
@@ -3009,8 +3748,6 @@ pub fn run() {
                 image_provider_config.clone(),
                 video_provider_config.clone(),
             );
-            let app_settings =
-                settings::load(&settings_dir.join("settings.json")).unwrap_or_default();
 
             // Initialize RuntimeManager and register discovered runtimes
             let mut runtime_manager = RuntimeManager::new();
@@ -3036,27 +3773,38 @@ pub fn run() {
                     working_directory: None,
                     environment: HashMap::new(),
                 });
-            tauri::async_runtime::block_on(runtime_manager.register_runtime(a1111_config)).ok();
-            tauri::async_runtime::block_on(runtime_manager.register_runtime(hunyuan_config)).ok();
-            tauri::async_runtime::block_on(runtime_manager.register_runtime(blender_config)).ok();
+            if let Err(error) = tauri::async_runtime::block_on(runtime_manager.register_runtime(a1111_config.clone())) {
+                tracing::warn!(?error, runtime_id = %a1111_config.runtime_id, "automatic1111 runtime registration failed");
+            }
+            if let Err(error) = tauri::async_runtime::block_on(runtime_manager.register_runtime(hunyuan_config.clone())) {
+                tracing::warn!(?error, runtime_id = %hunyuan_config.runtime_id, "hunyuan3d runtime registration failed");
+            }
+            if let Err(error) = tauri::async_runtime::block_on(runtime_manager.register_runtime(blender_config.clone())) {
+                tracing::warn!(?error, runtime_id = %blender_config.runtime_id, "blender runtime registration failed");
+            }
             let runtime_manager = Arc::new(Mutex::new(runtime_manager));
 
-            // Start async runtime initialization
-            let runtime_manager_clone = runtime_manager.clone();
+            // Initialize ProviderOrchestrator
+            let runtime_manager_arc = {
+                let guard = runtime_manager.lock().unwrap();
+                Arc::new((*guard).clone())
+            };
+            let mut provider_orchestrator = provider_orchestrator::ProviderOrchestrator::new(runtime_manager_arc);
+            provider_orchestrator.set_app_handle(app.handle().clone());
+            let provider_orchestrator = Arc::new(Mutex::new(provider_orchestrator));
+
+            // Start sequential provider initialization
+            let provider_orchestrator_clone = provider_orchestrator.clone();
             tauri::async_runtime::spawn(async move {
-                eprintln!("Starting local runtime initialization");
-                let runtime_manager_arc = {
-                    let guard = runtime_manager_clone.lock().unwrap();
+                tracing::info!("Starting sequential provider initialization");
+                let orchestrator = {
+                    let guard = provider_orchestrator_clone.lock().unwrap();
                     (*guard).clone()
                 };
-                let results = runtime_manager_arc.initialize_all().await;
-                for (runtime_id, status) in results {
-                    eprintln!(
-                        "Runtime initialization result: {}: {:?}",
-                        runtime_id, status
-                    );
+                if let Err(error) = orchestrator.initialize_sequential().await {
+                    tracing::error!(?error, "Provider initialization failed");
                 }
-                eprintln!("Local runtime initialization completed");
+                tracing::info!("Provider initialization completed");
             });
 
             app.manage(AppState {
@@ -3069,11 +3817,13 @@ pub fn run() {
                 logger,
                 current_project,
                 job_worker,
-                recent_projects: Mutex::new(Vec::new()),
+                recent_projects_path,
+                recent_projects: Mutex::new(load_recent_projects(&settings_dir.join("recent-projects.v1.json"))),
                 hardware_snapshot: Mutex::new(hardware_snapshot),
                 provider_registry: Mutex::new(provider_registry),
                 media_integrity_cache: asset_delivery::IntegrityCache::default(),
                 runtime_manager,
+                provider_orchestrator,
             });
             Ok(())
         })
@@ -3088,6 +3838,7 @@ pub fn run() {
             get_current_project,
             get_recent_projects,
             archive_project,
+            delete_project,
             import_asset,
             list_assets,
             search_assets,
@@ -3118,6 +3869,7 @@ pub fn run() {
             create_model3d_processing_job,
             get_model3d_processing_result,
             approve_model3d_asset,
+            approve_image_asset,
             reject_model3d_asset,
             reprocess_model3d_asset,
             create_unity_delivery,
@@ -3133,11 +3885,13 @@ pub fn run() {
             create_hunyuan_generation_job,
             get_hunyuan_generation_result,
             discover_unity_project,
+            detect_engine_targets,
             validate_unity_project,
             save_unity_config,
             discover_blender,
             validate_blender_executable,
             list_runtimes,
+            check_and_update_engines,
             get_runtime,
             check_runtime_health,
             start_runtime,
@@ -3147,25 +3901,42 @@ pub fn run() {
             save_a1111_config,
             get_hunyuan_config,
             save_hunyuan_config,
-            discover_runtimes
+            get_openrouter_config,
+            save_openrouter_config,
+            remove_openrouter_key,
+            test_openrouter_connection,
+            list_openrouter_models,
+            openrouter_chat_completion,
+            get_skip_runtime_startup,
+            set_skip_runtime_startup,
+            discover_runtimes,
+            deploy_model3d_to_unity,
+            get_orchestrator_status,
+            start_orchestrator,
         ])
         .build(tauri::generate_context!())
         .expect("failed to initialize Nexora Game Studio");
 
+    tracing::info!("Tauri app built successfully, starting event loop");
+
     app.run(|handle, event| {
-        if let RunEvent::Exit = event {
-            if let Some(state) = handle.try_state::<AppState>() {
-                state.job_worker.stop();
-                if let Ok(mut guard) = state.current_project.lock() {
-                    let _ = retire_current_project(&mut guard);
+        tracing::info!(?event, "Tauri event received");
+        match event {
+            RunEvent::Exit => {
+                if let Some(state) = handle.try_state::<AppState>() {
+                    state.job_worker.stop();
+                    if let Ok(mut guard) = state.current_project.lock() {
+                        let _ = retire_current_project(&mut guard);
+                    }
+                    // Shutdown Nexora-owned runtime processes
+                    let runtime_manager_arc = (*state.runtime_manager.lock().unwrap()).clone();
+                    let _ = tauri::async_runtime::block_on(runtime_manager_arc.shutdown_all());
+                    state
+                        .logger
+                        .info("application_shutdown", "Nexora Game Studio closed cleanly");
                 }
-                // Shutdown Nexora-owned runtime processes
-                let runtime_manager_arc = (*state.runtime_manager.lock().unwrap()).clone();
-                tauri::async_runtime::block_on(runtime_manager_arc.shutdown_all());
-                state
-                    .logger
-                    .info("application_shutdown", "Nexora Game Studio closed cleanly");
             }
+            _ => {}
         }
     });
 }

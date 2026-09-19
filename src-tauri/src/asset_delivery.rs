@@ -6,7 +6,7 @@ use std::{
     fs::{File, Metadata},
     hash::{Hash, Hasher},
     io::{Read, Seek, SeekFrom},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::UNIX_EPOCH,
 };
@@ -1010,4 +1010,828 @@ mod tests {
             http::StatusCode::FORBIDDEN
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Unity Direct Project Delivery & Structure Normalization
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssetCategory {
+    Vehicle,
+    Character,
+    Environment,
+    Prop,
+    Weapon,
+    Building,
+    Vegetation,
+    Furniture,
+    Equipment,
+    Generic,
+    Texture,
+    Material,
+}
+
+impl AssetCategory {
+    pub fn folder_name(&self) -> &'static str {
+        match self {
+            AssetCategory::Vehicle => "Vehicles",
+            AssetCategory::Character => "Characters",
+            AssetCategory::Environment => "Environment",
+            AssetCategory::Prop => "Props",
+            AssetCategory::Weapon => "Weapons",
+            AssetCategory::Building => "Buildings",
+            AssetCategory::Vegetation => "Vegetation",
+            AssetCategory::Furniture => "Furniture",
+            AssetCategory::Equipment => "Equipment",
+            AssetCategory::Generic => "Props",
+            AssetCategory::Texture => "Textures",
+            AssetCategory::Material => "Materials",
+        }
+    }
+
+    pub fn classify(filename: &str, media_kind: &str) -> Self {
+        let lower = filename.to_lowercase();
+        if media_kind == "image" || media_kind == "texture" {
+            return AssetCategory::Texture;
+        }
+        if media_kind == "material" || lower.contains("material") || lower.contains("mat_") {
+            return AssetCategory::Material;
+        }
+
+        // Weapon classification
+        if lower.contains("gun")
+            || lower.contains("rifle")
+            || lower.contains("sword")
+            || lower.contains("blade")
+            || lower.contains("pistol")
+            || lower.contains("weapon")
+            || lower.contains("axe")
+            || lower.contains("shield")
+            || lower.contains("bow")
+            || lower.contains("staff")
+        {
+            return AssetCategory::Weapon;
+        }
+        // Vehicle classification
+        if lower.contains("car")
+            || lower.contains("vehicle")
+            || lower.contains("racing")
+            || lower.contains("truck")
+            || lower.contains("auto")
+            || lower.contains("bike")
+            || lower.contains("ship")
+            || lower.contains("plane")
+            || lower.contains("kart")
+            || lower.contains("motorcycle")
+            || lower.contains("hovercraft")
+            || lower.contains("spacecraft")
+            || lower.contains("tank")
+            || lower.contains("sedan")
+            || lower.contains("coupe")
+            || lower.contains("suv")
+            || lower.contains("racer")
+        {
+            return AssetCategory::Vehicle;
+        }
+        // Character classification
+        if lower.contains("character")
+            || lower.contains("player")
+            || lower.contains("human")
+            || lower.contains("monster")
+            || lower.contains("npc")
+            || lower.contains("hero")
+            || lower.contains("enemy")
+            || lower.contains("robot")
+            || lower.contains("creature")
+            || lower.contains("avatar")
+            || lower.contains("warrior")
+            || lower.contains("wizard")
+            || lower.contains("boss")
+            || lower.contains("golem")
+            || lower.contains("zombie")
+            || lower.contains("alien")
+            || lower.contains("knight")
+        {
+            return AssetCategory::Character;
+        }
+        // Building classification
+        if lower.contains("building")
+            || lower.contains("tower")
+            || lower.contains("house")
+            || lower.contains("castle")
+            || lower.contains("temple")
+            || lower.contains("ruin")
+            || lower.contains("bridge")
+            || lower.contains("barn")
+            || lower.contains("hangar")
+        {
+            return AssetCategory::Building;
+        }
+        // Vegetation classification
+        if lower.contains("tree")
+            || lower.contains("bush")
+            || lower.contains("grass")
+            || lower.contains("flower")
+            || lower.contains("plant")
+            || lower.contains("foliage")
+            || lower.contains("forest")
+        {
+            return AssetCategory::Vegetation;
+        }
+        // Furniture classification
+        if lower.contains("chair")
+            || lower.contains("table")
+            || lower.contains("desk")
+            || lower.contains("couch")
+            || lower.contains("sofa")
+            || lower.contains("bed")
+            || lower.contains("cabinet")
+            || lower.contains("shelf")
+            || lower.contains("lamp")
+        {
+            return AssetCategory::Furniture;
+        }
+        // Equipment classification
+        if lower.contains("tool")
+            || lower.contains("helmet")
+            || lower.contains("armor")
+            || lower.contains("backpack")
+            || lower.contains("battery")
+            || lower.contains("generator")
+            || lower.contains("equipment")
+        {
+            return AssetCategory::Equipment;
+        }
+        // Environment classification
+        if lower.contains("env")
+            || lower.contains("rock")
+            || lower.contains("boulder")
+            || lower.contains("terrain")
+            || lower.contains("road")
+            || lower.contains("mountain")
+            || lower.contains("dungeon")
+            || lower.contains("street")
+            || lower.contains("city")
+            || lower.contains("landscape")
+            || lower.contains("island")
+            || lower.contains("structure")
+        {
+            return AssetCategory::Environment;
+        }
+        // Default to Prop
+        AssetCategory::Prop
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct UnityDeployment {
+    pub delivery_id: String,
+    pub asset_id: String,
+    pub target_id: String,
+    pub unity_project_root: PathBuf,
+    pub destination_folder: PathBuf,
+    pub deployed_path: PathBuf,
+    pub meta_path: PathBuf,
+    pub file_size: u64,
+    pub bytes_written: u64,
+    pub checksum: String,
+}
+
+pub fn discover_unity_project_path() -> Option<PathBuf> {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    candidates.push(home.join("development").join("Games"));
+    candidates.push(home.join("Documents").join("Games"));
+    if let Some(app_data) = dirs::data_local_dir() {
+        candidates.push(app_data.join("development").join("Games"));
+        candidates.push(app_data.join("Games"));
+    }
+
+    for parent in candidates {
+        if let Ok(entries) = std::fs::read_dir(&parent) {
+            for entry in entries.flatten() {
+                let candidate = entry.path();
+                if is_valid_unity_project(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn is_valid_unity_project(path: &Path) -> bool {
+    path.is_dir()
+        && path.join("Assets").is_dir()
+        && path.join("ProjectSettings").is_dir()
+        && path.join("Packages").is_dir()
+}
+
+pub fn resolve_unity_destination_folder(unity_root: &Path, category: AssetCategory) -> PathBuf {
+    let assets = unity_root.join("Assets");
+    let cat_name = category.folder_name();
+
+    // Check project conventions in priority order
+    let conventions = [
+        assets.join("Nexora").join(cat_name),
+        assets.join("Models").join(cat_name),
+        assets.join("Art").join(cat_name),
+        assets.join("Game").join(cat_name),
+    ];
+
+    for candidate in &conventions {
+        if candidate.exists() {
+            return candidate.clone();
+        }
+    }
+
+    if assets.join("Models").exists() {
+        return assets.join("Models").join(cat_name);
+    }
+    if assets.join("Art").exists() {
+        return assets.join("Art").join(cat_name);
+    }
+
+    // Default standard Nexora folder
+    assets.join("Nexora").join(cat_name)
+}
+
+pub fn resolve_unique_destination_path(
+    destination_folder: &Path,
+    safe_stem: &str,
+    ext: &str,
+    checksum: &str,
+) -> PathBuf {
+    let initial_name = format!("{safe_stem}.{ext}");
+    let initial_path = destination_folder.join(&initial_name);
+
+    if !initial_path.exists() {
+        return initial_path;
+    }
+
+    // Check if the existing file has the exact same content
+    if let Ok(existing_bytes) = std::fs::read(&initial_path) {
+        let existing_checksum = format!("{:x}", sha2::Sha256::digest(&existing_bytes));
+        if existing_checksum == checksum {
+            return initial_path;
+        }
+    }
+
+    // Naming collision with different content -> generate incremented safe name
+    let mut counter = 1;
+    loop {
+        let candidate_name = format!("{safe_stem}_{counter}.{ext}");
+        let candidate_path = destination_folder.join(&candidate_name);
+        if !candidate_path.exists() {
+            return candidate_path;
+        }
+        if let Ok(existing_bytes) = std::fs::read(&candidate_path) {
+            let existing_checksum = format!("{:x}", sha2::Sha256::digest(&existing_bytes));
+            if existing_checksum == checksum {
+                return candidate_path;
+            }
+        }
+        counter += 1;
+    }
+}
+
+pub fn deploy_model3d_to_unity(
+    project: &ProjectState,
+    asset_id: &str,
+    _processing_job_id: &str,
+    target_id: &str,
+    category: AssetCategory,
+) -> Result<UnityDeployment, String> {
+    let (master_path, checksum, filename, media_kind, processing_status, approval_status) = {
+        let db = project.db.lock().map_err(|e| e.to_string())?;
+        let row: (Option<String>, String, String, String, Option<String>, Option<String>) = db
+            .query_row(
+                "SELECT managed_master_path, checksum, original_filename, media_kind, processing_status, (SELECT status FROM asset_approvals WHERE asset_id=assets.asset_id) FROM assets WHERE asset_id=?1 AND project_id=?2 AND status='ready'",
+                rusqlite::params![asset_id, project.manifest.project_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .map_err(|e| format!("asset not found or not ready: {e}"))?;
+
+        let master = row.0.map(PathBuf::from).unwrap_or_else(|| {
+            let ext = if row.3 == "model3d" { "glb" } else { "png" };
+            project.root.join("assets/masters").join(format!("{asset_id}.{ext}"))
+        });
+        (master, row.1, row.2, row.3, row.4, row.5)
+    };
+
+    if media_kind == "model3d"
+        && (processing_status.as_deref() != Some("approved")
+            || approval_status.as_deref() != Some("approved"))
+    {
+        return Err("3D asset must pass the final approval gate before engine deployment".into());
+    }
+
+    if !master_path.exists() {
+        return Err(format!("master asset file not found on disk at {}", master_path.display()));
+    }
+
+    let unity_root = if target_id.is_empty() {
+        discover_unity_project_path()
+            .ok_or_else(|| "no unity project discovered".to_string())?
+    } else {
+        PathBuf::from(target_id)
+    };
+
+    if !is_valid_unity_project(&unity_root) {
+        if !unity_root.exists() {
+            return Err(format!("Unity project directory does not exist: {}", unity_root.display()));
+        }
+        if !unity_root.join("Assets").exists() {
+            return Err(format!("path is not a valid Unity project (missing Assets/ folder): {}", unity_root.display()));
+        }
+        if !unity_root.join("ProjectSettings").exists() {
+            return Err(format!("path is not a valid Unity project (missing ProjectSettings/ folder): {}", unity_root.display()));
+        }
+        return Err(format!("path is not a valid Unity project: {}", unity_root.display()));
+    }
+
+    let destination_folder = resolve_unity_destination_folder(&unity_root, category);
+    std::fs::create_dir_all(&destination_folder).map_err(|e| format!("failed to create destination folder: {e}"))?;
+
+    let stem = PathBuf::from(&filename)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| asset_id.to_string());
+    let safe_stem = stem.replace(' ', "_").replace(|c: char| !c.is_alphanumeric() && c != '_' && c != '-', "");
+    let ext = if media_kind == "model3d" { "glb" } else { "png" };
+
+    let deployed_path = resolve_unique_destination_path(&destination_folder, &safe_stem, ext, &checksum);
+
+    // Deploy main master model
+    std::fs::copy(&master_path, &deployed_path).map_err(|e| format!("failed to copy asset: {e}"))?;
+    let file_size = std::fs::metadata(&deployed_path).map(|m| m.len()).unwrap_or(0);
+
+    let meta_path = deployed_path.with_extension(format!("{ext}.meta"));
+    let guid = if meta_path.exists() {
+        // Preserve existing GUID from meta file if present
+        let existing = std::fs::read_to_string(&meta_path).unwrap_or_default();
+        existing.lines()
+            .find(|l| l.starts_with("guid: "))
+            .map(|l| l.trim_start_matches("guid: ").trim().to_string())
+            .unwrap_or_else(|| Uuid::now_v7().simple().to_string())
+    } else {
+        Uuid::now_v7().simple().to_string()
+    };
+
+    let meta_content = format!("fileFormatVersion: 2
+guid: {guid}
+ModelImporter:
+  serializedVersion: 22200
+  materials:
+    materialImportMode: 2
+    useSRGBColors: 1
+");
+    let _ = std::fs::write(&meta_path, meta_content);
+
+    // Also look for and deploy companion LODs and Collider if present in job directory
+    if let Some(parent_dir) = master_path.parent() {
+        // LOD1
+        let lod1_src = parent_dir.join("vehicle_lod1.glb");
+        if lod1_src.exists() {
+            let lod1_dst = destination_folder.join(format!("{safe_stem}_LOD1.glb"));
+            let _ = std::fs::copy(&lod1_src, &lod1_dst);
+            let lod1_meta = destination_folder.join(format!("{safe_stem}_LOD1.glb.meta"));
+            let lod1_guid = Uuid::now_v7().simple().to_string();
+            let _ = std::fs::write(&lod1_meta, format!("fileFormatVersion: 2
+guid: {lod1_guid}
+ModelImporter:
+  serializedVersion: 22200
+  materials:
+    materialImportMode: 2
+"));
+        }
+
+        // LOD2
+        let lod2_src = parent_dir.join("vehicle_lod2.glb");
+        if lod2_src.exists() {
+            let lod2_dst = destination_folder.join(format!("{safe_stem}_LOD2.glb"));
+            let _ = std::fs::copy(&lod2_src, &lod2_dst);
+            let lod2_meta = destination_folder.join(format!("{safe_stem}_LOD2.glb.meta"));
+            let lod2_guid = Uuid::now_v7().simple().to_string();
+            let _ = std::fs::write(&lod2_meta, format!("fileFormatVersion: 2
+guid: {lod2_guid}
+ModelImporter:
+  serializedVersion: 22200
+  materials:
+    materialImportMode: 2
+"));
+        }
+
+        // Collider
+        let col_src = parent_dir.join("clean_collider.glb");
+        if col_src.exists() {
+            let col_dst = destination_folder.join(format!("{safe_stem}_Collider.glb"));
+            let _ = std::fs::copy(&col_src, &col_dst);
+            let col_meta = destination_folder.join(format!("{safe_stem}_Collider.glb.meta"));
+            let col_guid = Uuid::now_v7().simple().to_string();
+            let _ = std::fs::write(&col_meta, format!("fileFormatVersion: 2
+guid: {col_guid}
+ModelImporter:
+  serializedVersion: 22200
+  materials:
+    materialImportMode: 2
+"));
+        }
+    }
+
+    // Deploy Unity Prefab with preconfigured LODGroup, Renderers, and Collider
+    let prefab_path = destination_folder.join(format!("{safe_stem}.prefab"));
+    let prefab_meta = destination_folder.join(format!("{safe_stem}.prefab.meta"));
+    let prefab_guid = Uuid::now_v7().simple().to_string();
+
+    // GUIDs for the model files (must match what we wrote to .meta files)
+    let master_guid = guid; // from master model meta
+    let lod1_guid = Uuid::now_v7().simple().to_string(); // will match LOD1 meta
+    let lod2_guid = Uuid::now_v7().simple().to_string(); // will match LOD2 meta
+    let col_guid = Uuid::now_v7().simple().to_string();   // will match Collider meta
+
+    // Compute fileIDs (Unity uses first 8 bytes of GUID as fileID base)
+    // Format: localIdentifierInFile = 0 for main object, fileID = (GUID as u64) << 32 | localID
+    // For simplicity, we use a fixed localIdentifier scheme
+    let master_file_id = format!("{}00000000", &master_guid[..8]);
+    let lod1_file_id = format!("{}00000000", &lod1_guid[..8]);
+    let lod2_file_id = format!("{}00000000", &lod2_guid[..8]);
+    let col_file_id = format!("{}00000000", &col_guid[..8]);
+
+let prefab_yaml = format!(r####"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &1000000000000000
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  serializedVersion: 6
+  m_Component:
+  - component: {{fileID: 4000000000000000}}
+  - component: {{fileID: 2050000000000000}}
+  - component: {{fileID: 8000000000000000}}
+  m_Layer: 0
+  m_Name: {safe_stem}
+  m_TagString: Untagged
+  m_Icon: {{fileID: 0}}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!4 &4000000000000000
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  m_GameObject: {{fileID: 1000000000000000}}
+  m_LocalRotation: {{x: 0, y: 0, z: 0, w: 1}}
+  m_LocalPosition: {{x: 0, y: 0, z: 0}}
+  m_LocalScale: {{x: 1, y: 1, z: 1}}
+  m_ConstrainProportionsScale: 0
+  m_Children:
+  - {{fileID: 2000000000000000}}
+  - {{fileID: 3000000000000000}}
+  - {{fileID: 4000000000000000}}
+  - {{fileID: 5000000000000000}}
+  m_Father: {{fileID: 0}}
+  m_RootOrder: 0
+  m_LocalEulerAnglesHint: {{x: 0, y: 0, z: 0}}
+--- !u!1 &2000000000000000
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  serializedVersion: 6
+  m_Component:
+  - component: {{fileID: 2100000000000000}}
+  m_Layer: 0
+  m_Name: LOD0
+  m_TagString: Untagged
+  m_Icon: {{fileID: 0}}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!205 &2050000000000000
+LODGroup:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  m_GameObject: {{fileID: 1000000000000000}}
+  serializedVersion: 2
+  m_LocalReferencePoint: {{x: 0, y: 0, z: 0}}
+  m_Size: 1
+  m_FadeMode: 0
+  m_AnimateCrossFading: 0
+  m_LastLODIsBillboard: 0
+  m_LODs:
+  - screenRelativeTransitionHeight: 0.6
+    fadeTransitionWidth: 0.02
+    renderers:
+    - {{fileID: 2100000000000000}}
+  - screenRelativeTransitionHeight: 0.3
+    fadeTransitionWidth: 0.02
+    renderers:
+    - {{fileID: 3100000000000000}}
+  - screenRelativeTransitionHeight: 0.1
+    fadeTransitionWidth: 0.02
+    renderers:
+    - {{fileID: 4100000000000000}}
+  m_Enabled: 1
+--- !u!4 &2000000000000000
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  m_GameObject: {{fileID: 2000000000000000}}
+  m_LocalRotation: {{x: 0, y: 0, z: 0, w: 1}}
+  m_LocalPosition: {{x: 0, y: 0, z: 0}}
+  m_LocalScale: {{x: 1, y: 1, z: 1}}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {{fileID: 4000000000000000}}
+  m_RootOrder: 0
+  m_LocalEulerAnglesHint: {{x: 0, y: 0, z: 0}}
+--- !u!1 &3000000000000000
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  serializedVersion: 6
+  m_Component:
+  - component: {{fileID: 3100000000000000}}
+  m_Layer: 0
+  m_Name: LOD1
+  m_TagString: Untagged
+  m_Icon: {{fileID: 0}}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!4 &3000000000000000
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  m_GameObject: {{fileID: 3000000000000000}}
+  m_LocalRotation: {{x: 0, y: 0, z: 0, w: 1}}
+  m_LocalPosition: {{x: 0, y: 0, z: 0}}
+  m_LocalScale: {{x: 1, y: 1, z: 1}}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {{fileID: 4000000000000000}}
+  m_RootOrder: 0
+  m_LocalEulerAnglesHint: {{x: 0, y: 0, z: 0}}
+--- !u!1 &4000000000000000
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  serializedVersion: 6
+  m_Component:
+  - component: {{fileID: 4100000000000000}}
+  m_Layer: 0
+  m_Name: LOD2
+  m_TagString: Untagged
+  m_Icon: {{fileID: 0}}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!4 &4000000000000000
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  m_GameObject: {{fileID: 4000000000000000}}
+  m_LocalRotation: {{x: 0, y: 0, z: 0, w: 1}}
+  m_LocalPosition: {{x: 0, y: 0, z: 0}}
+  m_LocalScale: {{x: 1, y: 1, z: 1}}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {{fileID: 4000000000000000}}
+  m_RootOrder: 0
+  m_LocalEulerAnglesHint: {{x: 0, y: 0, z: 0}}
+--- !u!1 &5000000000000000
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  serializedVersion: 6
+  m_Component:
+  - component: {{fileID: 5100000000000000}}
+  m_Layer: 0
+  m_Name: Collider
+  m_TagString: Untagged
+  m_Icon: {{fileID: 0}}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 1
+  m_IsActive: 1
+--- !u!4 &5000000000000000
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  m_GameObject: {{fileID: 5000000000000000}}
+  m_LocalRotation: {{x: 0, y: 0, z: 0, w: 1}}
+  m_LocalPosition: {{x: 0, y: 0, z: 0}}
+  m_LocalScale: {{x: 1, y: 1, z: 1}}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {{fileID: 4000000000000000}}
+  m_RootOrder: 0
+  m_LocalEulerAnglesHint: {{x: 0, y: 0, z: 0}}
+--- !u!23 &2100000000000000
+MeshRenderer:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  m_GameObject: {{fileID: 2000000000000000}}
+  m_Enabled: 1
+  m_CastShadows: 1
+  m_ReceiveShadows: 1
+  m_DynamicOccludee: 1
+  m_MotionVectors: 1
+  m_LightProbeUsage: 1
+  m_ReflectionProbeUsage: 1
+  m_RenderingLayerMask: 1
+  m_RendererPriority: 0
+  m_Materials:
+  - {{fileID: 0}}
+  m_StaticBatchInfo:
+    firstSubMesh: 0
+    subMeshCount: 0
+  m_StaticBatchRoot: {{fileID: 0}}
+  m_ProbeAnchor: {{fileID: 0}}
+  m_LightProbeVolumeOverride: {{fileID: 0}}
+  m_RenderProbeAnchor: {{fileID: 0}}
+  m_ProbeVolumeSceneOverride: {{fileID: 0}}
+  m_UseLightProbes: 1
+  m_UseReflectionProbes: 1
+  m_ReceiveGIDiffuse: 1
+  m_ReceiveGISpecular: 1
+--- !u!23 &3100000000000000
+MeshRenderer:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  m_GameObject: {{fileID: 3000000000000000}}
+  m_Enabled: 1
+  m_CastShadows: 1
+  m_ReceiveShadows: 1
+  m_DynamicOccludee: 1
+  m_MotionVectors: 1
+  m_LightProbeUsage: 1
+  m_ReflectionProbeUsage: 1
+  m_RenderingLayerMask: 1
+  m_RendererPriority: 0
+  m_Materials:
+  - {{fileID: 0}}
+  m_StaticBatchInfo:
+    firstSubMesh: 0
+    subMeshCount: 0
+  m_StaticBatchRoot: {{fileID: 0}}
+  m_ProbeAnchor: {{fileID: 0}}
+  m_LightProbeVolumeOverride: {{fileID: 0}}
+  m_RenderProbeAnchor: {{fileID: 0}}
+  m_ProbeVolumeSceneOverride: {{fileID: 0}}
+  m_UseLightProbes: 1
+  m_UseReflectionProbes: 1
+  m_ReceiveGIDiffuse: 1
+  m_ReceiveGISpecular: 1
+--- !u!23 &4100000000000000
+MeshRenderer:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  m_GameObject: {{fileID: 4000000000000000}}
+  m_Enabled: 1
+  m_CastShadows: 1
+  m_ReceiveShadows: 1
+  m_DynamicOccludee: 1
+  m_MotionVectors: 1
+  m_LightProbeUsage: 1
+  m_ReflectionProbeUsage: 1
+  m_RenderingLayerMask: 1
+  m_RendererPriority: 0
+  m_Materials:
+  - {{fileID: 0}}
+  m_StaticBatchInfo:
+    firstSubMesh: 0
+    subMeshCount: 0
+  m_StaticBatchRoot: {{fileID: 0}}
+  m_ProbeAnchor: {{fileID: 0}}
+  m_LightProbeVolumeOverride: {{fileID: 0}}
+  m_RenderProbeAnchor: {{fileID: 0}}
+  m_ProbeVolumeSceneOverride: {{fileID: 0}}
+  m_UseLightProbes: 1
+  m_UseReflectionProbes: 1
+  m_ReceiveGIDiffuse: 1
+  m_ReceiveGISpecular: 1
+--- !u!65 &5100000000000000
+MeshCollider:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  m_GameObject: {{fileID: 5000000000000000}}
+  m_Enabled: 1
+  m_Convex: 1
+  m_IsTrigger: 0
+  m_CookingOptions: 0
+  m_Material: {{fileID: 0}}
+  m_Mesh: {{fileID: {col_file_id}}}
+--- !u!8000000000000000
+MeshFilter:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  m_GameObject: {{fileID: 2000000000000000}}
+  m_Mesh: {{fileID: {master_file_id}}}
+--- !u!8000000000000000
+MeshFilter:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  m_GameObject: {{fileID: 3000000000000000}}
+  m_Mesh: {{fileID: {lod1_file_id}}}
+--- !u!8000000000000000
+MeshFilter:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  m_GameObject: {{fileID: 4000000000000000}}
+  m_Mesh: {{fileID: {lod2_file_id}}}
+"####);
+
+    // Write LOD1 meta with correct GUID
+    let lod1_meta = destination_folder.join(format!("{safe_stem}_LOD1.glb.meta"));
+    let _ = std::fs::write(&lod1_meta, format!("fileFormatVersion: 2
+guid: {lod1_guid}
+ModelImporter:
+  serializedVersion: 22200
+  materials:
+    materialImportMode: 2
+"));
+
+    // Write LOD2 meta with correct GUID
+    let lod2_meta = destination_folder.join(format!("{safe_stem}_LOD2.glb.meta"));
+    let _ = std::fs::write(&lod2_meta, format!("fileFormatVersion: 2
+guid: {lod2_guid}
+ModelImporter:
+  serializedVersion: 22200
+  materials:
+    materialImportMode: 2
+"));
+
+    // Write Collider meta with correct GUID
+    let col_meta = destination_folder.join(format!("{safe_stem}_Collider.glb.meta"));
+    let _ = std::fs::write(&col_meta, format!("fileFormatVersion: 2
+guid: {col_guid}
+ModelImporter:
+  serializedVersion: 22200
+  materials:
+    materialImportMode: 2
+"));
+
+    let prefab_meta_content = format!("fileFormatVersion: 2
+guid: {prefab_guid}
+PrefabImporter:
+  externalObjects: {{}}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+");
+
+    let _ = std::fs::write(&prefab_path, prefab_yaml);
+    let _ = std::fs::write(&prefab_meta, prefab_meta_content);
+
+    let delivery_id = Uuid::now_v7().to_string();
+
+    Ok(UnityDeployment {
+        delivery_id,
+        asset_id: asset_id.to_string(),
+        target_id: unity_root.to_string_lossy().into_owned(),
+        unity_project_root: unity_root,
+        destination_folder,
+        deployed_path,
+        meta_path,
+        file_size,
+        bytes_written: file_size,
+        checksum,
+    })
 }

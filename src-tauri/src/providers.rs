@@ -29,6 +29,7 @@ pub enum Capability {
     HunyuanImageTo3d,
     MeshProcessing,
     MaterialGeneration,
+    PromptGeneration,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -345,6 +346,21 @@ impl ProviderRegistry {
         Ok(registry)
     }
 
+    pub fn phase8(image_enabled: bool, video_enabled: bool, openrouter_configured: bool) -> Result<Self, ProviderError> {
+        let mut registry = Self::phase7(image_enabled, video_enabled)?;
+        registry.register_core_local_http(local_hunyuan(true), HealthState::Healthy)?;
+        registry.register_core_local_cli(local_blender(), HealthState::Healthy)?;
+        let openrouter_health = crate::openrouter::health(&crate::openrouter::OpenRouterConfig {
+            enabled: openrouter_configured,
+            ..Default::default()
+        });
+        registry.register_remote_api(
+            crate::openrouter::provider_manifest(),
+            openrouter_health.state,
+        )?;
+        Ok(registry)
+    }
+
     pub fn register(
         &mut self,
         manifest: ProviderManifest,
@@ -357,6 +373,17 @@ impl ProviderRegistry {
         self.insert(manifest, health)
     }
 
+    fn register_remote_api(
+        &mut self,
+        manifest: ProviderManifest,
+        health: HealthState,
+    ) -> Result<(), ProviderError> {
+        let mut validated = manifest.clone();
+        validated.enabled = false;
+        validated.validate()?;
+        self.insert(manifest, health)
+    }
+
     fn register_core_local_http(
         &mut self,
         manifest: ProviderManifest,
@@ -364,8 +391,29 @@ impl ProviderRegistry {
     ) -> Result<(), ProviderError> {
         if !matches!(
             manifest.provider_id.as_str(),
-            "local.a1111" | "local.comfyui"
+            "local.a1111" | "local.comfyui" | "local.hunyuan"
         ) || manifest.execution_mode != ExecutionMode::LocalHttp
+            || manifest.nature != ProviderNature::Real
+        {
+            return Err(ProviderError::InvalidMetadata);
+        }
+        let mut validated = manifest.clone();
+        validated.enabled = false;
+        validated.validate()?;
+        self.insert(manifest, health)
+    }
+
+    /// Core local CLI providers (Blender) follow the same pattern as core
+    /// local HTTP providers: validate a disabled copy, then insert the
+    /// enabled manifest. The worker resolves the executable at job time, so
+    /// registration is static and the health refresher never probes it.
+    fn register_core_local_cli(
+        &mut self,
+        manifest: ProviderManifest,
+        health: HealthState,
+    ) -> Result<(), ProviderError> {
+        if manifest.provider_id != "local.blender"
+            || manifest.execution_mode != ExecutionMode::ControlledCli
             || manifest.nature != ProviderNature::Real
         {
             return Err(ProviderError::InvalidMetadata);
@@ -436,6 +484,47 @@ impl ProviderRegistry {
         } else {
             HealthState::Healthy
         };
+        provider.health.checked_at = Utc::now();
+        provider.health.detail = detail;
+        Ok(provider.health.clone())
+    }
+
+    pub fn set_local_hunyuan_state(
+        &mut self,
+        enabled: bool,
+        reachable: bool,
+        compatible: bool,
+        detail: Option<String>,
+    ) -> Result<ProviderHealth, ProviderError> {
+        let provider = self
+            .providers
+            .get_mut("local.hunyuan")
+            .ok_or_else(|| ProviderError::UnknownProvider("local.hunyuan".into()))?;
+        provider.manifest.enabled = enabled;
+        provider.health.state = if !enabled || !reachable {
+            HealthState::Unavailable
+        } else if !compatible {
+            HealthState::Misconfigured
+        } else {
+            HealthState::Healthy
+        };
+        provider.health.checked_at = Utc::now();
+        provider.health.detail = detail;
+        Ok(provider.health.clone())
+    }
+
+    pub fn set_openrouter_state(
+        &mut self,
+        enabled: bool,
+        state: HealthState,
+        detail: Option<String>,
+    ) -> Result<ProviderHealth, ProviderError> {
+        let provider = self
+            .providers
+            .get_mut("remote.openrouter")
+            .ok_or_else(|| ProviderError::UnknownProvider("remote.openrouter".into()))?;
+        provider.manifest.enabled = enabled;
+        provider.health.state = state;
         provider.health.checked_at = Utc::now();
         provider.health.detail = detail;
         Ok(provider.health.clone())
@@ -542,7 +631,9 @@ impl ProviderRegistry {
             .values()
             .filter(|provider| {
                 provider.manifest.enabled
-                    && provider.manifest.classification == Classification::Local
+                    && (provider.manifest.classification == Classification::Local
+                        || (provider.manifest.classification == Classification::Remote
+                            && provider.manifest.execution_mode == ExecutionMode::RemoteApi))
                     && provider.manifest.capabilities.contains(&capability)
                     && matches!(
                         provider.health.state,
@@ -574,7 +665,9 @@ impl ProviderRegistry {
             .ok_or_else(|| ProviderError::UnknownProvider(provider_id.into()))?;
         let view = provider_view(provider, snapshot);
         if !view.manifest.enabled
-            || view.manifest.classification != Classification::Local
+            || (view.manifest.classification != Classification::Local
+                && !(view.manifest.classification == Classification::Remote
+                    && view.manifest.execution_mode == ExecutionMode::RemoteApi))
             || !view.manifest.capabilities.contains(&capability)
             || !matches!(
                 view.health.state,
@@ -1015,6 +1108,59 @@ fn local_comfyui(enabled: bool) -> ProviderManifest {
     }
 }
 
+fn local_hunyuan(enabled: bool) -> ProviderManifest {
+    ProviderManifest {
+        schema_version: PROVIDER_MANIFEST_SCHEMA_VERSION,
+        provider_id: "local.hunyuan".into(),
+        display_name: "Local Hunyuan3D".into(),
+        version: "1.0.0".into(),
+        provider_type: ProviderType::ThreeDProcessing,
+        execution_mode: ExecutionMode::LocalHttp,
+        nature: ProviderNature::Real,
+        classification: Classification::Local,
+        enabled,
+        capabilities: vec![
+            Capability::Model3dTextTo3d,
+            Capability::Model3dImageTo3d,
+            Capability::HunyuanTextTo3d,
+            Capability::HunyuanImageTo3d,
+        ],
+        health_check: HealthCheckType::LocalHttp,
+        requirements: requirements(ResourceClass::Heavy),
+        license: unknown_license(),
+        permissions: vec![
+            Permission::InputAssetsRead,
+            Permission::JobWorkingDirectoryWrite,
+            Permission::OutputStagingWrite,
+            Permission::Network,
+        ],
+    }
+}
+
+fn local_blender() -> ProviderManifest {
+    ProviderManifest {
+        schema_version: PROVIDER_MANIFEST_SCHEMA_VERSION,
+        provider_id: "local.blender".into(),
+        display_name: "Local Blender".into(),
+        version: "1.0.0".into(),
+        provider_type: ProviderType::ThreeDProcessing,
+        execution_mode: ExecutionMode::ControlledCli,
+        nature: ProviderNature::Real,
+        classification: Classification::Local,
+        enabled: true,
+        capabilities: vec![Capability::MeshProcessing],
+        health_check: HealthCheckType::Process,
+        requirements: requirements(ResourceClass::Standard),
+        license: unknown_license(),
+        permissions: vec![
+            Permission::InputAssetsRead,
+            Permission::JobWorkingDirectoryRead,
+            Permission::JobWorkingDirectoryWrite,
+            Permission::OutputStagingWrite,
+        ],
+    }
+}
+
 fn mock_basic() -> ProviderManifest {
     mock_manifest(
         "mock.image.basic",
@@ -1053,11 +1199,11 @@ fn mock_unavailable() -> ProviderManifest {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::hardware::{Confidence, GpuSnapshot, HARDWARE_SCHEMA_VERSION, HardwareSource};
 
-    fn snapshot(
+    pub(crate) fn snapshot(
         ram: Option<u64>,
         disk: Option<u64>,
         gpu: Option<(&str, Option<u64>)>,
@@ -1123,6 +1269,7 @@ mod tests {
             Capability::ThreeDGeneration,
             Capability::MeshProcessing,
             Capability::MaterialGeneration,
+            Capability::PromptGeneration,
         ];
         assert_eq!(
             serde_json::to_value(capabilities).unwrap(),
@@ -1138,7 +1285,8 @@ mod tests {
                 "video_to_video",
                 "three_d_generation",
                 "mesh_processing",
-                "material_generation"
+                "material_generation",
+                "prompt_generation"
             ])
         );
     }
@@ -1370,6 +1518,21 @@ mod tests {
             registry.select(Capability::ImageToImage, &low),
             Err(ProviderError::NoSuitableProvider)
         ));
+    }
+
+    #[test]
+    fn phase8_registers_selectable_blender_mesh_processing() {
+        // Regression: the Blender stage's creation gate resolves its provider
+        // through the registry. phase8 (the production constructor) must
+        // expose local.blender as a selectable MeshProcessing provider or
+        // every Blender optimization fails with "no compatible 3D processing
+        // provider is configured".
+        let registry = ProviderRegistry::phase8(true, true, false).unwrap();
+        let selected = registry
+            .select(Capability::MeshProcessing, &snapshot(Some(16_000), Some(50_000), None))
+            .expect("local.blender must be selectable for MeshProcessing");
+        assert_eq!(selected.manifest.provider_id, "local.blender");
+        assert_eq!(selected.fit.status, CompatibilityStatus::Compatible);
     }
 
     #[test]
