@@ -71,7 +71,7 @@ function createDefaultInitialState(): InitialState {
   return {
     info: {
       name: "Nexora Game Studio",
-      version: "0.1.6",
+      version: "0.2.1",
       foundationStatus: "Operational",
       localFirst: true,
       telemetryEnabled: false,
@@ -365,7 +365,7 @@ export function App() {
     if (workspaceId === "video-generator") return <VideoGeneratorPage key={projectKey} currentProject={engineProject} onOpenProjectModal={openProjectModal} />;
     if (workspaceId === "model3d-generator") return <Model3dGeneratorPage key={projectKey} currentProject={engineProject} onOpenProjectModal={openProjectModal} />;
     if (workspaceId === "model3d-review") return <Model3dReviewPage key={projectKey} />;
-    if (workspaceId === "hunyuan-generator") return <HunyuanGeneratorPage key={projectKey} currentProject={engineProject} onOpenProjectModal={openProjectModal} onOpenProject={handleOpenProject} />;
+    if (workspaceId === "hunyuan-generator") return <HunyuanGeneratorPage key={projectKey} currentProject={engineProject} onOpenProjectModal={openProjectModal} />;
     return <PlaceholderPage description={definition.description} />;
   };
 

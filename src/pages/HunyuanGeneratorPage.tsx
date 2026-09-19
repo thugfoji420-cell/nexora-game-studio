@@ -152,11 +152,9 @@ const initialRequest: HunyuanGenerationRequest = {
 export function HunyuanGeneratorPage({
   currentProject,
   onOpenProjectModal,
-  onOpenProject,
 }: {
   currentProject?: ProjectInfo | null;
   onOpenProjectModal?: (mode: "create" | "open", scope?: EngineProjectScope) => void;
-  onOpenProject?: (root: string) => void;
 } = {}) {
   const [studioMode, setStudioMode] = useState<StudioMode>("full_circle");
   const [assetCreationStyle, setAssetCreationStyle] = useState<AssetCreationStyle>("normal");
