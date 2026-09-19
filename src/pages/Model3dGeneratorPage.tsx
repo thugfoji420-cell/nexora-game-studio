@@ -23,7 +23,10 @@ import {
   type Model3dGenerationMode,
   type Model3dGenerationRequest,
   type ProviderView,
+  type EngineProjectScope,
+  type ProjectInfo,
 } from "../types/core";
+import { ProjectManagementBar } from "../components/ProjectManagementBar";
 
 const POLL_INTERVAL_MS = 1000;
 
@@ -39,7 +42,13 @@ const initialRequest: Model3dGenerationRequest = {
   outputFormat: MODEL3D_OUTPUT_FORMAT,
 };
 
-export function Model3dGeneratorPage() {
+export function Model3dGeneratorPage({
+  currentProject,
+  onOpenProjectModal,
+}: {
+  currentProject?: ProjectInfo | null;
+  onOpenProjectModal?: (mode: "create" | "open", scope?: EngineProjectScope) => void;
+} = {}) {
   const [request, setRequest] = useState(initialRequest);
   const [randomSeed, setRandomSeed] = useState(true);
   const [providers, setProviders] = useState<ProviderView[]>([]);
@@ -56,7 +65,13 @@ export function Model3dGeneratorPage() {
   const activeJobId = useRef<string | null>(null);
 
   const loadWorkspaceData = async () => {
-    const [nextProviders, nextAssets, nextJobs] = await Promise.all([listProviders(), listAssets(), listJobs()]);
+    const safeAssets = await listAssets().catch(() => [] as AssetInfo[]);
+    const safeJobs = await listJobs().catch(() => [] as JobInfo[]);
+    const [nextProviders, nextAssets, nextJobs] = await Promise.all([
+      listProviders(),
+      Promise.resolve(safeAssets),
+      Promise.resolve(safeJobs),
+    ]);
     setProviders(nextProviders);
     setAssets(nextAssets);
     setJobs(nextJobs.filter((item) => item.jobType === "model3d.generate"));
@@ -67,7 +82,16 @@ export function Model3dGeneratorPage() {
 
   useEffect(() => {
     let mounted = true;
-    Promise.all([listProviders(), listAssets(), listJobs()])
+    const selectedImageAssetId = sessionStorage.getItem("nexora_selected_image_asset_id");
+    if (selectedImageAssetId) {
+      sessionStorage.removeItem("nexora_selected_image_asset_id");
+      setRequest((current) => ({ ...current, mode: "image_to_3d", sourceAssetId: selectedImageAssetId }));
+    }
+    Promise.all([
+      listProviders(),
+      listAssets().catch(() => [] as AssetInfo[]),
+      listJobs().catch(() => [] as JobInfo[]),
+    ])
       .then(([nextProviders, nextAssets, nextJobs]) => {
         if (!mounted) return;
         setProviders(nextProviders);
@@ -113,10 +137,10 @@ export function Model3dGeneratorPage() {
     getModel3dGenerationResult(jobId)
       .then(async (result) => {
         const assetIds = completedModel3dAssetIds(result);
-        const nextAssets = await listAssets();
+        const nextAssets = await listAssets().catch(() => [] as AssetInfo[]);
         if (!active || activeJobId.current !== jobId) return;
         setResultAssetIds(assetIds);
-        setAssets(nextAssets);
+        if (nextAssets.length > 0) setAssets(nextAssets);
       })
       .catch((nextError: unknown) => { if (active) setError(presentModel3dGenerationError(nextError)); });
     return () => { active = false; };
@@ -126,7 +150,7 @@ export function Model3dGeneratorPage() {
   const modeProviders = providers.filter(({ manifest }) => manifest.capabilities.includes(capability));
   const eligibleProviders = modeProviders.filter((provider) => isEligibleModel3dProvider(provider, request.mode));
   const selectedProvider = eligibleProviders[0];
-  const sourceImages = assets.filter((asset) => asset.mediaKind === "image" && asset.status === "ready");
+  const sourceImages = assets.filter((asset) => asset.mediaKind === "image" && asset.status === "ready" && (asset.sourceType !== "generated" || asset.approvalStatus === "approved"));
   const modelAssets = assets.filter((asset) => asset.mediaKind === "model3d");
   const submittedRequest: Model3dGenerationRequest = {
     ...request,
@@ -181,7 +205,19 @@ export function Model3dGeneratorPage() {
 
   return (
     <section className="image-generator-page model3d-generator-page">
-      <div className="image-generator-intro"><div><div className="panel-label">MANAGED 3D GENERATION</div><h2>Structural GLB Generator</h2><p>Create managed 3D assets through an explicitly compatible provider.</p></div><button className="btn btn--secondary" type="button" disabled={refreshing} onClick={() => void handleRefresh()}>{refreshing ? "Refreshing..." : "Refresh"}</button></div>
+      <div className="image-generator-intro">
+        <div>
+          <div className="panel-label">MANAGED 3D GENERATION</div>
+          <h2>Structural 3D Engine (Standalone)</h2>
+          <p>Direct Hunyuan3D mesh generation with full prompt controls and real-time GPU synthesis.</p>
+        </div>
+        <button className="btn btn--secondary" type="button" disabled={refreshing} onClick={() => void handleRefresh()}>
+          {refreshing ? "Refreshing..." : "Refresh"}
+        </button>
+      </div>
+
+      <ProjectManagementBar currentProject={currentProject} scope="3d" onOpenProjectModal={onOpenProjectModal} />
+
       {error && <div className="error-banner" role="alert">{error}</div>}
       {validationErrors.length > 0 && <ul className="provider-warnings" role="alert">{validationErrors.map((item) => <li key={item}>{item}</li>)}</ul>}
 
@@ -194,19 +230,143 @@ export function Model3dGeneratorPage() {
 
       <div className="image-generator-layout">
         <form className="image-generation-form image-generator-panel" onSubmit={handleGenerate}>
-          <div className="image-panel-heading"><div><div className="panel-label">GENERATION REQUEST</div><h3>Compose model</h3></div></div>
+          <div className="image-panel-heading">
+            <div>
+              <div className="panel-label">GENERATION REQUEST</div>
+              <h3>Compose 3D Model</h3>
+            </div>
+            <div className="prompt-actions-top">
+              <button
+                className="btn btn--secondary btn--sm"
+                type="button"
+                onClick={() => {
+                  const presets = [
+                    "Sci-fi supply container with PBR metallic surface, glowing neon cyan status strip, watertight manifold mesh, game asset",
+                    "Ornate mythical battle hammer resting on stone pedestal, glowing runes, photorealistic textures, clean topology",
+                    "Cybernetic combat drone with dual thrusters and optical sensor array, high-detail game prop",
+                    "Stylized low-poly fantasy treasure chest with brass bands, vibrant colors, game ready asset",
+                    "Futuristic energy shield generator with rotating core rings and heavy reinforced base",
+                  ];
+                  const random = presets[Math.floor(Math.random() * presets.length)];
+                  setRequest((prev) => ({ ...prev, prompt: random }));
+                }}
+              >
+                🎲 Random Preset
+              </button>
+              {request.prompt && (
+                <button
+                  className="btn btn--ghost btn--sm"
+                  type="button"
+                  onClick={() => setRequest((prev) => ({ ...prev, prompt: "" }))}
+                >
+                  ✕ Clear
+                </button>
+              )}
+            </div>
+          </div>
+
           <label>Mode<select value={request.mode} onChange={(event) => setRequest({ ...request, mode: event.currentTarget.value as Model3dGenerationMode, sourceAssetId: null })}><option value="text_to_3d">Text to 3D</option><option value="image_to_3d">Image to 3D</option></select></label>
-          <label>Prompt<textarea rows={5} value={request.prompt} onChange={(event) => setRequest({ ...request, prompt: event.currentTarget.value })} placeholder="Describe the structure, shape, and materials" required /></label>
-          <label>Negative prompt<textarea rows={3} value={request.negativePrompt ?? ""} onChange={(event) => setRequest({ ...request, negativePrompt: event.currentTarget.value || null })} placeholder="Optional exclusions" /></label>
-          {request.mode === "image_to_3d" && <label>Managed source image<select value={request.sourceAssetId ?? ""} onChange={(event) => setRequest({ ...request, sourceAssetId: event.currentTarget.value || null })} required><option value="">Select a READY image</option>{sourceImages.map((asset) => <option value={asset.assetId} key={asset.assetId}>{asset.originalFilename} [{asset.assetId.slice(0, 8)}]</option>)}</select></label>}
-          <div className="image-form-grid">
+
+          <div className="prompt-input-wrapper">
+            <div className="prompt-input-header">
+              <label htmlFor="model3d-prompt-input" className="form-field-label">3D Model Description & Structure</label>
+              <span className={`char-counter ${request.prompt.length > 1800 ? "char-counter--warning" : ""}`}>
+                {request.prompt.length} / 2000
+              </span>
+            </div>
+            <textarea
+              id="model3d-prompt-input"
+              rows={4}
+              maxLength={2000}
+              value={request.prompt}
+              onChange={(event) => setRequest({ ...request, prompt: event.currentTarget.value })}
+              placeholder="Describe the 3D structure, materials, and form in detail..."
+              required
+              className="prompt-textarea"
+            />
+            {/* Quick 3D Style Chips */}
+            <div className="prompt-chips-container">
+              <span className="chips-label">3D Styles:</span>
+              <div className="prompt-chips-scroll">
+                {[
+                  "Unreal Engine 5 PBR",
+                  "Cyberpunk neon",
+                  "Hard-surface mech",
+                  "Dark fantasy weapon",
+                  "Watertight low-poly",
+                  "Game-ready prop",
+                  "Clean quad topology",
+                ].map((chip) => (
+                  <button
+                    key={chip}
+                    type="button"
+                    className="prompt-chip"
+                    onClick={() => {
+                      const current = request.prompt.trim();
+                      if (!current) {
+                        setRequest({ ...request, prompt: chip });
+                      } else if (!current.toLowerCase().includes(chip.toLowerCase())) {
+                        setRequest({ ...request, prompt: `${current}, ${chip}` });
+                      }
+                    }}
+                  >
+                    + {chip}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div className="prompt-input-wrapper" style={{ marginTop: 14 }}>
+            <div className="prompt-input-header">
+              <label htmlFor="model3d-negative-input" className="form-field-label">Exclusions (Optional)</label>
+              <span className="char-counter">
+                {(request.negativePrompt ?? "").length} / 2000
+              </span>
+            </div>
+            <textarea
+              id="model3d-negative-input"
+              rows={2}
+              maxLength={2000}
+              value={request.negativePrompt ?? ""}
+              onChange={(event) => setRequest({ ...request, negativePrompt: event.currentTarget.value || null })}
+              placeholder="Optional exclusions (e.g. 'messy mesh, non-manifold, holes in mesh')"
+              className="prompt-textarea prompt-textarea--negative"
+            />
+            {/* Negative Quick Chips */}
+            <div className="prompt-chips-container">
+              <span className="chips-label">Avoid:</span>
+              <div className="prompt-chips-scroll">
+                {["messy mesh", "non-manifold", "distorted geometry", "holes in mesh", "deformed"].map((chip) => (
+                  <button
+                    key={chip}
+                    type="button"
+                    className="prompt-chip prompt-chip--negative"
+                    onClick={() => {
+                      const current = (request.negativePrompt ?? "").trim();
+                      if (!current) {
+                        setRequest({ ...request, negativePrompt: chip });
+                      } else if (!current.toLowerCase().includes(chip.toLowerCase())) {
+                        setRequest({ ...request, negativePrompt: `${current}, ${chip}` });
+                      }
+                    }}
+                  >
+                    ✕ {chip}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {request.mode === "image_to_3d" && <label style={{ marginTop: 14 }}>Managed source image<select value={request.sourceAssetId ?? ""} onChange={(event) => setRequest({ ...request, sourceAssetId: event.currentTarget.value || null })} required><option value="">Select a READY image</option>{sourceImages.map((asset) => <option value={asset.assetId} key={asset.assetId}>{asset.originalFilename} [{asset.assetId.slice(0, 8)}]</option>)}</select></label>}
+          <div className="image-form-grid" style={{ marginTop: 14 }}>
             <label>Profile<input value={request.profile} readOnly /></label>
             <label>Quality<input value={request.quality} readOnly /></label>
             <label>Output<input value={request.outputFormat.toUpperCase()} readOnly /></label>
             <label>Seed<input type="number" min="0" step="1" disabled={randomSeed} value={request.seed ?? 0} onChange={(event) => setRequest({ ...request, seed: event.currentTarget.valueAsNumber })} /></label>
           </div>
           <label className="image-checkbox"><input type="checkbox" checked={randomSeed} onChange={(event) => { setRandomSeed(event.currentTarget.checked); if (event.currentTarget.checked) setRequest({ ...request, seed: null }); }} /> Use random seed</label>
-          <button className="btn btn--primary image-generate-button" type="submit" disabled={!selectedProvider || currentValidationErrors.length > 0 || generating || active}>{generating ? "Starting..." : "Generate 3D Model"}</button>
+          <button className="btn btn--primary image-generate-button" type="submit" disabled={!selectedProvider || currentValidationErrors.length > 0 || generating || active}>{generating ? "Starting..." : "🧊 Generate 3D Model"}</button>
         </form>
 
         <section className="image-generator-panel image-output-panel">

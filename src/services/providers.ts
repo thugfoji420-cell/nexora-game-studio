@@ -18,6 +18,7 @@ import type {
   RuntimeKind,
   A1111Config,
   HunyuanConfig,
+  EngineUpdateStatus,
 } from "../types/providers";
 
 export const getHardwareSnapshot = (): Promise<HardwareSnapshot> =>
@@ -45,6 +46,9 @@ export const createProviderDiagnosticJob = (input: CreateProviderDiagnosticJobIn
 export const listRuntimes = (): Promise<RuntimeState[]> =>
   invoke<RuntimeState[]>("list_runtimes");
 
+export const checkAndUpdateEngines = (): Promise<EngineUpdateStatus[]> =>
+  invoke<EngineUpdateStatus[]>("check_and_update_engines");
+
 export const getRuntime = (runtimeId: string): Promise<RuntimeState> =>
   invoke<RuntimeState>("get_runtime", { runtimeId });
 
@@ -62,6 +66,12 @@ export const initializeRuntimes = (): Promise<[string, RuntimeStatus][]> =>
 
 export const discoverRuntimes = (): Promise<RuntimeConfig[]> =>
   invoke<RuntimeConfig[]>("discover_runtimes");
+
+export const getOrchestratorStatus = (): Promise<OrchestratorStatus> =>
+  invoke<OrchestratorStatus>("get_orchestrator_status");
+
+export const startOrchestrator = (): Promise<void> =>
+  invoke<void>("start_orchestrator");
 
 export const getA1111Config = (): Promise<A1111Config> =>
   invoke<A1111Config>("get_a1111_config");
@@ -92,6 +102,7 @@ const capabilityLabels: Record<Capability, string> = {
   "model3d.image_to_3d": "Model 3D: Image to 3D",
   "hunyuan.text_to_3d": "Hunyuan: Text to 3D",
   "hunyuan.image_to_3d": "Hunyuan: Image to 3D",
+  prompt_generation: "Prompt Generation",
 };
 
 export const formatCapability = (capability: Capability): string => capabilityLabels[capability];
@@ -175,6 +186,28 @@ export const diagnosticCapability = (provider: ProviderView): Capability | undef
   provider.manifest.capabilities.includes("text_to_image")
     ? "text_to_image"
     : provider.manifest.capabilities[0];
+
+// Orchestrator Types
+export type ProviderState = "idle" | "queued" | "starting" | "initializing" | "health_checking" | "ready" | "degraded" | "failed" | "stopping" | "stopped";
+
+export interface ProviderInfo {
+  providerId: string;
+  displayName: string;
+  state: ProviderState;
+  error: string | null;
+  startedAt: string | null;
+  readyAt: string | null;
+  healthCheckCount: number;
+}
+
+export interface OrchestratorStatus {
+  state: ProviderState;
+  currentProvider: string | null;
+  providers: ProviderInfo[];
+  startupOrder: string[];
+  completedCount: number;
+  totalCount: number;
+}
 
 export { capabilities };
 export type { RuntimeState, RuntimeStatus, RuntimeConfig, RuntimeType, RuntimeKind, A1111Config, HunyuanConfig };

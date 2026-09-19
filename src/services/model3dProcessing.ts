@@ -8,6 +8,7 @@ import type {
   Model3dProcessingQuality,
   UpdateUnityDeliveryStatusInput,
   UnityDelivery,
+  UnityDeploymentDto,
   ApproveModel3dAssetInput,
   RejectModel3dAssetInput,
   ReprocessModel3dAssetInput,
@@ -15,6 +16,7 @@ import type {
   AssetApproval,
   ProcessingReport,
 } from "../types/model3dProcessing";
+import type { EngineTargetInfo } from "../types/core";
 import { MODEL3D_GENERATION_PROFILE_ID, MODEL3D_OUTPUT_FORMAT, MODEL3D_QUALITY } from "../types/core";
 
 export const createModel3dProcessingJob = (input: CreateModel3dProcessingJobInput): Promise<CreateModel3dProcessingJobResult> =>
@@ -25,6 +27,9 @@ export const getModel3dProcessingResult = (jobId: string): Promise<Model3dProces
 
 export const approveModel3dAsset = (input: ApproveModel3dAssetInput): Promise<void> =>
   invoke("approve_model3d_asset", { assetId: input.assetId, processingJobId: input.processingJobId });
+
+export const approveImageAsset = (assetId: string, generationJobId?: string | null): Promise<void> =>
+  invoke("approve_image_asset", { assetId, generationJobId: generationJobId ?? null });
 
 export const rejectModel3dAsset = (input: RejectModel3dAssetInput): Promise<void> =>
   invoke("reject_model3d_asset", { assetId: input.assetId, processingJobId: input.processingJobId, rejectionReason: input.rejectionReason });
@@ -60,6 +65,10 @@ export const formatProcessingReport = (report: ProcessingReport | null): string[
   if (report.lod0Triangles !== null) lines.push(`LOD0 triangles: ${report.lod0Triangles.toLocaleString()}`);
   if (report.lod1Triangles !== null) lines.push(`LOD1 triangles: ${report.lod1Triangles.toLocaleString()}`);
   if (report.lod2Triangles !== null) lines.push(`LOD2 triangles: ${report.lod2Triangles.toLocaleString()}`);
+  
+  lines.push(`Category: ${report.categoryDetected || "Unknown"}`);
+  lines.push(`Category confidence: ${(report.categoryConfidence * 100).toFixed(1)}%`);
+  lines.push(`Category needs review: ${report.categoryNeedsReview ? "Yes" : "No"}`);
   
   lines.push(`Vehicle detected: ${report.vehicleDetected ? "Yes" : "No"}`);
   lines.push(`Wheel candidates: ${report.wheelCandidates}`);
@@ -123,5 +132,26 @@ export const listUnityDeliveries = (
 
 export const verifyAssetApprovedForUnityDelivery = (
   assetId: string,
-): Promise<{ assetId: string; checksum: string }> =>
-  invoke<{ assetId: string; checksum: string }>("verify_asset_approved_for_unity_delivery", { assetId });
+): Promise<UnityDelivery> =>
+  invoke<UnityDelivery>("verify_asset_approved_for_unity_delivery", { assetId });
+
+export const discoverUnityProject = (): Promise<string | null> =>
+  invoke<string | null>("discover_unity_project");
+
+export const detectEngineTargets = (): Promise<EngineTargetInfo[]> =>
+  invoke<EngineTargetInfo[]>("detect_engine_targets");
+
+export const validateUnityProject = (
+  projectRoot: string,
+): Promise<{ isValid: boolean; unityVersion: string | null; projectRoot: string; errorMessage: string | null }> =>
+  invoke<{ isValid: boolean; unityVersion: string | null; projectRoot: string; errorMessage: string | null }>(
+    "validate_unity_project",
+    { projectRoot },
+  );
+
+export const deployModel3dToUnity = (
+  assetId: string,
+  targetId: string,
+  category?: string,
+): Promise<UnityDeploymentDto> =>
+  invoke<UnityDeploymentDto>("deploy_model3d_to_unity", { assetId, targetId, category });

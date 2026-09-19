@@ -103,7 +103,7 @@ pub fn resolve_source(
         return Ok(None);
     };
     let (path, registered_size, registered_checksum): (String, u64, String) = project.db.lock().unwrap().query_row(
-        "SELECT managed_master_path,file_size,checksum FROM assets WHERE asset_id=?1 AND project_id=?2 AND status='ready' AND media_kind='image'",
+        "SELECT managed_master_path,file_size,checksum FROM assets WHERE asset_id=?1 AND project_id=?2 AND status='ready' AND media_kind='image' AND (COALESCE(source_type, '') <> 'generated' OR EXISTS (SELECT 1 FROM asset_approvals WHERE asset_id=assets.asset_id AND status='approved'))",
         rusqlite::params![id, project.manifest.project_id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ).map_err(|_| Model3dError::InvalidRequest("sourceAssetId must reference a READY image in the current project".into()))?;

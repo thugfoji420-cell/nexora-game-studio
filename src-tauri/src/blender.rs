@@ -72,7 +72,14 @@ pub fn discover_blender() -> Vec<PathBuf> {
 }
 
 pub fn validate_blender(executable: &Path) -> BlenderInfo {
-    let output = Command::new(executable).arg("--version").output();
+    let mut cmd = Command::new(executable);
+    cmd.arg("--version");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let output = cmd.output();
 
     match output {
         Ok(out) => {

@@ -5,9 +5,37 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#0c1017" />
     <title>Nexora Game Studio</title>
+  <style>
+    body { background: #0c1017; color: #fff; font-family: system-ui; margin: 0; }
+    #root { min-height: 100vh; }
+    .fallback { padding: 40px; text-align: center; }
+    .error { color: #ff6b6b; }
+    .success { color: #6bff6b; }
+  </style>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div class="fallback">
+        <h1>NEXORA GAME STUDIO</h1>
+        <p>Loading React application...</p>
+        <p id="status">Waiting for JS...</p>
+        <p id="error" class="error"></p>
+        <p id="success" class="success"></p>
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
+    <script>
+      console.log('[NEXORA] index.html inline script executing');
+      document.getElementById('status').textContent = 'JS loaded, mounting React...';
+      document.getElementById('success').textContent = 'Inline script executed OK';
+      window.addEventListener('error', (e) => {
+        document.getElementById('error').textContent = 'Error: ' + e.message;
+        console.error('Global error:', e);
+      });
+      window.addEventListener('unhandledrejection', (e) => {
+        document.getElementById('error').textContent = 'Unhandled rejection: ' + e.reason;
+        console.error('Unhandled rejection:', e);
+      });
+    </script>
   </body>
 </html>

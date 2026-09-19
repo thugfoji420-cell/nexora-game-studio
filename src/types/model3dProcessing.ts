@@ -3,7 +3,17 @@ import type { ProviderFit } from "./providers";
 
 export const MODEL3D_PROCESSING_PROFILE_ID = "foundation.processing.v1" as const;
 
-export type Model3dProcessingProfile = "generic" | "vehicle";
+export type Model3dProcessingProfile = 
+  | "generic" 
+  | "vehicle" 
+  | "character" 
+  | "environment" 
+  | "prop" 
+  | "weapon" 
+  | "building" 
+  | "vegetation" 
+  | "furniture" 
+  | "equipment";
 
 export type Model3dProcessingQuality = "master" | "mobile_high" | "mobile_balanced" | "mobile_low";
 
@@ -52,6 +62,14 @@ export interface ProcessingReport {
   lod0Triangles: number | null;
   lod1Triangles: number | null;
   lod2Triangles: number | null;
+  collisionGenerated?: boolean | null;
+  collisionTriangles?: number | null;
+  qualityScore?: number | null;
+  qualityRating?: string | null;
+  categoryDetected: string;
+  categoryConfidence: number;
+  categoryNeedsReview: boolean;
+  categoryDetails: Record<string, unknown>;
   vehicleDetected: boolean;
   wheelCandidates: number;
   wheelSeparationPossible: boolean;
@@ -153,4 +171,18 @@ export interface UpdateUnityDeliveryStatusInput {
   importedAssetPath?: string;
   prefabPath?: string;
   validationReport?: string;
+}
+
+export interface UnityDeploymentDto {
+  deliveryId: string;
+  assetId: string;
+  targetId: string;
+  unityProjectRoot: string;
+  destinationFolder: string;
+  deployedPath: string;
+  metaPath: string;
+  fileSize: number;
+  bytesWritten: number;
+  checksum: string;
+  category: string;
 }
