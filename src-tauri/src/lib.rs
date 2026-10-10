@@ -11,6 +11,7 @@ pub mod hunyuan_generation;
 mod image_generation;
 pub mod jobs;
 mod logging;
+pub mod llama_local;
 mod model3d_generation;
 mod model3d_import;
 mod model3d_processing;
@@ -2870,7 +2871,7 @@ mod asset_tests {
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         "#;
 
-        let mut db = project.db.lock().unwrap();
+        let db = project.db.lock().unwrap();
         db.execute(
             sql,
             rusqlite::params![
@@ -2957,7 +2958,7 @@ mod asset_tests {
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         "#;
 
-        let mut db = project.db.lock().unwrap();
+        let db = project.db.lock().unwrap();
         db.execute(
             sql,
             rusqlite::params![
@@ -3097,7 +3098,7 @@ mod asset_tests {
         "#;
 
         {
-            let mut db = project.db.lock().unwrap();
+            let db = project.db.lock().unwrap();
             db.execute(
                 sql,
                 rusqlite::params![
@@ -3171,7 +3172,7 @@ mod asset_tests {
         "#;
 
         {
-            let mut db = project.db.lock().unwrap();
+            let db = project.db.lock().unwrap();
             db.execute(
                 sql,
                 rusqlite::params![
@@ -3221,7 +3222,7 @@ mod asset_tests {
         fs::copy(&staging_path2, &master_path2).unwrap();
 
         {
-            let mut db = project.db.lock().unwrap();
+            let db = project.db.lock().unwrap();
             db.execute(
                 sql,
                 rusqlite::params![
@@ -3468,7 +3469,7 @@ mod asset_tests {
         "#;
 
         {
-            let mut db = project.db.lock().unwrap();
+            let db = project.db.lock().unwrap();
             db.execute(
                 sql,
                 rusqlite::params![
@@ -4084,6 +4085,8 @@ pub fn run() {
             llm::llm_refresh_model_lists,
             llm::llm_test_connection,
             llm::open_external_url,
+            llama_local::local_ai_status,
+            llama_local::local_ai_start,
         ])
         .build(tauri::generate_context!())
         .expect("failed to initialize Nexora Game Studio");

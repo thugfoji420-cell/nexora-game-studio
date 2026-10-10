@@ -364,6 +364,10 @@ impl ProviderRegistry {
         self.insert(manifest, health)
     }
 
+    /// Registers a remote-API provider with validation but keeps it disabled
+    /// (proof-of-concept path for future hosted providers; not used by the
+    /// current startup seeding, which registers core local/HTTP providers).
+    #[allow(dead_code)]
     fn register_remote_api(
         &mut self,
         manifest: ProviderManifest,

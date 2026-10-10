@@ -22,6 +22,10 @@ pub enum LlmProvider {
     /// Any OpenAI-compatible /chat/completions endpoint: Nvidia NIM,
     /// LM Studio, Ollama, vLLM, or a self-hosted server.
     Custom,
+    /// Fully offline local runtime: Ollama / llama.cpp `llama-server` /
+    /// LM Studio on this machine. No API key, no internet — the app can
+    /// chat and self-code with zero cloud dependencies.
+    Local,
 }
 
 impl LlmProvider {
@@ -31,6 +35,7 @@ impl LlmProvider {
             LlmProvider::Anthropic => "Anthropic",
             LlmProvider::Gemini => "Google Gemini",
             LlmProvider::Custom => "Custom (OpenAI-compatible)",
+            LlmProvider::Local => "Offline local model",
         }
     }
 
@@ -42,6 +47,9 @@ impl LlmProvider {
             // gpt-oss-20b responds reliably on the free tier (verified 2026-10-08);
             // some larger NIM models (deepseek-v4.1-flash, kimi-k3) hang in queue.
             LlmProvider::Custom => "openai/gpt-oss-20b",
+            // 7B coding model — best quality/size balance for an offline
+            // 'self coding' brain (Apache-2.0). Smaller sizes remain listed.
+            LlmProvider::Local => "qwen2.5-coder:7b",
         }
     }
 
@@ -51,6 +59,9 @@ impl LlmProvider {
             LlmProvider::Anthropic => "https://api.anthropic.com/v1",
             LlmProvider::Gemini => "https://generativelanguage.googleapis.com/v1beta",
             LlmProvider::Custom => "https://integrate.api.nvidia.com/v1",
+            // Ollama's OpenAI-compatible endpoint. llama.cpp/LM Studio on
+            // another port can be entered in AI Settings.
+            LlmProvider::Local => "http://localhost:11434/v1",
         }
     }
 
@@ -60,6 +71,7 @@ impl LlmProvider {
             LlmProvider::Anthropic,
             LlmProvider::Gemini,
             LlmProvider::Custom,
+            LlmProvider::Local,
         ]
     }
 }
@@ -139,18 +151,6 @@ impl Default for LlmConfig {
 impl LlmConfig {
     pub fn get_active(&self) -> Option<&LlmProviderConfig> {
         self.providers.get(&self.active_provider)
-    }
-
-    pub fn get_active_api_key(&self) -> Option<&str> {
-        self.get_active()
-            .and_then(|c| c.api_key.as_deref())
-            .filter(|k| !k.is_empty())
-    }
-
-    pub fn get_active_model(&self) -> &str {
-        self.get_active()
-            .map(|c| c.model.as_str())
-            .unwrap_or_else(|| self.active_provider.default_model())
     }
 
     pub fn get_active_base_url(&self) -> String {
@@ -239,15 +239,21 @@ pub async fn chat(
         });
     }
 
-    let api_key = provider_config
-        .api_key
-        .as_ref()
-        .filter(|k| !k.is_empty())
-        .ok_or_else(|| ChatError {
-            message: "No API key configured for active provider".into(),
-            provider: provider_config.provider.to_string(),
-            error_type: "configuration".into(),
-        })?;
+    // Local provider runs without any key and without the internet.
+    let api_key = if matches!(provider_config.provider, LlmProvider::Local) {
+        ""
+    } else {
+        provider_config
+            .api_key
+            .as_ref()
+            .filter(|k| !k.is_empty())
+            .map(String::as_str)
+            .ok_or_else(|| ChatError {
+                message: "No API key configured for active provider".into(),
+                provider: provider_config.provider.to_string(),
+                error_type: "configuration".into(),
+            })?
+    };
 
     let model = provider_config.model.clone();
 
@@ -258,87 +264,16 @@ pub async fn chat(
         LlmProvider::Custom => {
             call_custom(config.get_active_base_url(), api_key, &model, &request).await
         }
-    }
-}
-
-/// Resolves a legacy `openrouter` provider value from an older config file to
-/// the equivalent OpenAI-compatible `custom` provider, so old settings keep
-/// working without OpenRouter.
-fn normalize_legacy_provider(value: &mut serde_json::Value) {
-    let Some(obj) = value.as_object_mut() else { return };
-    // Provider entries saved by the old frontend used camelCase `apiKey`.
-    // Serde silently ignores unknown fields, which would drop the stored key,
-    // so normalize the key name before deserialization.
-    let rename_key = |entry: &mut serde_json::Value| {
-        if let Some(cfg_obj) = entry.as_object_mut() {
-            if let Some(key) = cfg_obj.remove("apiKey") {
-                cfg_obj.entry("api_key".to_string()).or_insert(key);
-            }
-        }
-    };
-    for key in ["activeProvider", "active_provider"] {
-        if let Some(active) = obj.get_mut(key) {
-            rename_key(active);
-        }
-    }
-    if let Some(providers) = obj.get_mut("providers").and_then(|p| p.as_object_mut()) {
-        // Legacy map key "openrouter" must be renamed to "custom" — otherwise
-        // the LlmProvider enum key deserialization fails and the whole config
-        // would silently reset to defaults.
-        if let Some(mut legacy) = providers.remove("openrouter") {
-            rename_key(&mut legacy);
-            if let Some(cfg_obj) = legacy.as_object_mut() {
-                cfg_obj.insert(
-                    "provider".into(),
-                    serde_json::Value::String("custom".into()),
-                );
-                if !cfg_obj.contains_key("base_url") {
-                    cfg_obj.insert(
-                        "base_url".into(),
-                        serde_json::Value::String("https://openrouter.ai/api/v1".into()),
-                    );
-                }
-            }
-            providers.insert("custom".into(), legacy);
-        }
-        // Any other entry still declaring provider == "openrouter" (e.g. a
-        // differently-keyed map) gets the same treatment.
-        for (_, cfg) in providers.iter_mut() {
-            rename_key(cfg);
-            if cfg.get("provider").and_then(|v| v.as_str()) == Some("openrouter") {
-                if let Some(cfg_obj) = cfg.as_object_mut() {
-                    cfg_obj.insert(
-                        "provider".into(),
-                        serde_json::Value::String("custom".into()),
-                    );
-                    if !cfg_obj.contains_key("base_url") {
-                        cfg_obj.insert(
-                            "base_url".into(),
-                            serde_json::Value::String("https://openrouter.ai/api/v1".into()),
-                        );
-                    }
-                }
-            }
-        }
-    }
-    // The active-provider key can appear in snake_case (files written by the
-    // Rust save path) or camelCase (defensive) — handle both.
-    let active_is_openrouter = ["active_provider", "activeProvider"]
-        .iter()
-        .any(|key| obj.get(*key).and_then(|v| v.as_str()) == Some("openrouter"));
-    if active_is_openrouter {
-        for key in ["active_provider", "activeProvider"] {
-            if obj.contains_key(key) {
-                obj.insert(
-                    key.to_string(),
-                    serde_json::Value::String("custom".into()),
-                );
-            }
+        // Local runtime never needs a key: the empty string is by design.
+        LlmProvider::Local => {
+            call_local(config.get_active_base_url(), &model, &request).await
         }
     }
 }
 
 /// Canonicalize any incoming config JSON into a clean [`LlmConfig`].
+/// (Supersedes the former `normalize_legacy_provider` helper — legacy
+/// openrouter/camelCase shaping happens here in one pass.)
 ///
 /// Tolerates every shape seen in the wild:
 /// - camelCase (`activeProvider`/`apiKey`/`baseUrl`) from the frontend, snake
@@ -428,7 +363,10 @@ fn canonical_config_value(raw: serde_json::Value) -> Result<LlmConfig, String> {
             let base_url = base_url.or_else(|| {
                 if legacy_openrouter {
                     Some("https://openrouter.ai/api/v1".to_string())
-                } else if matches!(provider_enum, LlmProvider::Custom) {
+                } else if matches!(
+                    provider_enum,
+                    LlmProvider::Custom | LlmProvider::Local
+                ) {
                     Some(provider_enum.default_base_url().to_string())
                 } else {
                     None
@@ -663,6 +601,110 @@ async fn call_custom(
         content,
         model: data.model,
         provider: "Custom".into(),
+        tokens_used: data.usage.and_then(|u| u.total_tokens),
+        finish_reason,
+        is_fallback: false,
+        fallback_from: None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Offline local runtime (Ollama / llama.cpp llama-server / LM Studio).
+// Sends the same OpenAI-compatible payload to a localhost endpoint — no API
+// key, no DNS, no internet. Kept separate from `call_custom` so its error
+// messages can point at runtime setup instead of cloud keys.
+// ---------------------------------------------------------------------------
+
+async fn call_local(
+    base_url: String,
+    model: &str,
+    request: &ChatRequest,
+) -> Result<ChatResponse, ChatError> {
+    let messages: Vec<OpenAiMessage> = request
+        .messages
+        .iter()
+        .map(|m| OpenAiMessage {
+            role: match m.role {
+                MessageRole::System => "system".into(),
+                MessageRole::User => "user".into(),
+                MessageRole::Assistant => "assistant".into(),
+            },
+            content: m.content.clone(),
+        })
+        .collect();
+
+    let body = OpenAiRequest {
+        model: model.to_string(),
+        messages,
+        max_tokens: request.max_tokens,
+        temperature: request.temperature,
+    };
+
+    let base = base_url.trim_end_matches('/');
+    let url = format!("{base}/chat/completions");
+    // Local inference is slower than a cloud API (CPU fallback especially) —
+    // long timeout, short connect timeout so a dead runtime fails fast and
+    // the fallback chain can take over.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| ChatError {
+            message: format!("failed to build HTTP client: {}", e),
+            provider: "network".into(),
+            error_type: "network".into(),
+        })?;
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Authorization", "Bearer local") // some clients demand one
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            ChatError {
+                message: if msg.contains("timed out") || msg.contains("connect") {
+                    "Local AI runtime not reachable — start Ollama (or llama-server / LM Studio) or open AI Settings > Offline local model to set it up.".into()
+                } else {
+                    format!("Local runtime request failed: {}", e)
+                },
+                provider: "Local".into(),
+                error_type: "network".into(),
+            }
+        })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(ChatError {
+            message: format!("Local runtime error ({}): {}", status, text),
+            provider: "Local".into(),
+            error_type: "api".into(),
+        });
+    }
+
+    let data: OpenAiResponse = resp.json().await.map_err(|e| ChatError {
+        message: format!("Failed to parse local runtime response: {}", e),
+        provider: "Local".into(),
+        error_type: "parse".into(),
+    })?;
+
+    let content = data
+        .choices
+        .first()
+        .map(|c| c.message.content.clone())
+        .unwrap_or_default();
+
+    let finish_reason = data
+        .choices
+        .first()
+        .and_then(|c| c.finish_reason.clone());
+
+    Ok(ChatResponse {
+        content,
+        model: data.model,
+        provider: "Local".into(),
         tokens_used: data.usage.and_then(|u| u.total_tokens),
         finish_reason,
         is_fallback: false,
@@ -1108,20 +1150,6 @@ pub async fn llm_chat_command(
     chat_with_fallback(&config, request).await
 }
 
-#[tauri::command]
-pub async fn llm_chat(
-    config: LlmConfig,
-    messages: Vec<ChatMessage>,
-    max_tokens: Option<u32>,
-    temperature: Option<f32>,
-) -> Result<ChatResponse, ChatError> {
-    let request = ChatRequest {
-        messages,
-        max_tokens,
-        temperature,
-    };
-    chat(&config, request).await
-}
 
 /// Central, single source of truth for LLM provider model lists.
 /// Kept here (not duplicated in frontend) so the app can refresh it at runtime
@@ -1149,6 +1177,7 @@ impl LlmProviderInfo {
             LlmProvider::Anthropic => "🧠",
             LlmProvider::Gemini => "✨",
             LlmProvider::Custom => "🛠️",
+            LlmProvider::Local => "🏠",
         };
         let metadata = models.iter().map(|m| model_info_for(provider, m)).collect();
         Self {
@@ -1224,6 +1253,16 @@ pub fn model_info_for(provider: &LlmProvider, model: &str) -> ModelInfo {
             "moonshotai/kimi-2.5" => (None, 2, 8, true),
             _ => (None, 2, 6, true),
         },
+        LlmProvider::Local => match model {
+            // All offline: cost 0, ranking prefers the biggest coder.
+            "qwen2.5-coder:14b" => (None, 3, 8, true),
+            "qwen2.5-coder:7b" => (None, 2, 7, true),
+            "qwen2.5-coder:3b" => (None, 1, 5, true),
+            "qwen2.5-coder:1.5b" => (None, 1, 4, true),
+            "phi3.5:3.8b" => (None, 1, 5, true),
+            "deepseek-coder-v2:16b-lite" => (None, 3, 6, true),
+            _ => (None, 2, 5, true),
+        },
     };
     ModelInfo {
         name: model.to_string(),
@@ -1231,15 +1270,6 @@ pub fn model_info_for(provider: &LlmProvider, model: &str) -> ModelInfo {
         speed_class: speed,
         capability_tier: tier,
         free_tier_available: free,
-    }
-}
-
-impl LlmProvider {
-    /// Best model of this provider for auto-fallback: free tier preferred,
-    /// then highest capability. Used when a model's limit is hit and the app
-    /// must pick a replacement automatically.
-    pub fn best_fallback_model(&self) -> &'static str {
-        self.default_model()
     }
 }
 
@@ -1304,6 +1334,19 @@ pub fn provider_models(provider: &LlmProvider) -> Vec<String> {
             "deepseek-ai/deepseek-v3.2".into(),
             "moonshotai/kimi-2.5".into(),
         ],
+        // Offline local family — names follow Ollama's model tags (which are
+        // equally valid as llama.cpp model names). Everything here runs on the
+        // user's own hardware with zero network access. Qwen2.5-Coder is
+        // Apache-2.0 across 0.5b/1.5b/7b/14b (3b is research-licensed —
+        // deliberately NOT listed); phi3.5 is MIT.
+        LlmProvider::Local => vec![
+            "qwen2.5-coder:7b".into(),
+            "qwen2.5-coder:14b".into(),
+            "qwen2.5-coder:3b".into(),
+            "qwen2.5-coder:1.5b".into(),
+            "phi3.5:3.8b".into(),
+            "deepseek-coder-v2:16b-lite".into(),
+        ],
     }
 }
 
@@ -1338,7 +1381,10 @@ pub fn ranked_fallback_configs(config: &LlmConfig) -> Vec<LlmProviderConfig> {
         .filter(|c| {
             c.enabled
                 && (c.api_key.as_ref().is_some_and(|k| !k.is_empty())
-                    || c.base_url.as_ref().is_some_and(|u| !u.trim().is_empty()))
+                    || c.base_url.as_ref().is_some_and(|u| !u.trim().is_empty())
+                    // Local needs neither a key nor a URL — being enabled is
+                    // enough, that's the whole point of offline mode.
+                    || matches!(c.provider, LlmProvider::Local))
         })
         .map(|c| {
             let models = provider_models(&c.provider);
@@ -1684,5 +1730,92 @@ mod canonical_config_tests {
 
     fn gemini_model_for_test(cfg: &super::LlmProviderConfig) -> &str {
         cfg.model.as_str()
+    }
+}
+
+#[cfg(test)]
+mod local_provider_tests {
+    use super::*;
+
+    /// A config saved with a local provider persists the exact tag, model
+    /// and loopback base URL without any key requirement.
+    #[test]
+    fn local_provider_round_trips_through_canonical_config() {
+        let payload = serde_json::json!({
+            "activeProvider": "local",
+            "providers": {
+                "local": {
+                    "provider": "local",
+                    "model": "qwen2.5-coder:7b",
+                    "baseUrl": "http://localhost:11434/v1",
+                    "enabled": true
+                }
+            }
+        });
+        let config = canonical_config_value(payload).expect("local payload must parse");
+        assert!(matches!(config.active_provider, LlmProvider::Local));
+        let local = config.providers.get(&LlmProvider::Local).expect("local entry");
+        assert!(matches!(local.provider, LlmProvider::Local));
+        assert_eq!(local.model, "qwen2.5-coder:7b");
+        assert_eq!(local.base_url.as_deref(), Some("http://localhost:11434/v1"));
+    }
+
+    /// The offline provider must qualify for the fallback chain with neither
+    /// an API key nor a URL — being enabled is the entire configuration.
+    #[test]
+    fn local_provider_enters_fallback_chain_without_key_or_url() {
+        let config = LlmConfig {
+            active_provider: LlmProvider::Gemini,
+            providers: [
+                (LlmProvider::Gemini, LlmProviderConfig {
+                    provider: LlmProvider::Gemini,
+                    api_key: Some("k".into()),
+                    model: "gemini-3.5-flash".into(),
+                    enabled: true,
+                    base_url: None,
+                }),
+                (LlmProvider::Local, LlmProviderConfig {
+                    provider: LlmProvider::Local,
+                    api_key: None,
+                    model: "qwen2.5-coder:7b".into(),
+                    enabled: true,
+                    base_url: None,
+                }),
+            ]
+            .into_iter()
+            .collect(),
+            auto_switch_on_quota_hit: true,
+        };
+        let chain = ranked_fallback_configs(&config);
+        assert!(chain.iter().any(|c| matches!(c.provider, LlmProvider::Local)));
+    }
+
+    /// Disabled local stays out of the chain.
+    #[test]
+    fn disabled_local_skips_fallback_chain() {
+        let config = LlmConfig {
+            active_provider: LlmProvider::Gemini,
+            providers: [
+                (LlmProvider::Gemini, LlmProviderConfig {
+                    provider: LlmProvider::Gemini,
+                    api_key: Some("k".into()),
+                    model: "gemini-3.5-flash".into(),
+                    enabled: true,
+                    base_url: None,
+                }),
+                (LlmProvider::Local, LlmProviderConfig {
+                    provider: LlmProvider::Local,
+                    api_key: None,
+                    model: "qwen2.5-coder:7b".into(),
+                    enabled: false,
+                    base_url: None,
+                }),
+            ]
+            .into_iter()
+            .collect(),
+            auto_switch_on_quota_hit: true,
+        };
+        let chain = ranked_fallback_configs(&config);
+        assert!(!chain.iter().any(|c| matches!(c.provider, LlmProvider::Local)));
     }
 }

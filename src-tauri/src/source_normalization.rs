@@ -275,7 +275,7 @@ pub fn normalize_source_image(bytes: &[u8]) -> Vec<u8> {
     };
 
     let rgba = parsed.to_rgba8();
-    let (width, height) = rgba.dimensions();
+    let (_width, _height) = rgba.dimensions();
     let cut = remove_background(&rgba);
     let Some(bounds) = subject_bounds(&cut) else {
         return bytes.to_vec();

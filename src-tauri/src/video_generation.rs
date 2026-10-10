@@ -199,6 +199,10 @@ pub struct VideoJobPayload {
 
 #[derive(Clone, Debug)]
 pub struct SourceAsset {
+    /// Decoded source image bytes. Currently only asserted by tests (the
+    /// HTTP path streams from the managed file directly); kept so callers can
+    /// verify the validated asset without a second disk read.
+    #[allow(dead_code)]
     pub bytes: Vec<u8>,
 }
 

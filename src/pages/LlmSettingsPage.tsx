@@ -10,7 +10,10 @@ import {
   providerDisplayName,
   providerIcon,
   PROVIDER_MODELS,
+  localAiStatus,
+  localAiStart,
 } from "../services/llm";
+import type { LocalAiStatus } from "../types/llm";
 import type { ChatResponse, LlmConfig, LlmProviderInfo, LlmProviderConfig, LlmProviderId } from "../types/llm";
 import { CUSTOM_PRESETS } from "../services/llm";
 
@@ -106,6 +109,8 @@ export default function LlmSettingsPage() {
   const [saveStatus, setSaveStatus] = useState<{ ok: boolean; message: string } | null>(null);
   const [pings, setPings] = useState<Record<string, PingStatus>>({});
   const [loading, setLoading] = useState(true);
+  const [localInfo, setLocalInfo] = useState<LocalAiStatus | null>(null);
+  const [localBusy, setLocalBusy] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -126,6 +131,35 @@ export default function LlmSettingsPage() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // Offline local runtime probe — needs the desktop backend, so swallow it in
+  // plain-browser dev.
+  const refreshLocal = useCallback(async () => {
+    try {
+      setLocalInfo(await localAiStatus());
+    } catch {
+      /* backend unavailable (browser dev) */
+    }
+  }, []);
+  useEffect(() => { void refreshLocal(); }, [refreshLocal]);
+
+  const handleLocalStart = async () => {
+    setLocalBusy(true);
+    try {
+      await localAiStart();
+      await refreshLocal();
+    } catch (e) {
+      setLocalInfo((prev) => prev ?? {
+        reachable: false,
+        endpoint: null,
+        runtimeFound: "none",
+        installedModels: [],
+        hint: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      setLocalBusy(false);
+    }
+  };
 
   const handleProviderChange = (
     providerId: string,
@@ -246,6 +280,51 @@ export default function LlmSettingsPage() {
             <span className="llm-settings-active__model">
               {config.providers[config.activeProvider]?.model || "no model set"}
             </span>
+          </div>
+        </div>
+      </div>
+
+      {/* Offline local AI — no key, no internet */}
+      <div className="llm-provider-card llm-provider-card--local" style={{ marginBottom: 18 }}>
+        <div className="llm-provider-card__head">
+          <span className="llm-provider-card__icon" aria-hidden>🏠</span>
+          <span className="llm-provider-card__name">Offline local model (self-coding without any API key)</span>
+          <span
+            className={`llm-provider-card__badge ${localInfo?.reachable ? "llm-provider-card__badge--active" : ""}`}
+          >
+            {localInfo?.reachable ? "RUNNING" : "OFF"}
+          </span>
+        </div>
+        <div className="llm-provider-card__body">
+          <p style={{ margin: "6px 0 10px", fontSize: 13 }}>
+            A small coding model (Qwen2.5-Coder) runs entirely on this PC via Ollama,
+            llama.cpp or LM Studio — no API key, no internet needed, fully offline.
+          </p>
+          {localInfo && (
+            <div className="llm-test-result llm-test-result--ok" style={{ marginBottom: 10 }}>
+              {localInfo.reachable
+                ? `✅ Runtime reachable at ${localInfo.endpoint}${localInfo.installedModels.length ? ` — models: ${localInfo.installedModels.slice(0, 5).join(", ")}${localInfo.installedModels.length > 5 ? "…" : ""}` : ""}`
+                : localInfo.hint}
+            </div>
+          )}
+          <div className="llm-provider-actions" style={{ flexWrap: "wrap", gap: 6 }}>
+            {!localInfo?.reachable && (
+              <button type="button" className="btn btn--sm" onClick={() => void handleLocalStart()} disabled={localBusy}>
+                {localBusy ? "Starting offline engine…" : "▶ Start offline engine"}
+              </button>
+            )}
+            <button
+              type="button"
+              className="btn btn--sm btn--secondary"
+              onClick={() => { void openExternalUrl(API_KEY_URLS.local).catch(() => undefined); }}
+            >
+              📥 Get Ollama (free, offline)
+            </button>
+            {localInfo?.reachable && (
+              <button type="button" className="btn btn--sm btn--secondary" onClick={() => handleSetActive("local")}>
+                Set Active
+              </button>
+            )}
           </div>
         </div>
       </div>

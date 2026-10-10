@@ -10,7 +10,6 @@ use std::{
 use tauri::Emitter;
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
-use which::which;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -542,7 +541,7 @@ impl RuntimeManager {
         #[cfg(windows)]
         cmd.creation_flags(0x08000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
 
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .map_err(|e| RuntimeError::ProcessSpawn(e.to_string()))?;
 
@@ -597,7 +596,7 @@ impl RuntimeManager {
     }
 
     pub async fn stop_runtime(&self, runtime_id: &str) -> Result<(), RuntimeError> {
-        let (started_by_nexora, pid) = {
+        let (started_by_nexora, _pid) = {
             let state = self.get_runtime(runtime_id).await?;
             (state.started_by_nexora, state.process_id)
         };

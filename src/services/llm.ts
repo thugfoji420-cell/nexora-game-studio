@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { LocalAiStatus } from "../types/llm";
 import type {
   LlmConfig,
   LlmProviderInfo,
@@ -16,9 +17,18 @@ export const API_KEY_URLS = {
   anthropic: "https://console.anthropic.com/settings/keys",
   gemini: "https://aistudio.google.com/apikey",
   custom: "https://build.nvidia.com",
+  local: "https://ollama.com/download",
   openrouter: "https://openrouter.ai/keys",
   groq: "https://console.groq.com/keys",
 } as const;
+
+/** Probe the offline local AI runtime (Ollama / llama-server / LM Studio). */
+export const localAiStatus = (baseUrl?: string): Promise<LocalAiStatus> =>
+  invoke<LocalAiStatus>("local_ai_status", { baseUrl: baseUrl ?? null });
+
+/** Start the detected local runtime (Ollama serve / bundled llama-server). */
+export const localAiStart = (): Promise<string> =>
+  invoke<string>("local_ai_start");
 
 /** Open an https URL in the system default browser (Rust-side validation applies). */
 export const openExternalUrl = (url: string): Promise<void> =>
@@ -64,6 +74,7 @@ export const PROVIDER_MODELS: Record<string, string[]> = {
   anthropic: [],
   gemini: [],
   custom: [],
+  local: [],
 };
 
 /** Fetch the latest provider list (models included) from the backend. */
@@ -103,6 +114,15 @@ export function createDefaultLlmConfig(): LlmConfig {
         enabled: false,
         baseUrl: "https://integrate.api.nvidia.com/v1",
       },
+      // Offline local engine: enabled tracks whether a runtime is set up,
+      // but it never needs an API key — that's the point.
+      local: {
+        provider: "local",
+        apiKey: "",
+        model: "qwen2.5-coder:7b",
+        enabled: false,
+        baseUrl: "http://localhost:11434/v1",
+      },
     },
   };
 }
@@ -113,8 +133,8 @@ export const CUSTOM_PRESETS: { label: string; baseUrl: string; model: string; no
   { label: "🆓 Groq (fast free tier)", baseUrl: "https://api.groq.com/openai/v1", model: "openai/gpt-oss-120b", note: "console.groq.com — extremely fast, generous free tier (gpt-oss-120b / llama-3.1-8b-instant)" },
   { label: "Nvidia NIM", baseUrl: "https://integrate.api.nvidia.com/v1", model: "openai/gpt-oss-20b", note: "build.nvidia.com — free API key. gpt-oss-20b verified responsive; some large models queue on the free tier." },
   { label: "Gemini (OpenAI-compatible)", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", model: "gemini-3.5-flash", note: "Google AI Studio key se chalta hai, OpenAI format mein" },
-  { label: "LM Studio (local)", baseUrl: "http://localhost:1234/v1", model: "local-model", note: "Local server start karo, model khud load hota hai" },
-  { label: "Ollama (local)", baseUrl: "http://localhost:11434/v1", model: "llama3.1", note: "ollama serve chalu ho to kaam karta hai, key ki zaroorat nahi" },
+  { label: "🆓 LM Studio (local)", baseUrl: "http://localhost:1234/v1", model: "local-model", note: "Local server start karo, model khud load hota hai" },
+  { label: "🆓 Ollama (local)", baseUrl: "http://localhost:11434/v1", model: "qwen2.5-coder:7b", note: "ollama serve chalu ho to kaam karta hai, key ki zaroorat nahi" },
   { label: "vLLM / custom server", baseUrl: "http://localhost:8000/v1", model: "my-model", note: "Apna khud ka hosted model" },
 ];
 
@@ -125,6 +145,7 @@ export function providerDisplayName(id: string): string {
     case "anthropic": return "Anthropic (Claude)";
     case "gemini": return "Google Gemini";
     case "custom": return "Custom (OpenAI-compatible)";
+    case "local": return "Offline local";
     default: return id;
   }
 }
@@ -136,6 +157,7 @@ export function providerIcon(id: string): string {
     case "anthropic": return "🧠";
     case "gemini": return "✨";
     case "custom": return "🛠️";
+    case "local": return "🏠";
     default: return "🔮";
   }
 }

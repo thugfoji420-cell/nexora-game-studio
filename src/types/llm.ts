@@ -1,4 +1,4 @@
-export type LlmProviderId = "openai" | "anthropic" | "gemini" | "custom";
+export type LlmProviderId = "openai" | "anthropic" | "gemini" | "custom" | "local";
 
 /** Per-model metadata for auto-selection (mirrors Rust `ModelInfo`). */
 export interface ModelInfo {
@@ -37,6 +37,15 @@ export interface LlmConfig {
   providers: Record<LlmProviderId, LlmProviderConfig>;
   /** Auto-switch to the next best provider when the active model's quota trips. */
   autoSwitchOnQuotaHit?: boolean;
+}
+
+/** Live status of the offline local AI runtime (from llama_local.rs). */
+export interface LocalAiStatus {
+  reachable: boolean;
+  endpoint: string | null;
+  runtimeFound: string;
+  installedModels: string[];
+  hint: string;
 }
 
 export type MessageRole = "system" | "user" | "assistant";

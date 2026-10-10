@@ -226,6 +226,8 @@ impl UnityProjectTarget {
         }
     }
 
+    /// Test-only constructor used by the settings validation tests.
+    #[cfg(test)]
     pub fn with_id(target_id: String, display_name: String, project_root: String) -> Self {
         Self {
             target_id,

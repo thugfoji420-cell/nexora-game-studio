@@ -313,7 +313,7 @@ export type ModeModelMap = Partial<Record<ChatMode, ModeModel>>;
 
 const MODE_MODEL_STORAGE_KEY = "nexora_mode_models";
 const CHAT_MODES: ChatMode[] = ["agent", "codex", "midjourney"];
-const KNOWN_PROVIDERS: LlmProviderId[] = ["openai", "anthropic", "gemini", "custom"];
+const KNOWN_PROVIDERS: LlmProviderId[] = ["openai", "anthropic", "gemini", "custom", "local"];
 
 /** Parse the stored per-mode model map; anything malformed is dropped. */
 export function parseModeModels(raw: string | null): ModeModelMap {
@@ -505,7 +505,9 @@ export function StudioChatPage({
           cfg &&
           cfg.enabled &&
           (Boolean(cfg.apiKey && cfg.apiKey.trim()) ||
-            (cfg.provider === "custom" && Boolean(cfg.baseUrl && cfg.baseUrl.trim()))),
+            (cfg.provider === "custom" && Boolean(cfg.baseUrl && cfg.baseUrl.trim())) ||
+            // Local runs without any key — enabled is enough.
+            cfg.provider === "local"),
       )
     : [];
 
@@ -516,7 +518,7 @@ export function StudioChatPage({
     const active = llmConfig.activeProvider;
     const isConfigured = (pid: LlmProviderId) =>
       configuredModels.some(([configuredPid]) => configuredPid === pid);
-    const order: LlmProviderId[] = ["openai", "anthropic", "gemini", "custom"];
+    const order: LlmProviderId[] = ["local", "gemini", "openai", "anthropic", "custom"];
     order.sort((a, b) => {
       const score = (pid: LlmProviderId) =>
         (pid === active ? 2 : 0) + (isConfigured(pid) ? 1 : 0);
@@ -1449,7 +1451,7 @@ export function StudioChatPage({
               {modelGroups.map((group) => (
                 <optgroup
                   key={group.pid}
-                  label={`${providerIcon(group.pid)} ${providerDisplayName(group.pid)}${group.configured ? "" : " — add API key"}`}
+                  label={`${providerIcon(group.pid)} ${providerDisplayName(group.pid)}${group.configured || group.pid === "local" ? "" : " — add API key"}`}
                 >
                   {group.models.map((model) => (
                     <option key={`${group.pid}|${model}`} value={`${group.pid}|${model}`} disabled={!group.configured}>
@@ -1477,6 +1479,12 @@ export function StudioChatPage({
               onClick={() => { void openExternalUrl(API_KEY_URLS.custom).catch(() => { window.location.hash = "llm-settings"; }); }}
             >
               🔑 Nvidia NIM key
+            </button>
+            <button
+              className="btn btn--sm"
+              onClick={() => { void openExternalUrl(API_KEY_URLS.local).catch(() => { window.location.hash = "llm-settings"; }); }}
+            >
+              🏠 Offline AI setup
             </button>
             <button className="btn btn--sm" onClick={() => { window.location.hash = "llm-settings"; }}>
               ⚙️ AI Settings

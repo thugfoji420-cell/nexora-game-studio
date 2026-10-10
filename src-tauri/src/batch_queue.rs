@@ -91,11 +91,6 @@ fn manifest_path(project: &ProjectState, batch_id: &str) -> PathBuf {
     batch_dir(project).join(format!("{batch_id}.json"))
 }
 
-fn load_manifest(project: &ProjectState, batch_id: &str) -> Option<BatchManifest> {
-    let text = std::fs::read_to_string(manifest_path(project, batch_id)).ok()?;
-    serde_json::from_str(&text).ok()
-}
-
 /// Newest paused manifest for the current project, if any. Called lazily by
 /// the UI state command so a batch paused by an app restart resurfaces.
 pub fn load_latest_paused(project: &ProjectState) -> Option<BatchManifest> {
@@ -435,10 +430,12 @@ fn run_item(
 // Test helpers / pure logic
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 pub fn next_pending_index(items: &[BatchItem]) -> Option<usize> {
     items.iter().position(|item| item.status == BatchItemStatus::Pending)
 }
 
+#[cfg(test)]
 pub fn summarize(manifest: &BatchManifest) -> (usize, usize, usize, usize) {
     let mut completed = 0;
     let mut failed = 0;

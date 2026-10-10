@@ -112,6 +112,10 @@ impl BlenderAdapter {
         Ok(Self { config })
     }
 
+    /// Runs `blender --version` and reports the resolved executable + version.
+    /// Not part of the hot pipeline (the adapter only needs the executable to
+    /// exist); kept for the diagnostics surface.
+    #[allow(dead_code)]
     pub fn validate(&self) -> Result<BlenderInfo, BlenderAdapterError> {
         let mut cmd = Command::new(&self.config.blender_executable);
         cmd.arg("--version");

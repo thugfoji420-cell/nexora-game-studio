@@ -1039,7 +1039,6 @@ pub enum AssetCategory {
     Vegetation,
     Furniture,
     Equipment,
-    Generic,
     Texture,
     Material,
 }
@@ -1056,7 +1055,6 @@ impl AssetCategory {
             AssetCategory::Vegetation => "Vegetation",
             AssetCategory::Furniture => "Furniture",
             AssetCategory::Equipment => "Equipment",
-            AssetCategory::Generic => "Props",
             AssetCategory::Texture => "Textures",
             AssetCategory::Material => "Materials",
         }
@@ -1307,9 +1305,6 @@ pub fn resolve_unique_destination_path(
         counter += 1;
     }
 }
-
-/// Maximum seconds to wait for the Blender FBX conversion before giving up.
-const FBX_CONVERT_TIMEOUT_SECS: u64 = 120;
 
 /// Converts a GLB into an FBX with embedded textures using bundled Blender,
 /// so Unity's native FBX importer brings the model in with colors/graphics

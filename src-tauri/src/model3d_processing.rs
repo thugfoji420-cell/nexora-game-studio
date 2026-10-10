@@ -5,21 +5,6 @@ use std::fs;
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const MODEL3D_PROCESSING_PROFILE_ID: &str = "foundation.processing.v1";
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProcessingQuality {
-    #[serde(rename = "master")]
-    Master,
-    #[serde(rename = "mobile_high")]
-    MobileHigh,
-    #[serde(rename = "mobile_balanced")]
-    MobileBalanced,
-    #[serde(rename = "mobile_low")]
-    MobileLow,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Model3dProcessingResult {
@@ -272,8 +257,6 @@ fn valid_uuid(value: &str) -> bool {
 pub enum Model3dProcessingError {
     #[error("invalid model3d processing request: {0}")]
     InvalidRequest(String),
-    #[error("model3d processing unavailable: {0}")]
-    Unavailable(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]

@@ -15,9 +15,6 @@ const MAX_PROMPT_CHARS: usize = 2000;
 const MAX_SOURCE_BYTES: u64 = 40 * 1024 * 1024;
 const MAX_SOURCE_PIXELS: u64 = 64 * 1024 * 1024;
 
-#[cfg(test)]
-const FIXTURE_MODEL_IDENTIFIER: &str = "test.fixture.hunyuan.v1";
-
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HunyuanMode {
@@ -217,11 +214,6 @@ pub fn get_result(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn fixture_output() -> Vec<u8> {
-    crate::model3d_validation::tests::fixture_glb()
-}
-
 fn valid_uuid(value: &str) -> bool {
     Uuid::parse_str(value).is_ok_and(|uuid| uuid.to_string() == value)
 }
@@ -231,10 +223,6 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
-}
-
-fn database(error: rusqlite::Error) -> HunyuanError {
-    HunyuanError::InvalidRequest(error.to_string())
 }
 
 pub fn run_hunyuan_generation(

@@ -1271,7 +1271,7 @@ pub fn tick_with_configs(
         if !project.execution_enabled() {
             return Ok(true);
         }
-        let mut result = response.and_then(|bytes| {
+        let result = response.and_then(|bytes| {
             update_image_progress_for_project(
                 project,
                 &job,
@@ -2285,7 +2285,7 @@ pub fn approve_model3d_asset(
         .db
         .lock()
         .map_err(|_| JobError::Database(rusqlite::Error::ExecuteReturnedResults))?;
-    let mut tx = db.transaction()?;
+    let tx = db.transaction()?;
 
     // Verify asset exists and is a model3d
     let asset: Option<(String, String)> = tx
@@ -2373,7 +2373,7 @@ pub fn approve_image_asset(
         .db
         .lock()
         .map_err(|_| JobError::Database(rusqlite::Error::ExecuteReturnedResults))?;
-    let mut tx = db.transaction()?;
+    let tx = db.transaction()?;
 
     let asset: Option<(String, String, String)> = tx
         .query_row(
@@ -2428,7 +2428,7 @@ pub fn reject_model3d_asset(
         .db
         .lock()
         .map_err(|_| JobError::Database(rusqlite::Error::ExecuteReturnedResults))?;
-    let mut tx = db.transaction()?;
+    let tx = db.transaction()?;
 
     // Verify asset exists and is a model3d
     let asset: Option<(String, String)> = tx
@@ -2742,7 +2742,7 @@ fn write_provider_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{hardware::HardwareSnapshot, hardware::GpuSnapshot, project::ProjectState, providers::ProviderRegistry};
+    use crate::{hardware::HardwareSnapshot, project::ProjectState, providers::ProviderRegistry};
     use sha2::{Digest, Sha256};
     use std::{
         sync::{Arc, atomic::AtomicBool},
@@ -4159,13 +4159,13 @@ pub fn create_unity_delivery(
         .db
         .lock()
         .map_err(|_| JobError::Database(rusqlite::Error::ExecuteReturnedResults))?;
-    let mut tx = db.transaction()?;
+    let tx = db.transaction()?;
 
     // Verify asset exists and is a model3d
     let asset: Option<(String, String, String)> = tx
         .query_row(
             "SELECT asset_id, media_kind, checksum FROM assets WHERE asset_id=?1 AND project_id=?2 AND status='ready'",
-            rusqlite::params![asset_id.clone(), project.manifest.project_id],
+            rusqlite::params![asset_id, project.manifest.project_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
@@ -4174,7 +4174,7 @@ pub fn create_unity_delivery(
         asset.ok_or(JobError::InvalidInput("approved asset not found".into()))?;
     let asset_id_for_approval = asset_id.clone();
     let asset_id_for_insert = asset_id.clone();
-    let asset_id_for_insert_2 = asset_id.clone();
+    let _asset_id_for_insert_2 = asset_id.clone();
     if media_kind != "model3d" {
         return Err(JobError::InvalidInput("asset is not a model3d".into()));
     }
@@ -4202,7 +4202,7 @@ pub fn create_unity_delivery(
         )
         .optional()?;
 
-    let (job_id, job_type) =
+    let (_job_id, job_type) =
         job.ok_or(JobError::InvalidInput("processing job not found".into()))?;
     if job_type != "model3d.processing" {
         return Err(JobError::InvalidInput(
@@ -4252,7 +4252,7 @@ pub fn create_unity_delivery(
     } else {
         // Create new delivery
         let delivery_id = Uuid::now_v7().to_string();
-        let now = now_ms();
+        let _now = now_ms();
         tx.execute(
             "INSERT INTO unity_deliveries (delivery_id, asset_id, approval_id, processing_job_id, target_id, approved_artifact_checksum, unity_project_root, unity_destination_folder, delivery_revision, status, created_at_ms, updated_at_ms)
              VALUES (?1, ?2, (SELECT approval_id FROM asset_approvals WHERE asset_id=?1), ?3, ?4, ?5, ?6, ?7, ?8, 'preparing', ?9, ?9)",
@@ -4288,7 +4288,7 @@ pub fn update_unity_delivery_status(
         .db
         .lock()
         .map_err(|_| JobError::Database(rusqlite::Error::ExecuteReturnedResults))?;
-    let mut tx = db.transaction()?;
+    let tx = db.transaction()?;
 
     let now = now_ms();
     tx.execute(
@@ -4458,7 +4458,7 @@ pub fn verify_asset_approved_for_unity_delivery(
     row.ok_or(JobError::InvalidInput(
         "asset not approved for unity delivery".into(),
     ))
-    .map(|(asset_id, checksum, approval_id)| (asset_id, checksum))
+    .map(|(asset_id, checksum, _approval_id)| (asset_id, checksum))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
