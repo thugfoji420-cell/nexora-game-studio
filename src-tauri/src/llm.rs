@@ -266,7 +266,19 @@ pub async fn chat(
         }
         // Local runtime never needs a key: the empty string is by design.
         LlmProvider::Local => {
-            call_local(config.get_active_base_url(), &model, &request).await
+            // The saved base URL can go stale (provider defaults to Ollama's
+            // 11434 while the bundled engine serves on 8080, or the runtime
+            // restarted on another port). Resolve a live endpoint before the
+            // call: saved endpoint first, then the known loopback sweep.
+            let saved = config.get_active_base_url();
+            let endpoint = crate::llama_local::resolve_local_endpoint(Some(&saved))
+                .await
+                .ok_or_else(|| ChatError {
+                    message: "Local AI runtime not reachable — open AI Settings > Offline local model and click 🚀 Set up offline AI.".into(),
+                    provider: "Local".into(),
+                    error_type: "network".into(),
+                })?;
+            call_local(endpoint, &model, &request).await
         }
     }
 }

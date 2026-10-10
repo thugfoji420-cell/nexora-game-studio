@@ -190,7 +190,7 @@ export default function LlmSettingsPage() {
                 apiKey: "",
                 model: "qwen2.5-coder:7b",
                 enabled: true,
-                baseUrl: "http://localhost:11434/v1",
+                baseUrl: "http://localhost:8080/v1",
               },
             },
           }).then((saved) => setConfig(saved)).catch(() => undefined);
@@ -277,7 +277,16 @@ export default function LlmSettingsPage() {
 
   const handleSetActive = (providerId: string) => {
     const pid = providerId as LlmProviderId;
-    setConfig((prev) => ({ ...prev, activeProvider: pid }));
+    // Persist immediately — the guided offline flow sets the provider here and
+    // the user should not need a second click on Save for it to stick (and the
+    // dashboard chat reads the saved config, not this page's state).
+    setConfig((prev) => ({
+      ...prev,
+      activeProvider: pid,
+    }));
+    void saveLlmConfig({ ...config, activeProvider: pid })
+      .then((saved) => setConfig(saved))
+      .catch((e) => console.error("Failed to save active provider:", e));
   };
 
   const handleSave = async () => {

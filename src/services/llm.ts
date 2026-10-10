@@ -147,7 +147,9 @@ export function createDefaultLlmConfig(): LlmConfig {
         apiKey: "",
         model: "qwen2.5-coder:7b",
         enabled: false,
-        baseUrl: "http://localhost:11434/v1",
+        // Bundled llama-server's port (Ollama users override in AI Settings or
+        // the backend auto-resolves the live loopback endpoint on chat).
+        baseUrl: "http://localhost:8080/v1",
       },
     },
   };

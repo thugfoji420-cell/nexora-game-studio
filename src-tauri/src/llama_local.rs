@@ -134,6 +134,29 @@ async fn probe(base_url: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Endpoint resolver for chat: try the saved/configured endpoint first, then
+/// sweep the known loopback ports. Exposed to llm.rs so sending chat to the
+/// Local provider works even when the provider config still carries the
+/// Ollama default (11434) while the bundled engine serves on 8080.
+pub async fn resolve_local_endpoint(saved_base_url: Option<&str>) -> Option<String> {
+    if let Some(saved) = saved_base_url.map(str::trim).filter(|s| !s.is_empty()) {
+        let saved = saved.trim_end_matches('/').to_string();
+        // Config files have carried both `/v1`-suffixed and bare roots; the
+        // probe normalizes by trying the OpenAI path either way.
+        let candidates: Vec<String> = if saved.ends_with("/v1") {
+            vec![saved.clone()]
+        } else {
+            vec![format!("{saved}/v1"), saved.clone()]
+        };
+        for c in &candidates {
+            if probe(c).await {
+                return Some(c.clone());
+            }
+        }
+    }
+    find_running().await.map(str::to_string)
+}
+
 async fn find_running() -> Option<&'static str> {
     for endpoint in LOCAL_ENDPOINTS {
         if probe(endpoint).await {
