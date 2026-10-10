@@ -12,6 +12,10 @@ mod image_generation;
 pub mod jobs;
 mod logging;
 pub mod llama_local;
+
+/// Concurrent-download gate for the managed GGUF model.
+pub static MODEL_DOWNLOAD_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 mod model3d_generation;
 mod model3d_import;
 mod model3d_processing;
@@ -3835,6 +3839,7 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_shell::init())
         .register_asynchronous_uri_scheme_protocol("nexora-media", |context, request, responder| {
             asset_delivery::handle_protocol(context.app_handle(), request, responder);
         })
@@ -4087,6 +4092,8 @@ pub fn run() {
             llm::open_external_url,
             llama_local::local_ai_status,
             llama_local::local_ai_start,
+            llama_local::local_ai_setup,
+            llama_local::local_ai_download_model,
         ])
         .build(tauri::generate_context!())
         .expect("failed to initialize Nexora Game Studio");

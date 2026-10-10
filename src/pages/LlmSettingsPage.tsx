@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   getLlmConfig,
   saveLlmConfig,
@@ -12,8 +13,13 @@ import {
   PROVIDER_MODELS,
   localAiStatus,
   localAiStart,
+  localAiSetup,
+  localAiDownloadModel,
 } from "../services/llm";
+
 import type { LocalAiStatus } from "../types/llm";
+import type { ModelDownloadProgress } from "../services/llm";
+import type { SetupStage } from "../services/llm";
 import type { ChatResponse, LlmConfig, LlmProviderInfo, LlmProviderConfig, LlmProviderId } from "../types/llm";
 import { CUSTOM_PRESETS } from "../services/llm";
 
@@ -111,6 +117,8 @@ export default function LlmSettingsPage() {
   const [loading, setLoading] = useState(true);
   const [localInfo, setLocalInfo] = useState<LocalAiStatus | null>(null);
   const [localBusy, setLocalBusy] = useState(false);
+  const [dlProgress, setDlProgress] = useState<ModelDownloadProgress | null>(null);
+  const [dlBusy, setDlBusy] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -132,6 +140,11 @@ export default function LlmSettingsPage() {
     load();
   }, [load]);
 
+  // Read-write mirror for event callbacks that must persist the latest config
+  // without re-binding listeners on every keystroke.
+  const configRef = useRef(config);
+  useEffect(() => { configRef.current = config; }, [config]);
+
   // Offline local runtime probe — needs the desktop backend, so swallow it in
   // plain-browser dev.
   const refreshLocal = useCallback(async () => {
@@ -143,6 +156,82 @@ export default function LlmSettingsPage() {
   }, []);
   useEffect(() => { void refreshLocal(); }, [refreshLocal]);
 
+  // Live download progress from the Rust side (emitted every ~500ms).
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<ModelDownloadProgress>("llama-model-download", (event) => {
+      setDlProgress(event.payload);
+      if (event.payload.done) {
+        setDlProgress(null);
+        void refreshLocal();
+      }
+    }).then((fn) => { unlisten = fn; }).catch(() => undefined);
+    return () => { unlisten?.(); };
+  }, [refreshLocal]);
+
+  // Guided-setup narration: one 🚀 button walks probe → model → engine → ready.
+  const [setupStage, setSetupStage] = useState<SetupStage | null>(null);
+  const [setupBusy, setSetupBusy] = useState(false);
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<SetupStage>("local-ai-setup", (event) => {
+      setSetupStage(event.payload);
+      if (event.payload.stage === "ready" && event.payload.status === "done") {
+        void refreshLocal().then(() => {
+          // Engine is live — switch the active provider to local and persist,
+          // so the guided flow ends with the offline model already answering.
+          void saveLlmConfig({
+            ...configRef.current,
+            activeProvider: "local",
+            providers: {
+              ...configRef.current.providers,
+              local: {
+                provider: "local",
+                apiKey: "",
+                model: "qwen2.5-coder:7b",
+                enabled: true,
+                baseUrl: "http://localhost:11434/v1",
+              },
+            },
+          }).then((saved) => setConfig(saved)).catch(() => undefined);
+        });
+      }
+    }).then((fn) => { unlisten = fn; }).catch(() => undefined);
+    return () => { unlisten?.(); };
+  }, [refreshLocal]);
+
+  const handleGuidedSetup = async () => {
+    setSetupBusy(true);
+    setSetupStage({ stage: "probe", status: "running", detail: "Starting guided setup…" });
+    try {
+      await localAiSetup();
+      await refreshLocal();
+    } catch (e) {
+      setSetupStage((prev) => prev && prev.status === "error" ? prev : {
+        stage: "ready",
+        status: "error",
+        detail: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      setSetupBusy(false);
+    }
+  };
+
+  const handleModelDownload = async () => {
+    setDlBusy(true);
+    try {
+      await localAiDownloadModel();
+      await refreshLocal();
+    } catch (e) {
+      setLocalInfo((prev) => prev ? {
+        ...prev,
+        hint: e instanceof Error ? e.message : String(e),
+      } : null);
+    } finally {
+      setDlBusy(false);
+    }
+  };
+
   const handleLocalStart = async () => {
     setLocalBusy(true);
     try {
@@ -153,6 +242,9 @@ export default function LlmSettingsPage() {
         reachable: false,
         endpoint: null,
         runtimeFound: "none",
+        engineBundled: false,
+        modelReady: false,
+        modelDownloading: false,
         installedModels: [],
         hint: e instanceof Error ? e.message : String(e),
       });
@@ -297,20 +389,59 @@ export default function LlmSettingsPage() {
         </div>
         <div className="llm-provider-card__body">
           <p style={{ margin: "6px 0 10px", fontSize: 13 }}>
-            A small coding model (Qwen2.5-Coder) runs entirely on this PC via Ollama,
-            llama.cpp or LM Studio — no API key, no internet needed, fully offline.
+            A bundled offline engine (llama.cpp) runs a Qwen2.5-Coder coding model
+            entirely on this PC — no API key, no Ollama install, no internet after
+            the one-time model download. Falls back to Ollama automatically if found.
           </p>
           {localInfo && (
             <div className="llm-test-result llm-test-result--ok" style={{ marginBottom: 10 }}>
               {localInfo.reachable
                 ? `✅ Runtime reachable at ${localInfo.endpoint}${localInfo.installedModels.length ? ` — models: ${localInfo.installedModels.slice(0, 5).join(", ")}${localInfo.installedModels.length > 5 ? "…" : ""}` : ""}`
-                : localInfo.hint}
+                : `${localInfo.hint}${localInfo.modelReady ? " · model ready ✅" : ""} · engine ${localInfo.engineBundled ? "bundled ✅" : "system fallback"}`}
+            </div>
+          )}
+          {dlProgress && (
+            <div className="llm-test-result" style={{ marginBottom: 10 }} role="progressbar" aria-valuenow={Math.round(dlProgress.percent)} aria-valuemin={0} aria-valuemax={100}>
+              {dlProgress.verifying
+                ? "Verifying SHA-256 checksum…"
+                : `Downloading Qwen2.5-Coder 7B — ${dlProgress.percent.toFixed(1)}% (${(dlProgress.received / 1e9).toFixed(2)} / ${(dlProgress.total / 1e9).toFixed(2)} GB)`}
+              {dlProgress.status ? ` — ${dlProgress.status}` : ""}
+              <div style={{ height: 6, background: "rgba(255,255,255,0.15)", borderRadius: 4, marginTop: 6 }}>
+                <div style={{ height: "100%", width: `${Math.min(100, dlProgress.percent)}%`, background: "#3ddc97", borderRadius: 4, transition: "width 0.3s" }} />
+              </div>
+            </div>
+          )}
+          {setupStage && (
+            <div
+              className={`llm-test-result ${setupStage.status === "error" ? "llm-test-result--err" : "llm-test-result--ok"}`}
+              style={{ marginBottom: 10 }}
+              role="status"
+              aria-live="polite"
+            >
+              {setupStage.status === "error" ? "❌ " : setupStage.status === "done" ? "✅ " : "⏳ "}
+              [{setupStage.stage}] {setupStage.detail}
             </div>
           )}
           <div className="llm-provider-actions" style={{ flexWrap: "wrap", gap: 6 }}>
             {!localInfo?.reachable && (
-              <button type="button" className="btn btn--sm" onClick={() => void handleLocalStart()} disabled={localBusy}>
-                {localBusy ? "Starting offline engine…" : "▶ Start offline engine"}
+              <button type="button" className="btn btn--sm" onClick={() => void handleGuidedSetup()} disabled={setupBusy || dlBusy}>
+                {setupBusy ? "Setting up offline AI — see progress below…" : "🚀 Set up offline AI (guided, one click)"}
+              </button>
+            )}
+            {!localInfo?.reachable && !localInfo?.modelReady && !dlBusy && !setupBusy && (
+              <button type="button" className="btn btn--sm btn--secondary" onClick={() => void handleModelDownload()}>
+                ⬇ Download model only (~4.7 GB)
+              </button>
+            )}
+            {dlBusy && <button type="button" className="btn btn--sm" disabled>Downloading… keep this window open</button>}
+            {!localInfo?.reachable && localInfo?.modelReady !== false && !setupBusy && (
+              <button type="button" className="btn btn--sm btn--secondary" onClick={() => void handleLocalStart()} disabled={localBusy || !!dlProgress}>
+                {localBusy ? "Starting offline engine…" : "▶ Start engine only"}
+              </button>
+            )}
+            {localInfo?.reachable && (
+              <button type="button" className="btn btn--sm btn--secondary" onClick={() => handleSetActive("local")}>
+                Set Active
               </button>
             )}
             <button
@@ -318,13 +449,8 @@ export default function LlmSettingsPage() {
               className="btn btn--sm btn--secondary"
               onClick={() => { void openExternalUrl(API_KEY_URLS.local).catch(() => undefined); }}
             >
-              📥 Get Ollama (free, offline)
+              📥 Install Ollama instead (optional)
             </button>
-            {localInfo?.reachable && (
-              <button type="button" className="btn btn--sm btn--secondary" onClick={() => handleSetActive("local")}>
-                Set Active
-              </button>
-            )}
           </div>
         </div>
       </div>

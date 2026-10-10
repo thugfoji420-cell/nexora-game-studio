@@ -28,8 +28,10 @@ dirs = "6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "ico"] }
 sha2 = "0.10"
 base64 = "0.22"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 tokio = { version = "1", features = ["time", "sync"] }
+tauri-plugin-shell = "2"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 which = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

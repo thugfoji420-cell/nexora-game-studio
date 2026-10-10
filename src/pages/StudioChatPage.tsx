@@ -555,8 +555,14 @@ export function StudioChatPage({
       const id = newId();
       const time = Date.now();
       const text = `Active model: ${providerDisplayName(pid)} — ${model} ✓`;
-      setMessages((prev) => [...prev, { id, role: "agent", text, time }]);
-      void appendChatHistory({ mode: "agent", role: "agent", text, id, time }).catch(() => undefined);
+      // Guided one-click setup right in the chat when the offline engine isn't
+      // serving yet — no Settings round-trip needed.
+      const guidance =
+        pid === "local"
+          ? "\n\n🏠 This model runs on your PC — first use walks a small setup: if no engine is live, open ⚙️ AI Settings and click 🚀 Set up offline AI. It downloads the model once (~4.7 GB after which you're fully offline), starts the engine, and switches me over automatically."
+          : "";
+      setMessages((prev) => [...prev, { id, role: "agent", text: text + guidance, time }]);
+      void appendChatHistory({ mode: "agent", role: "agent", text: text + guidance, id, time }).catch(() => undefined);
     }
     try {
       await saveLlmConfig(next);

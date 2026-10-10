@@ -26,9 +26,35 @@ export const API_KEY_URLS = {
 export const localAiStatus = (baseUrl?: string): Promise<LocalAiStatus> =>
   invoke<LocalAiStatus>("local_ai_status", { baseUrl: baseUrl ?? null });
 
-/** Start the detected local runtime (Ollama serve / bundled llama-server). */
+/** Start the detected local runtime (bundled llama-server sidecar / Ollama). */
 export const localAiStart = (): Promise<string> =>
   invoke<string>("local_ai_start");
+
+/** One-click GGUF download (streamed, SHA-256 verified) into app data dir. */
+export const localAiDownloadModel = (): Promise<string> =>
+  invoke<string>("local_ai_download_model");
+
+/** Guided zero-setup flow: probe → model → engine → ready (emits local-ai-setup). */
+export const localAiSetup = (): Promise<string> =>
+  invoke<string>("local_ai_setup");
+
+/** One 'local-ai-setup' stage event from the guided flow. */
+export interface SetupStage {
+  stage: "probe" | "model" | "engine" | "ready";
+  status: "running" | "done" | "error";
+  detail: string;
+}
+
+/** Progress payload for the 'llama-model-download' Tauri event. */
+export interface ModelDownloadProgress {
+  received: number;
+  total: number;
+  percent: number;
+  done: boolean;
+  verifying?: boolean;
+  /** Ollama pull status text when the update came from the registry pull. */
+  status?: string;
+}
 
 /** Open an https URL in the system default browser (Rust-side validation applies). */
 export const openExternalUrl = (url: string): Promise<void> =>

@@ -44,6 +44,9 @@ export interface LocalAiStatus {
   reachable: boolean;
   endpoint: string | null;
   runtimeFound: string;
+  engineBundled: boolean;
+  modelReady: boolean;
+  modelDownloading: boolean;
   installedModels: string[];
   hint: string;
 }

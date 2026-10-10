@@ -34,6 +34,9 @@
     "targets": [
       "nsis"
     ],
+    "externalBin": [
+      "binaries/llama-server"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -46,7 +49,30 @@
     "category": "DeveloperTool",
     "resources": {
       "blender/nexora_mesh_processor.py": "blender/nexora_mesh_processor.py",
-      "blender/nexora_fbx_convert.py": "blender/nexora_fbx_convert.py"
+      "blender/nexora_fbx_convert.py": "blender/nexora_fbx_convert.py",
+      "binaries/llama-server-impl.dll": "llama-server-impl.dll",
+      "binaries/llama.dll": "llama.dll",
+      "binaries/llama-common.dll": "llama-common.dll",
+      "binaries/mtmd.dll": "mtmd.dll",
+      "binaries/ggml.dll": "ggml.dll",
+      "binaries/ggml-base.dll": "ggml-base.dll",
+      "binaries/ggml-rpc.dll": "ggml-rpc.dll",
+      "binaries/ggml-cpu-x64.dll": "ggml-cpu-x64.dll",
+      "binaries/ggml-cpu-alderlake.dll": "ggml-cpu-alderlake.dll",
+      "binaries/ggml-cpu-cannonlake.dll": "ggml-cpu-cannonlake.dll",
+      "binaries/ggml-cpu-cascadelake.dll": "ggml-cpu-cascadelake.dll",
+      "binaries/ggml-cpu-cooperlake.dll": "ggml-cpu-cooperlake.dll",
+      "binaries/ggml-cpu-haswell.dll": "ggml-cpu-haswell.dll",
+      "binaries/ggml-cpu-icelake.dll": "ggml-cpu-icelake.dll",
+      "binaries/ggml-cpu-ivybridge.dll": "ggml-cpu-ivybridge.dll",
+      "binaries/ggml-cpu-piledriver.dll": "ggml-cpu-piledriver.dll",
+      "binaries/ggml-cpu-sandybridge.dll": "ggml-cpu-sandybridge.dll",
+      "binaries/ggml-cpu-sapphirerapids.dll": "ggml-cpu-sapphirerapids.dll",
+      "binaries/ggml-cpu-skylakex.dll": "ggml-cpu-skylakex.dll",
+      "binaries/ggml-cpu-sse42.dll": "ggml-cpu-sse42.dll",
+      "binaries/ggml-cpu-zen4.dll": "ggml-cpu-zen4.dll",
+      "binaries/libomp.dll": "libomp.dll",
+      "binaries/LICENSE-LLVM-OpenMP": "LICENSE-LLVM-OpenMP"
     }
   }
 }
