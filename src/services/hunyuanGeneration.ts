@@ -8,7 +8,11 @@ import type {
   JobInfo,
   ProviderView,
 } from "../types/core";
-import { HUNYUAN_GENERATION_PROFILE_ID, HUNYUAN_OUTPUT_FORMAT, HUNYUAN_QUALITY } from "../types/core";
+import {
+  HUNYUAN_GENERATION_PROFILE_ID,
+  HUNYUAN_OUTPUT_FORMAT,
+  HUNYUAN_GENERATION_QUALITIES,
+} from "../types/core";
 
 const MANAGED_ASSET_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
@@ -33,7 +37,7 @@ export const validateHunyuanGenerationRequest = (request: HunyuanGenerationReque
   if (negativePromptLength > 2000) errors.push("Negative prompt must not exceed 2000 characters after trimming.");
   if (request.seed !== null && (!Number.isSafeInteger(request.seed) || request.seed < 0)) errors.push("Seed must be a nonnegative whole number or random.");
   if (request.profile !== HUNYUAN_GENERATION_PROFILE_ID) errors.push(`Generation profile must be ${HUNYUAN_GENERATION_PROFILE_ID}.`);
-  if (request.quality !== HUNYUAN_QUALITY) errors.push(`Quality must be ${HUNYUAN_QUALITY}.`);
+  if (!HUNYUAN_GENERATION_QUALITIES.includes(request.quality)) errors.push(`Quality must be one of ${HUNYUAN_GENERATION_QUALITIES.join(", ")}.`);
   if (request.outputFormat !== HUNYUAN_OUTPUT_FORMAT) errors.push(`Output format must be ${HUNYUAN_OUTPUT_FORMAT}.`);
   const sourceId = request.sourceAssetId ?? "";
   if (sourceId && !MANAGED_ASSET_ID.test(sourceId)) errors.push("Source asset ID must be a managed UUID, not a path.");

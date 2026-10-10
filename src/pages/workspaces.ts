@@ -1,5 +1,5 @@
 export const workspaceIds = [
-  "home",
+  "studio-chat",
   "projects",
   "assets",
   "jobs",
@@ -9,35 +9,63 @@ export const workspaceIds = [
   "model3d-generator",
   "hunyuan-generator",
   "model3d-review",
+  "llm-settings",
   "settings",
   "diagnostics",
 ] as const;
 
 export type WorkspaceId = (typeof workspaceIds)[number];
 
+/** Public stage names kept as aliases for deep links while every alias still
+ * resolves to exactly one existing workspace implementation. */
+export const workspaceAliases: Record<string, WorkspaceId> = {
+  "home": "studio-chat",
+  "dashboard-image-generator": "image-generator",
+  "concept-studio": "image-generator",
+  "image-generation": "image-generator",
+  "image-approval": "image-generator",
+  "video-generation": "video-generator",
+  "3d-model-studio": "hunyuan-generator",
+  "blender-cleanup": "model3d-review",
+  "3d-approval": "model3d-review",
+  "engine-deployment": "model3d-review",
+};
+
 export interface WorkspaceDefinition {
   id: WorkspaceId;
   title: string;
   shortLabel: string;
-  marker: string;
+  icon: string;
   description: string;
+  section: "studio" | "create" | "library" | "system";
+  visibleInSidebar: boolean;
 }
 
 export const workspaces: WorkspaceDefinition[] = [
-  { id: "home", title: "Studio Overview", shortLabel: "Home", marker: "01", description: "Foundation status and local application information." },
-  { id: "projects", title: "Projects", shortLabel: "Projects", marker: "02", description: "Create, open, close, and manage recent local Nexora projects." },
-  { id: "assets", title: "Assets", shortLabel: "Assets", marker: "03", description: "The future library for immutable masters and derived visual assets." },
-  { id: "jobs", title: "Processing Jobs", shortLabel: "Jobs", marker: "04", description: "Monitor durable project jobs and run safe queue diagnostics." },
-  { id: "providers", title: "Providers", shortLabel: "Providers", marker: "05", description: "Inspect hardware and manage local providers by capability, health, compatibility, and license." },
-  { id: "image-generator", title: "Image Generator", shortLabel: "Image Gen", marker: "IG", description: "Generate image assets with a configured local Automatic1111 provider." },
-  { id: "video-generator", title: "Video Generator", shortLabel: "Video Gen", marker: "VG", description: "Generate managed videos with the stock ComfyUI Wan 2.1 T2V 1.3B low-VRAM profile." },
-  { id: "model3d-generator", title: "3D Generator", shortLabel: "3D Gen", marker: "3D", description: "Create managed GLB assets through an explicitly compatible 3D generation provider." },
-  { id: "hunyuan-generator", title: "Hunyuan Generator", shortLabel: "Hunyuan", marker: "HU", description: "Create managed 3D assets through the local Hunyuan3D provider." },
-  { id: "model3d-review", title: "3D Review", shortLabel: "3D Review", marker: "RV", description: "Review, approve, and reprocess 3D assets from the automated Blender pipeline." },
-  { id: "settings", title: "Settings", shortLabel: "Settings", marker: "06", description: "Shell preferences stored locally on this Windows account." },
-  { id: "diagnostics", title: "Diagnostics", shortLabel: "Diagnostics", marker: "07", description: "Local application log information and foundation health." },
+  { id: "studio-chat", title: "Dashboard", shortLabel: "Dashboard", icon: "sparkles", description: "One dashboard for everything: chat with any model in any language, and run the Image, Video, 3D and Mesh-Pipeline engines from a single prompt — all the way to approval and Unity.", section: "studio", visibleInSidebar: true },
+  { id: "hunyuan-generator", title: "Universal 3D Studio", shortLabel: "3D Studio", icon: "cube", description: "One-prompt game-asset production from concept through Hunyuan3D, Blender optimization, approval, and Unity delivery.", section: "create", visibleInSidebar: true },
+  { id: "assets", title: "Assets", shortLabel: "Assets", icon: "image", description: "The future library for immutable masters and derived visual assets.", section: "library", visibleInSidebar: true },
+  { id: "providers", title: "Providers", shortLabel: "Providers", icon: "server", description: "Inspect hardware and manage local providers by capability, health, compatibility, and license.", section: "system", visibleInSidebar: true },
+  { id: "settings", title: "Settings", shortLabel: "Settings", icon: "settings", description: "Shell preferences stored locally on this Windows account.", section: "system", visibleInSidebar: true },
+  { id: "projects", title: "Projects", shortLabel: "Projects", icon: "folder", description: "Create, open, close, and manage recent local Nexora projects.", section: "studio", visibleInSidebar: false },
+  { id: "jobs", title: "Processing Jobs", shortLabel: "Jobs", icon: "activity", description: "Monitor durable project jobs and run safe queue diagnostics.", section: "studio", visibleInSidebar: false },
+  { id: "image-generator", title: "Image Generation", shortLabel: "Image Gen", icon: "palette", description: "Create, review, and approve 2D images before they can enter the 3D pipeline.", section: "create", visibleInSidebar: false },
+  { id: "video-generator", title: "Video Generation", shortLabel: "Video Gen", icon: "film", description: "Independent prompt-to-video workspace with provider state, controls, previews, and history. stock ComfyUI Wan 2.1 T2V 1.3B low-VRAM profile.", section: "create", visibleInSidebar: false },
+  { id: "model3d-generator", title: "3D Generator", shortLabel: "3D Gen", icon: "box", description: "Create managed GLB assets through an explicitly compatible 3D generation provider.", section: "create", visibleInSidebar: false },
+  { id: "model3d-review", title: "3D Approval & Deployment", shortLabel: "3D Review", icon: "check-circle", description: "Review Blender-cleaned 3D assets, approve the final artifact, and deploy to a validated target.", section: "create", visibleInSidebar: false },
+  { id: "llm-settings", title: "AI Settings", shortLabel: "AI Settings", icon: "settings", description: "The app's own AI brain — connect Gemini, Nvidia NIM, or any OpenAI-compatible endpoint (LM Studio, Ollama, vLLM) with your API key.", section: "system", visibleInSidebar: true },
+  { id: "diagnostics", title: "Diagnostics", shortLabel: "Diagnostics", icon: "activity", description: "Local application log information and foundation health.", section: "system", visibleInSidebar: false },
 ];
 
 export function isWorkspaceId(value: string): value is WorkspaceId {
   return workspaceIds.includes(value as WorkspaceId);
+}
+
+export function resolveWorkspaceId(value: string): WorkspaceId | null {
+  if (isWorkspaceId(value)) return value;
+  return workspaceAliases[value] ?? null;
+}
+
+export function getWorkspaceById(id: WorkspaceId): WorkspaceDefinition | undefined {
+  return workspaces.find(w => w.id === id);
 }

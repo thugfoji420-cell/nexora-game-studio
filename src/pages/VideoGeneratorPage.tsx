@@ -23,17 +23,23 @@ import {
   VIDEO_PROVIDER_ID,
   type AssetInfo,
   type JobInfo,
+  type EngineProjectScope,
+  type ProjectInfo,
   type ProviderFit,
   type ProviderView,
   type VideoGenerationRequest,
   type VideoProviderConfig,
 } from "../types/core";
+import { ProjectManagementBar } from "../components/ProjectManagementBar";
 
 const POLL_INTERVAL_MS = 1000;
 const RESULT_RETRY_INTERVAL_MS = 5000;
 const DIMENSION_PRESETS = [
   { label: "Low VRAM 320 x 192", width: 320, height: 192 },
-] as const;
+  { label: "Low VRAM 384 x 256", width: 384, height: 256 },
+  { label: "Stock 480 x 272", width: 480, height: 272 },
+  { label: "Stock 640 x 368", width: 640, height: 368 },
+];
 
 const initialRequest: VideoGenerationRequest = {
   schemaVersion: 1,
@@ -49,7 +55,12 @@ const initialRequest: VideoGenerationRequest = {
   sourceAssetId: null,
 };
 
-export function VideoGeneratorPage() {
+export interface VideoGeneratorPageProps {
+  currentProject?: ProjectInfo | null;
+  onOpenProjectModal?: (mode: "create" | "open", scope?: EngineProjectScope) => void;
+}
+
+export function VideoGeneratorPage({ currentProject, onOpenProjectModal }: VideoGeneratorPageProps = {}) {
   const [config, setConfig] = useState<VideoProviderConfig | null>(null);
   const [providers, setProviders] = useState<ProviderView[]>([]);
   const [request, setRequest] = useState(initialRequest);
@@ -72,21 +83,38 @@ export function VideoGeneratorPage() {
 
   useEffect(() => {
     let mounted = true;
-    Promise.all([getVideoProviderConfig(), listVideoGenerationProviders(), listJobs().catch((nextError: unknown) => {
-      if (mounted) setError(presentVideoGenerationError(nextError));
-      return [] as JobInfo[];
-    })])
-      .then(([nextConfig, nextProviders, jobs]) => {
+    const init = async () => {
+      try {
+        await refreshProviderHealth(VIDEO_PROVIDER_ID).catch(() => null);
+        const [nextConfig, nextProviders, jobs] = await Promise.all([
+          getVideoProviderConfig(),
+          listVideoGenerationProviders(),
+          listJobs().catch((nextError: unknown) => {
+            const msg = presentVideoGenerationError(nextError);
+            if (mounted && !msg.toLowerCase().includes("no project")) {
+              setError(msg);
+            }
+            return [] as JobInfo[];
+          }),
+        ]);
         if (!mounted) return;
         setConfig(nextConfig);
         setProviders(nextProviders);
         const recoveredJob = recoverLatestVideoGenerationJob(jobs);
         activeJobId.current = recoveredJob?.jobId ?? null;
         setJob(recoveredJob);
-      })
-      .catch((nextError: unknown) => { if (mounted) setError(presentVideoGenerationError(nextError)); })
-      .finally(() => { if (mounted) setLoading(false); });
-    return () => { mounted = false; activeJobId.current = null; ++requestVersion.current; };
+      } catch (nextError: unknown) {
+        if (mounted) setError(presentVideoGenerationError(nextError));
+      } finally {
+        if (mounted) setLoading(false);
+      }
+    };
+    void init();
+    return () => {
+      mounted = false;
+      activeJobId.current = null;
+      ++requestVersion.current;
+    };
   }, []);
 
   useEffect(() => {
@@ -172,6 +200,10 @@ export function VideoGeneratorPage() {
 
   const handleGenerate = async (event: React.FormEvent) => {
     event.preventDefault();
+    if (!currentProject) {
+      setError("Please create or open a project first from the top bar before generating videos.");
+      return;
+    }
     const submittedRequest: VideoGenerationRequest = {
       ...request,
       mode: "text_to_video",
@@ -197,7 +229,12 @@ export function VideoGeneratorPage() {
     } catch (nextError) {
       if (version === requestVersion.current) {
         activeJobId.current = previousJobId;
-        setError(presentVideoGenerationError(nextError));
+        const msg = presentVideoGenerationError(nextError);
+        if (msg.toLowerCase().includes("no project")) {
+          setError("Please create or open a project first from the top bar before generating videos.");
+        } else {
+          setError(msg);
+        }
       }
     } finally {
       if (version === requestVersion.current) setGenerating(false);
@@ -236,30 +273,200 @@ export function VideoGeneratorPage() {
   return (
     <section className="image-generator-page video-generator-page">
       <div className="image-generator-intro"><div><div className="panel-label">LOCAL VIDEO GENERATION</div><h2>Stock ComfyUI Wan 2.1 T2V 1.3B</h2><p>Create managed videos with the trusted, backend-owned low-VRAM model and workflow profile.</p></div><button className="btn btn--secondary" type="button" disabled={saving} onClick={() => void handleRefresh()}>Refresh providers</button></div>
+      <div className="generator-hero generator-hero--video">
+        <div className="generator-hero__orb" aria-hidden="true"><span>VID</span></div>
+        <div className="generator-hero__copy">
+          <span className="generator-hero__eyebrow">NEXORA MOTION LAB</span>
+          <h3>Motion studies for the next scene</h3>
+          <p>Build short cinematic passes with a bounded local workflow, clear runtime status, and managed outputs ready for review.</p>
+        </div>
+        <div className="generator-hero__signals" aria-label="Video generation capabilities">
+          <span><i /> Wan 2.1 profile</span>
+          <span><i /> Low-VRAM aware</span>
+          <span><i /> No autoplay</span>
+        </div>
+      </div>
+      <ProjectManagementBar currentProject={currentProject} scope="video" onOpenProjectModal={onOpenProjectModal} />
       {error && <div className="error-banner" role="alert">{error}</div>}
       {message && <div className="success-banner" role="status">{message}</div>}
       {validationErrors.length > 0 && <ul className="provider-warnings" role="alert">{validationErrors.map((item) => <li key={item}>{item}</li>)}</ul>}
 
-      <form className="image-config-panel" onSubmit={handleSaveConfig}>
-        <div className="image-panel-heading"><div><div className="panel-label">PROVIDER SETUP</div><h3>Local ComfyUI connection</h3></div><span className={`status-badge status-badge--provider-${config.enabled && health ? health.tone : "muted"}`}>{config.enabled && health ? health.label : "Disabled"}</span></div>
-        <p className="image-prerequisite">ComfyUI must be installed and started separately. Setup is disabled by default. Nexora uses stock ComfyUI nodes and sends only bounded fields to a trusted backend-owned model and workflow profile; it does not install custom nodes or accept workflow JSON, paths, or arbitrary endpoints.</p>
-        <div className="image-config-fields">
-          <label className="image-checkbox"><input type="checkbox" checked={config.enabled} onChange={(event) => setConfig({ ...config, enabled: event.currentTarget.checked })} /> Enable provider</label>
-          <label>Loopback base URL<input type="url" value={config.baseUrl} onChange={(event) => setConfig({ ...config, baseUrl: event.currentTarget.value })} placeholder="http://127.0.0.1:8188" /></label>
-          <label>Timeout (seconds)<input type="number" min="1" max="300" value={config.timeoutSeconds} onChange={(event) => setConfig({ ...config, timeoutSeconds: event.currentTarget.valueAsNumber })} /></label>
-          <button className="btn btn--primary" type="submit" disabled={saving}>{saving ? "Checking..." : "Save & Check"}</button>
+      <form className="video-provider-bar-compact" onSubmit={handleSaveConfig}>
+        <div className="provider-bar-left">
+          <span className="panel-label" style={{ marginBottom: 0 }}>COMFYUI WAN 2.1</span>
+          <span className={`status-dot ${config.enabled && health?.tone === "good" ? "status-dot--ready" : "status-dot--offline"}`} />
+          <span className={`status-badge status-badge--provider-${config.enabled && health ? health.tone : "muted"}`}>
+            {config.enabled && health ? health.label : "Disabled"}
+          </span>
+          <label className="provider-bar-checkbox">
+            <input
+              type="checkbox"
+              checked={config.enabled}
+              onChange={(event) => setConfig({ ...config, enabled: event.currentTarget.checked })}
+            />
+            <span>Enabled</span>
+          </label>
         </div>
-        <div className={`image-provider-state ${config.enabled && !providerReady ? "image-provider-state--warning" : ""}`}>{providerMessage}</div>
-        {provider?.health.detail && <small className="image-health-detail">{provider.health.detail}</small>}
+
+        <div className="provider-bar-right">
+          <div className="provider-bar-field">
+            <label>URL:</label>
+            <input
+              type="url"
+              value={config.baseUrl}
+              onChange={(event) => setConfig({ ...config, baseUrl: event.currentTarget.value })}
+              placeholder="http://127.0.0.1:8188"
+            />
+          </div>
+          <div className="provider-bar-field">
+            <label>Timeout:</label>
+            <input
+              type="number"
+              min="1"
+              max="300"
+              value={config.timeoutSeconds}
+              onChange={(event) => setConfig({ ...config, timeoutSeconds: event.currentTarget.valueAsNumber })}
+            />
+            <span>s</span>
+          </div>
+          <button className="btn btn--secondary btn--sm" type="submit" disabled={saving}>
+            {saving ? "Checking..." : "Save & Check"}
+          </button>
+        </div>
       </form>
 
       <div className="image-generator-layout">
         <form className="image-generation-form image-generator-panel" onSubmit={handleGenerate}>
-          <div className="image-panel-heading"><div><div className="panel-label">GENERATION REQUEST</div><h3>Compose video</h3></div></div>
+          <div className="image-panel-heading">
+            <div>
+              <div className="panel-label">GENERATION REQUEST</div>
+              <h3>Compose Video Sequence</h3>
+            </div>
+            <div className="prompt-actions-top">
+              <button
+                className="btn btn--secondary btn--sm"
+                type="button"
+                onClick={() => {
+                  const presets = [
+                    "Futuristic neon cybernetic hovercar speeding through a rainy cyberpunk city, cinematic camera tracking, volumetric streetlights, reflections",
+                    "Magnificent scaled dragon gliding above mist-shrouded mountain peaks at sunset, wings flapping slowly, cinematic drone shot",
+                    "Heavy armored war mech walking forward through smoke and sparks, mechanical pistons firing, dramatic low-angle camera",
+                    "Medieval warrior in gleaming plate armor unsheathing an ornate glowing broadsword in a dense autumn forest, wind rustling leaves",
+                    "Interstellar starship gliding past an illuminated cosmic nebula with rotating sensor array, cinematic sci-fi lighting",
+                  ];
+                  const random = presets[Math.floor(Math.random() * presets.length)];
+                  setRequest((prev) => ({ ...prev, prompt: random }));
+                }}
+                title="Roll a creative studio prompt"
+              >
+                🎲 Random Preset
+              </button>
+              {request.prompt && (
+                <button
+                  className="btn btn--ghost btn--sm"
+                  type="button"
+                  onClick={() => setRequest((prev) => ({ ...prev, prompt: "" }))}
+                >
+                  ✕ Clear
+                </button>
+              )}
+            </div>
+          </div>
+
           <p className="image-prerequisite">Text-to-video only. This stock low-VRAM profile does not accept a source image.</p>
-          <label>Prompt<textarea rows={5} maxLength={2000} value={request.prompt} onChange={(event) => setRequest({ ...request, prompt: event.currentTarget.value })} placeholder="Describe the motion and scene" required /></label>
-          <label>Negative prompt<textarea rows={3} maxLength={2000} value={request.negativePrompt ?? ""} onChange={(event) => setRequest({ ...request, negativePrompt: event.currentTarget.value || null })} placeholder="Optional exclusions" /></label>
-          <div className="image-form-grid">
+
+          <div className="prompt-input-wrapper">
+            <div className="prompt-input-header">
+              <label htmlFor="video-prompt-input" className="form-field-label">Motion & Scene Description</label>
+              <span className={`char-counter ${request.prompt.length > 1800 ? "char-counter--warning" : ""}`}>
+                {request.prompt.length} / 2000
+              </span>
+            </div>
+            <textarea
+              id="video-prompt-input"
+              rows={4}
+              maxLength={2000}
+              value={request.prompt}
+              onChange={(event) => setRequest({ ...request, prompt: event.currentTarget.value })}
+              placeholder="Describe the motion and scene in detail (e.g. 'Cyberpunk combat vehicle drifting through illuminated highway with camera arc tracking')..."
+              required
+              className="prompt-textarea"
+            />
+            {/* Quick Motion Chips */}
+            <div className="prompt-chips-container">
+              <span className="chips-label">Motion Styles:</span>
+              <div className="prompt-chips-scroll">
+                {[
+                  "cinematic camera orbit",
+                  "slow motion 60fps",
+                  "dynamic forward tracking",
+                  "dramatic rim lighting",
+                  "volumetric fog & haze",
+                  "smooth continuous motion",
+                  "photorealistic 4k detail",
+                ].map((chip) => (
+                  <button
+                    key={chip}
+                    type="button"
+                    className="prompt-chip"
+                    onClick={() => {
+                      const current = request.prompt.trim();
+                      if (!current) {
+                        setRequest({ ...request, prompt: chip });
+                      } else if (!current.toLowerCase().includes(chip.toLowerCase())) {
+                        setRequest({ ...request, prompt: `${current}, ${chip}` });
+                      }
+                    }}
+                  >
+                    + {chip}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div className="prompt-input-wrapper" style={{ marginTop: 14 }}>
+            <div className="prompt-input-header">
+              <label htmlFor="video-negative-input" className="form-field-label">Negative Exclusions (Optional)</label>
+              <span className="char-counter">
+                {(request.negativePrompt ?? "").length} / 2000
+              </span>
+            </div>
+            <textarea
+              id="video-negative-input"
+              rows={2}
+              maxLength={2000}
+              value={request.negativePrompt ?? ""}
+              onChange={(event) => setRequest({ ...request, negativePrompt: event.currentTarget.value || null })}
+              placeholder="Optional exclusions (e.g. 'blurry, jittery, distorted, watermark, static')"
+              className="prompt-textarea prompt-textarea--negative"
+            />
+            {/* Negative Quick Chips */}
+            <div className="prompt-chips-container">
+              <span className="chips-label">Avoid:</span>
+              <div className="prompt-chips-scroll">
+                {["blurry", "jittery", "distorted anatomy", "watermark", "static image", "flickering"].map((chip) => (
+                  <button
+                    key={chip}
+                    type="button"
+                    className="prompt-chip prompt-chip--negative"
+                    onClick={() => {
+                      const current = (request.negativePrompt ?? "").trim();
+                      if (!current) {
+                        setRequest({ ...request, negativePrompt: chip });
+                      } else if (!current.toLowerCase().includes(chip.toLowerCase())) {
+                        setRequest({ ...request, negativePrompt: `${current}, ${chip}` });
+                      }
+                    }}
+                  >
+                    ✕ {chip}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div className="image-form-grid" style={{ marginTop: 18 }}>
             <label>Dimensions<select value={`${request.width}x${request.height}`} onChange={(event) => { const [width, height] = event.currentTarget.value.split("x").map(Number); setRequest({ ...request, width, height }); }}>{DIMENSION_PRESETS.map((preset) => <option key={preset.label} value={`${preset.width}x${preset.height}`}>{preset.label}</option>)}</select></label>
             <label>Frame count<input type="number" min="1" max="81" step="4" value={request.frameCount} onChange={(event) => setRequest({ ...request, frameCount: event.currentTarget.valueAsNumber })} /></label>
             <label>FPS<input type="number" min="1" max="24" step="1" value={request.fps} onChange={(event) => setRequest({ ...request, fps: event.currentTarget.valueAsNumber })} /></label>
@@ -268,7 +475,7 @@ export function VideoGeneratorPage() {
             <label>Generation profile<input value={VIDEO_GENERATION_PROFILE_ID} readOnly /></label>
           </div>
           <label className="image-checkbox"><input type="checkbox" checked={randomSeed} onChange={(event) => { setRandomSeed(event.currentTarget.checked); if (event.currentTarget.checked) setRequest({ ...request, seed: null }); }} /> Use random seed</label>
-          <button className="btn btn--primary image-generate-button" type="submit" disabled={!providerReady || generating || shouldPollVideoGenerationJob(job)}>{generating ? "Starting..." : "Generate Video"}</button>
+          <button className="btn btn--primary image-generate-button" type="submit" disabled={!providerReady || generating || shouldPollVideoGenerationJob(job)}>{generating ? "Starting..." : "🎬 Generate Video Sequence"}</button>
         </form>
 
         <section className="image-generator-panel image-output-panel">

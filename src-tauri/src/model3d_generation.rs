@@ -56,7 +56,7 @@ impl Model3dGenerationRequest {
                 .as_ref()
                 .is_some_and(|value| value.chars().count() > MAX_PROMPT_CHARS)
             || self.profile != PROFILE_ID
-            || self.quality != "standard"
+            || !matches!(self.quality.as_str(), "draft" | "standard" | "high")
             || self.seed.is_some_and(|seed| seed < 0)
             || self.output_format != "glb"
         {
@@ -103,7 +103,7 @@ pub fn resolve_source(
         return Ok(None);
     };
     let (path, registered_size, registered_checksum): (String, u64, String) = project.db.lock().unwrap().query_row(
-        "SELECT managed_master_path,file_size,checksum FROM assets WHERE asset_id=?1 AND project_id=?2 AND status='ready' AND media_kind='image'",
+        "SELECT managed_master_path,file_size,checksum FROM assets WHERE asset_id=?1 AND project_id=?2 AND status='ready' AND media_kind='image' AND (COALESCE(source_type, '') <> 'generated' OR EXISTS (SELECT 1 FROM asset_approvals WHERE asset_id=assets.asset_id AND status='approved'))",
         rusqlite::params![id, project.manifest.project_id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ).map_err(|_| Model3dError::InvalidRequest("sourceAssetId must reference a READY image in the current project".into()))?;
@@ -421,6 +421,18 @@ mod tests {
             serde_json::to_string(&crate::providers::Capability::Model3dImageTo3d).unwrap(),
             "\"model3d.image_to_3d\""
         );
+    }
+
+    #[test]
+    fn quality_presets_are_accepted_and_unknown_rejected() {
+        for quality in ["draft", "standard", "high"] {
+            let mut value = request(None);
+            value.quality = quality.into();
+            assert!(value.normalize().is_ok(), "{quality} must be accepted");
+        }
+        let mut value = request(None);
+        value.quality = "ultra".into();
+        assert!(value.normalize().is_err());
     }
 
     #[test]

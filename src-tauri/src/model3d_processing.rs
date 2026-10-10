@@ -1,20 +1,11 @@
 use crate::{model3d_validation, project::ProjectState};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf};
+use std::fs;
 use thiserror::Error;
 use uuid::Uuid;
 
 pub const MODEL3D_PROCESSING_PROFILE_ID: &str = "foundation.processing.v1";
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProcessingProfile {
-    #[serde(rename = "generic")]
-    Generic,
-    #[serde(rename = "vehicle")]
-    Vehicle,
-}
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -30,7 +21,7 @@ pub enum ProcessingQuality {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Model3dProcessingResult {
     pub job_id: String,
     pub status: String,
@@ -45,12 +36,17 @@ pub struct Model3dProcessingResult {
     pub material_status: Option<String>,
     pub pre_analysis_report: Option<ProcessingReport>,
     pub post_analysis_report: Option<ProcessingReport>,
+    /// PBR upgrade stage stats from the processor report (normal/roughness maps,
+    /// AO bake, metallic clamping). Present for jobs processed after the
+    /// game-readiness upgrade; older reports yield an empty default.
+    #[serde(default)]
+    pub pbr_stats: serde_json::Value,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ProcessingReport {
     pub vertices_before: u64,
     pub vertices_after: u64,
@@ -74,6 +70,22 @@ pub struct ProcessingReport {
     pub lod0_triangles: Option<u64>,
     pub lod1_triangles: Option<u64>,
     pub lod2_triangles: Option<u64>,
+    #[serde(default)]
+    pub collision_generated: Option<bool>,
+    #[serde(default)]
+    pub collision_triangles: Option<u64>,
+    #[serde(default)]
+    pub quality_score: Option<u32>,
+    #[serde(default)]
+    pub quality_rating: Option<String>,
+    #[serde(default)]
+    pub category_detected: String,
+    #[serde(default)]
+    pub category_confidence: f32,
+    #[serde(default)]
+    pub category_needs_review: bool,
+    #[serde(default)]
+    pub category_details: serde_json::Value,
     pub vehicle_detected: bool,
     pub wheel_candidates: u32,
     pub wheel_separation_possible: bool,
@@ -111,7 +123,7 @@ pub fn get_result(
         Option<String>,
     )> = {
         db.query_row(
-            "SELECT status, processing_stage, progress, output_master_path, lod0_path, lod1_path, lod2_path, vehicle_analysis_path, material_status, error_code, error_message, blender_log_path FROM model3d_processing_jobs WHERE job_id=?1",
+            "SELECT j.status, p.processing_stage, p.progress, p.output_master_path, p.lod0_path, p.lod1_path, p.lod2_path, p.vehicle_analysis_path, p.material_status, p.error_code, p.error_message, p.blender_log_path FROM model3d_processing_jobs p JOIN jobs j ON j.job_id = p.job_id WHERE p.job_id=?1",
             rusqlite::params![job_id],
             |row| Ok((
                 row.get(0)?,
@@ -185,6 +197,10 @@ pub fn get_result(
         None
     };
 
+    // Pull the PBR upgrade stats out of the stored processor report so the UI
+    // can show what material data the asset actually carries.
+    let pbr_stats = read_report_and_extract_pbr(&db, job_id);
+
     Ok(Model3dProcessingResult {
         job_id: job_id.into(),
         status,
@@ -199,6 +215,7 @@ pub fn get_result(
         material_status,
         pre_analysis_report: pre_report,
         post_analysis_report: post_report,
+        pbr_stats: pbr_stats,
         error_code,
         error_message,
     })
@@ -207,6 +224,44 @@ pub fn get_result(
 fn read_report(path: &str) -> Option<ProcessingReport> {
     let data = fs::read(path).ok()?;
     serde_json::from_slice(&data).ok()
+}
+
+/// Reads the processor report for a job and extracts `stages.pbr_materials.stats`.
+/// Returns Null for jobs processed before the PBR upgrade (no stage in report).
+fn read_report_and_extract_pbr(db: &rusqlite::Connection, job_id: &str) -> serde_json::Value {
+    let path: Option<String> = db
+        .query_row(
+            "SELECT post_analysis_report_path FROM model3d_processing_jobs WHERE job_id=?1",
+            rusqlite::params![job_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten();
+    let Some(path) = path else {
+        return serde_json::Value::Null;
+    };
+    fs::read(&path)
+        .ok()
+        .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
+        .and_then(|report| {
+            let mut stats = report
+                .get("stages")
+                .and_then(|s| s.get("pbr_materials"))
+                .and_then(|s| s.get("stats"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            // Surface the honest AAA readiness verdict alongside the map stats
+            if let serde_json::Value::Object(ref mut map) = stats {
+                if let Some(score) = report.get("quality_score").cloned() {
+                    map.insert("quality_score".to_string(), score);
+                }
+                if let Some(rating) = report.get("quality_rating").cloned() {
+                    map.insert("quality_rating".to_string(), rating);
+                }
+            }
+            Some(stats)
+        })
+        .unwrap_or(serde_json::Value::Null)
 }
 
 fn valid_uuid(value: &str) -> bool {

@@ -186,6 +186,10 @@ pub enum ImageError {
     Timeout,
     #[error("local image provider returned retryable status {0}")]
     Server(u16),
+    #[error("generated concept was cropped (subject touches the image edge); retrying with a fresh seed")]
+    CroppedComposition,
+    #[error("generated concept still failed the 3D-safety gate after all retries (subject too large in frame or cropped)")]
+    CompositionRejected,
     #[error("local image provider rejected request with status {0}")]
     Rejected(u16),
     #[error("malformed local image provider output: {0}")]
@@ -200,7 +204,18 @@ pub enum ImageError {
 
 impl ImageError {
     pub fn retryable(&self) -> bool {
-        matches!(self, Self::Unavailable(_) | Self::Timeout | Self::Server(_))
+        matches!(
+            self,
+            Self::Unavailable(_) | Self::Timeout | Self::Server(_) | Self::CroppedComposition
+        )
+    }
+
+    /// True when the request payload should be mutated before the next
+    /// attempt. Cropped compositions get a fresh seed (an unchanged requeue
+    /// would reproduce the identical framing) and an escalated CFG, which
+    /// pushes the composition away from the model's close-up prior.
+    pub fn needs_reseed(&self) -> bool {
+        matches!(self, Self::CroppedComposition)
     }
 }
 
@@ -243,6 +258,30 @@ pub fn execute_http(
         return Err(ImageError::Unavailable("provider is disabled".into()));
     }
     let request = &payload.request;
+    #[cfg(not(test))]
+    {
+        // A long-running A1111 instance can wedge: the API answers but every
+        // txt2img returns 500 (observed on 4GB GPUs sharing VRAM with
+        // Hunyuan3D). Probe with a tiny generation first; on failure, wait
+        // and probe once more before the real request so a transient wedge
+        // clears without failing the job (the job-level retry then only
+        // handles genuine failures).
+        let probe = serde_json::json!({
+            "prompt": "health probe", "width": 64, "height": 64, "steps": 1,
+            "seed": 0, "batch_size": 1, "n_iter": 1, "send_images": false, "save_images": false
+        });
+        let probe_client = client(config)?;
+        for attempt in 0..2 {
+            let endpoint = endpoint(config, "/sdapi/v1/txt2img")?;
+            match probe_client.post(endpoint).json(&probe).send() {
+                Ok(response) if response.status().is_success() => break,
+                _ if attempt == 0 => {
+                    std::thread::sleep(Duration::from_secs(8));
+                }
+                _ => {}
+            }
+        }
+    }
     let body = serde_json::json!({
         "prompt": request.prompt,
         "negative_prompt": request.negative_prompt.as_deref().unwrap_or(""),

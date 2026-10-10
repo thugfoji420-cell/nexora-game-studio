@@ -1,4 +1,6 @@
-import type { AppSettings, BlenderConfig } from "../types/core";
+import { useEffect, useState } from "react";
+import type { AppSettings } from "../types/core";
+import { getSkipRuntimeStartup, setSkipRuntimeStartup } from "../services/core";
 
 interface SettingsPageProps {
   settings: AppSettings;
@@ -8,10 +10,22 @@ interface SettingsPageProps {
 }
 
 export function SettingsPage({ settings, saving, message, onChange }: SettingsPageProps) {
-  const blender: BlenderConfig = settings.blender || { executablePath: null, version: null, validatedAtMs: null };
+  const [skipRuntimeStartup, setSkipRuntimeStartupLocal] = useState(false);
+  const [saveMessage, setSaveMessage] = useState(message);
 
-  const updateBlender = (patch: Partial<BlenderConfig>) => {
-    onChange({ ...settings, blender: { ...blender, ...patch } });
+  useEffect(() => {
+    getSkipRuntimeStartup().then(setSkipRuntimeStartupLocal).catch(console.error);
+  }, []);
+
+  const handleSkipRuntimeChange = async (enabled: boolean) => {
+    setSkipRuntimeStartupLocal(enabled);
+    setSaveMessage("Saving...");
+    try {
+      await setSkipRuntimeStartup(enabled);
+      setSaveMessage("Startup preference saved.");
+    } catch {
+      setSaveMessage("Failed to save startup preference.");
+    }
   };
 
   return (
@@ -32,22 +46,17 @@ export function SettingsPage({ settings, saving, message, onChange }: SettingsPa
         <span className="locked-value">OFF</span>
       </div>
       <div className="setting-row">
-        <div><strong>Blender executable</strong><p>Path to blender.exe for 3D processing. Leave empty to auto-discover.</p></div>
-        <input
-          value={blender.executablePath ?? ""}
-          onChange={(event) => updateBlender({ executablePath: event.target.value || null })}
-          placeholder="C:\\Program Files\\Blender Foundation\\Blender 4.1\\blender.exe"
-        />
+        <div><strong>Skip AI runtime startup on launch</strong><p>When enabled, Nexora will not automatically start Hunyuan3D or Stable Diffusion servers on launch. You can start them manually from the Providers page.</p></div>
+        <label className="toggle-label">
+          <input
+            type="checkbox"
+            checked={skipRuntimeStartup}
+            onChange={(event) => handleSkipRuntimeChange(event.target.checked)}
+          />
+          <span className="toggle-slider" />
+        </label>
       </div>
-      <div className="setting-row">
-        <div><strong>Blender version</strong><p>Detected version (validated on check).</p></div>
-        <input value={blender.version ?? ""} readOnly />
-      </div>
-      <div className="setting-row">
-        <div><strong>Validated</strong><p>Last successful validation timestamp.</p></div>
-        <input value={blender.validatedAtMs ? new Date(blender.validatedAtMs).toLocaleString() : "Never"} readOnly />
-      </div>
-      <div className="save-state">{saving ? "Saving locally..." : message}</div>
+      <div className="save-state">{saving ? "Saving locally..." : saveMessage}</div>
     </section>
   );
 }

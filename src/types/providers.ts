@@ -19,6 +19,7 @@ export const capabilities = [
   "model3d.image_to_3d",
   "hunyuan.text_to_3d",
   "hunyuan.image_to_3d",
+  "prompt_generation",
 ] as const;
 
 export type Capability = (typeof capabilities)[number];
@@ -140,7 +141,7 @@ export type ProviderDiagnosticJob = JobInfo;
 
 // Runtime Manager Types
 export type RuntimeType = "automatic1111" | "hunyuan3d" | "blender";
-export type RuntimeStatus = "notConfigured" | "notInstalled" | "stopped" | "starting" | "ready" | "degraded" | "failed";
+export type RuntimeStatus = "notConfigured" | "notInstalled" | "stopped" | "starting" | "ready" | "degraded" | "failed" | "unavailable";
 export type RuntimeKind = "longRunningService" | "onDemandExecutable";
 
 export interface RuntimeConfig {
@@ -169,6 +170,16 @@ export interface RuntimeState {
   readinessTimeMs: number | null;
 }
 
+export interface EngineUpdateStatus {
+  engineId: string;
+  displayName: string;
+  currentVersion: string | null;
+  availableVersion: string | null;
+  updateAvailable: boolean;
+  status: "up-to-date" | "available" | "updated" | "skipped" | "deferred" | "manual" | "check-failed" | "update-failed";
+  detail: string;
+}
+
 export interface A1111Config {
   installPath: string | null;
   launcherPath: string | null;
@@ -187,3 +198,4 @@ export interface HunyuanConfig {
   concurrency: number;
   textureGeneration: boolean;
 }
+

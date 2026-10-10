@@ -4,7 +4,7 @@ const { invoke, open } = vi.hoisted(() => ({ invoke: vi.fn(), open: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open }));
 
-import { formatFileSize, formatTimestamp, importAsset, isDuplicateError, pickAssetFile } from "./assets";
+import { formatFileSize, formatTimestamp, importAsset, isDuplicateError, pickAssetFile, deleteAsset, deleteAssets } from "./assets";
 
 describe("Asset Service Layer", () => {
   beforeEach(() => {
@@ -21,6 +21,16 @@ describe("Asset Service Layer", () => {
     await expect(pickAssetFile()).resolves.toBe("C:\\safe\\model.glb");
     expect(invoke).toHaveBeenCalledWith("import_asset", { path: "C:\\safe\\model.glb" });
     expect(open).toHaveBeenCalledWith({ multiple: false, filters: [{ name: "Images and 3D Models", extensions: ["png", "jpg", "jpeg", "glb", "gltf"] }] });
+  });
+
+  it("passes the exact camelCase invoke contract for single and bulk delete", async () => {
+    invoke.mockResolvedValueOnce({ assetId: "asset-1", requested: 1, deleted: [], failed: [] });
+    await expect(deleteAsset("asset-1")).resolves.toBeTruthy();
+    expect(invoke).toHaveBeenLastCalledWith("delete_asset", { assetId: "asset-1" });
+
+    invoke.mockResolvedValueOnce({ requested: 2, deleted: [], failed: [] });
+    await expect(deleteAssets(["asset-1", "asset-2"])).resolves.toBeTruthy();
+    expect(invoke).toHaveBeenLastCalledWith("delete_assets", { assetIds: ["asset-1", "asset-2"] });
   });
   describe("isDuplicateError", () => {
     it("detects duplicate error from string", () => {

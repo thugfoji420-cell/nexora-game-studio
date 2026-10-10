@@ -36,6 +36,9 @@ export interface AssetInfo {
   codec: string | null;
   modelMetadataSchemaVersion: number | null;
   modelMetadata?: Model3dMetadata | null;
+  processingStatus?: string | null;
+  approvalStatus?: "pending" | "approved" | "rejected" | null;
+  sourceType?: string | null;
 }
 
 export interface DuplicateAssetResult {

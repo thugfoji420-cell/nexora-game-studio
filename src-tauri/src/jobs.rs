@@ -1,6 +1,6 @@
 use crate::{
     blender_adapter,
-    hardware::HardwareSnapshot,
+    hardware::{Confidence, HardwareSnapshot},
     hunyuan_generation::{
         self, HUNYUAN_JOB_TYPE, HunyuanGenerationRequest, HunyuanJobPayload, HunyuanMode,
     },
@@ -24,6 +24,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub const JOB_TYPE: &str = "diagnostic.delay";
@@ -457,11 +458,14 @@ pub fn create_image_generation(
     image_generation::validate_payload(&payload)
         .map_err(|error| JobError::InvalidInput(error.to_string()))?;
     let compatibility = provider.fit;
+    // Five attempts: the composition gate rejects tight framings and each
+    // retry re-seeds and escalates CFG, so more attempts directly increase
+    // the odds of a 3D-safe concept without user intervention.
     let job = insert_job(
         project,
         IMAGE_GENERATION_JOB_TYPE,
         serde_json::to_string(&payload)?,
-        2,
+        5,
     )?;
     Ok(CreateImageGenerationJobResult { job, compatibility })
 }
@@ -556,6 +560,42 @@ pub fn create_model3d_generation(
     Ok(CreateModel3dGenerationJobResult { job, compatibility })
 }
 
+/// Minimum free VRAM (MiB) required before accepting a Hunyuan `high` (AAA)
+/// generation. Measured on the 4 GB dev GPU: shape+texture with the paint
+/// pipeline loaded needs more headroom than was available when a 2.20 GiB-free
+/// card hit "CUDA out of memory" during DiT load. `standard`/`draft` stay
+/// ungated — they were proven to fit alongside other apps.
+pub const HUNYUAN_HIGH_MIN_FREE_VRAM_MIB: u64 = 2048;
+
+/// Pre-flight gate for AAA (high) Hunyuan jobs: refuse to enqueue when the
+/// GPU does not have enough free VRAM, so the user gets a one-second warning
+/// instead of a ten-minute CUDA OOM failure. Only enforced when an NVIDIA GPU
+/// reports free VRAM at High confidence; otherwise the check stays silent.
+pub fn hunyuan_vram_preflight(
+    request: &HunyuanGenerationRequest,
+    snapshot: &HardwareSnapshot,
+) -> Result<(), String> {
+    if request.quality != "high" {
+        return Ok(());
+    }
+    let gpu = snapshot
+        .gpus
+        .iter()
+        .find(|gpu| gpu.vendor == "nvidia" && gpu.confidence == Confidence::High);
+    let Some(gpu) = gpu else {
+        return Ok(());
+    };
+    let Some(free_mib) = gpu.vram_free_mib else {
+        return Ok(());
+    };
+    if free_mib >= HUNYUAN_HIGH_MIN_FREE_VRAM_MIB {
+        return Ok(());
+    }
+    Err(format!(
+        "AAA quality needs at least {HUNYUAN_HIGH_MIN_FREE_VRAM_MIB} MiB free VRAM but the GPU reports only {free_mib} MiB free. Close GPU-heavy apps (e.g. A1111) or switch quality to standard."
+    ))
+}
+
 pub fn create_hunyuan_generation(
     project: &ProjectState,
     registry: &ProviderRegistry,
@@ -566,6 +606,8 @@ pub fn create_hunyuan_generation(
         .request
         .normalize()
         .map_err(|error| JobError::InvalidInput(error.to_string()))?;
+    hunyuan_vram_preflight(&request, snapshot)
+        .map_err(JobError::InvalidInput)?;
     let capability = match request.mode {
         HunyuanMode::TextTo3d => Capability::HunyuanTextTo3d,
         HunyuanMode::ImageTo3d => Capability::HunyuanImageTo3d,
@@ -660,7 +702,173 @@ pub fn create_model3d_processing(
         1,
     )?;
 
+    // Seed the result row so get_result/retry can find the job from the moment it exists.
+    let now = now_ms();
+    {
+        let db = project.db.lock().unwrap();
+        // Best-effort seed; the worker's persist step upserts anyway.
+        let _ = db.execute(
+            "INSERT INTO model3d_processing_jobs (job_id, source_asset_id, profile, quality, progress, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)",
+            rusqlite::params![
+                job.job_id,
+                payload.request.source_asset_id,
+                payload.request.profile,
+                payload.request.quality,
+                now,
+            ],
+        );
+    }
+
     Ok(CreateModel3dProcessingJobResult { job, compatibility })
+}
+
+/// Persist the outcome of a Blender processing run into model3d_processing_jobs and
+/// register the processed master GLB as a first-class asset with provenance.
+fn persist_model3d_processing_result(
+    db: &Connection,
+    job_id: &str,
+    payload: &Model3dProcessingJobPayload,
+    result: &crate::model3d_processing::Model3dProcessingResult,
+) {
+    use sha2::{Digest, Sha256};
+
+    let now = now_ms();
+    let source_asset_id = payload.request.source_asset_id.clone();
+    let output_dir = result
+        .output_master_path
+        .as_deref()
+        .and_then(|p| std::path::Path::new(p).parent().map(|d| d.to_path_buf()));
+
+    // 1. Write pre/post analysis reports next to the outputs so get_result can read them.
+    if let Some(dir) = output_dir.as_ref() {
+        for (name, report) in [
+            ("pre_analysis.json", &result.pre_analysis_report),
+            ("post_analysis.json", &result.post_analysis_report),
+        ] {
+            if let Some(report) = report {
+                let path = dir.join(name);
+                if let Ok(json) = serde_json::to_vec_pretty(report) {
+                    let _ = std::fs::write(&path, json);
+                }
+            }
+        }
+    }
+
+    // 2. Register the processed master GLB as a managed asset with provenance.
+    if let (Some(master_path), Some(bytes)) = (
+        result.output_master_path.as_deref(),
+        result.output_master_path.as_deref().and_then(|p| std::fs::read(p).ok()),
+    ) {
+        if !bytes.is_empty() {
+            let masters_dir = db
+                .query_row(
+                    "SELECT managed_master_path FROM assets WHERE asset_id=?1",
+                    rusqlite::params![source_asset_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|p| std::path::Path::new(&p).parent().map(|d| d.to_path_buf()));
+            if let Some(masters_dir) = masters_dir {
+                let asset_id = Uuid::now_v7().to_string();
+                let dest = masters_dir.join(format!("{}.glb", asset_id));
+                if fs::copy(master_path, &dest).is_ok() {
+                    let size = bytes.len() as u64;
+                    let checksum = format!("{:x}", Sha256::digest(&bytes));
+                    let inserted = db.execute(
+                        "INSERT INTO assets (asset_id, project_id, original_filename, managed_master_path, file_size, checksum, imported_at_ms, status, source_type, media_kind, media_container, media_format, validation_level, model_metadata_schema_version, model_metadata_json, processing_status) VALUES (?1, (SELECT project_id FROM assets WHERE asset_id=?2), 'processed-model.glb', ?3, ?4, ?5, ?6, 'ready', 'generated', 'model3d', 'GLB', 'glTF 2.0', 'structural', 1, '{}', 'ready_for_review')",
+                        rusqlite::params![
+                            asset_id,
+                            source_asset_id,
+                            dest.to_string_lossy(),
+                            size,
+                            checksum,
+                            now,
+                        ],
+                    );
+                    if inserted.is_ok() {
+                        let _ = db.execute(
+                            "INSERT INTO asset_provenance (asset_id, parent_asset_id, source_type, provider_id, provider_version, model_identifier, commercial_use_allowed, prompt, actual_seed, generation_settings_version, generation_settings_json, generating_job_id, generated_at_ms) VALUES (?1, ?2, 'generated', ?3, ?4, 'foundation.processing.v1', 1, 'Blender optimization', 0, 1, ?5, ?6, ?7)",
+                            rusqlite::params![
+                                asset_id,
+                                source_asset_id,
+                                payload.provider_id,
+                                payload.provider_version,
+                                serde_json::json!({
+                                    "schemaVersion": 1,
+                                    "processing": true,
+                                    "profile": payload.request.profile,
+                                    "quality": payload.request.quality,
+                                    "sourceAssetId": source_asset_id,
+                                })
+                                .to_string(),
+                                job_id,
+                                now,
+                            ],
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Mark the source asset's processing_status (persistent signal that processing ran).
+    match result.status.as_str() {
+        "READY_FOR_REVIEW" | "completed" => {
+            let _ = db.execute(
+                "UPDATE assets SET processing_status='ready_for_review' WHERE asset_id=?1 AND media_kind='model3d'",
+                rusqlite::params![source_asset_id],
+            );
+        }
+        "NEEDS_REVIEW" => {
+            let _ = db.execute(
+                "UPDATE assets SET processing_status='needs_review' WHERE asset_id=?1 AND media_kind='model3d'",
+                rusqlite::params![source_asset_id],
+            );
+        }
+        _ => {}
+    }
+
+    // 4. Persist the result row (upsert; the row is seeded at creation but be defensive).
+    let _ = db.execute(
+        "INSERT INTO model3d_processing_jobs (job_id, source_asset_id, profile, quality, blender_log_path, pre_analysis_report_path, post_analysis_report_path, output_master_path, lod0_path, lod1_path, lod2_path, vehicle_analysis_path, material_status, processing_stage, progress, error_code, error_message, created_at_ms, updated_at_ms, started_at_ms, completed_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?18,?18,?18)
+         ON CONFLICT(job_id) DO UPDATE SET
+            blender_log_path=excluded.blender_log_path,
+            pre_analysis_report_path=excluded.pre_analysis_report_path,
+            post_analysis_report_path=excluded.post_analysis_report_path,
+            output_master_path=excluded.output_master_path,
+            lod0_path=excluded.lod0_path,
+            lod1_path=excluded.lod1_path,
+            lod2_path=excluded.lod2_path,
+            vehicle_analysis_path=excluded.vehicle_analysis_path,
+            material_status=excluded.material_status,
+            processing_stage=excluded.processing_stage,
+            progress=excluded.progress,
+            error_code=excluded.error_code,
+            error_message=excluded.error_message,
+            updated_at_ms=excluded.updated_at_ms,
+            started_at_ms=coalesce(model3d_processing_jobs.started_at_ms, excluded.started_at_ms),
+            completed_at_ms=excluded.completed_at_ms",
+        rusqlite::params![
+            job_id,
+            source_asset_id,
+            payload.request.profile,
+            payload.request.quality,
+            output_dir.as_ref().map(|d| d.join("processing.log").to_string_lossy().to_string()),
+            output_dir.as_ref().filter(|_| result.pre_analysis_report.is_some()).map(|d| d.join("pre_analysis.json").to_string_lossy().to_string()),
+            output_dir.as_ref().filter(|_| result.post_analysis_report.is_some()).map(|d| d.join("post_analysis.json").to_string_lossy().to_string()),
+            result.output_master_path.as_deref().map(|p| p.to_string()),
+            result.lod0_path.as_deref().map(|p| p.to_string()),
+            result.lod1_path.as_deref().map(|p| p.to_string()),
+            result.lod2_path.as_deref().map(|p| p.to_string()),
+            result.vehicle_analysis_path.as_deref().map(|p| p.to_string()),
+            result.material_status,
+            result.processing_stage,
+            result.progress as i64,
+            result.error_code,
+            result.error_message,
+            now,
+        ],
+    );
 }
 
 #[cfg(test)]
@@ -1063,7 +1271,7 @@ pub fn tick_with_configs(
         if !project.execution_enabled() {
             return Ok(true);
         }
-        let result = response.and_then(|bytes| {
+        let mut result = response.and_then(|bytes| {
             update_image_progress_for_project(
                 project,
                 &job,
@@ -1077,7 +1285,7 @@ pub fn tick_with_configs(
                     "execution session retired".into(),
                 ));
             }
-            let result =
+            let mut result =
                 image_generation::parse_response(project, &job.job_id, &payload.request, &bytes)?;
             update_image_progress_for_project(
                 project,
@@ -1087,6 +1295,64 @@ pub fn tick_with_configs(
                 "provider output validated",
             )
             .map_err(|error| image_generation::ImageError::Http(error.to_string()))?;
+            // A concept that fails the 3D-safety gate (cropped or no margin)
+            // must never be promoted: Hunyuan3D reconstructs geometry it
+            // cannot see, and an edge-filling subject yields garbage meshes.
+            // With attempts left, reject retryably so the job re-queues with
+            // a fresh seed; on the final attempt reject permanently — a
+            // failed job with a clear error beats a silently promoted
+            // mesh-hostile image.
+            // Composition gate: repair first, reject only what cannot be
+            // repaired. A tight-but-complete subject (no edge contact) is
+            // auto-reframed onto a margined canvas — the mesh pipeline gets a
+            // usable concept without burning a retry. Edge contact means
+            // pixels are genuinely missing, so the attempt is rejected: with
+            // attempts left it requeues reseeded with escalated CFG, on the
+            // final attempt it fails loudly rather than promoting garbage.
+            let mut repaired = false;
+            for output in &mut result.outputs {
+                // Repair first: an isolatable subject — even one reaching the
+                // edge — is cropped out and recomposed with real margins. This
+                // rescues tight framings AND many edge-touching shots, so the
+                // user's pipeline keeps moving instead of burning retries.
+                if let Some(fixed) =
+                    crate::source_normalization::reframe_with_margin(&output.bytes)
+                {
+                    if !crate::source_normalization::subject_touches_border(&fixed) {
+                        output.bytes = fixed;
+                        output.width = 1024;
+                        output.height = 1024;
+                        output.checksum = format!("{:x}", Sha256::digest(&output.bytes));
+                        output.staging_path = {
+                            let path = output.staging_path.with_extension("png");
+                            fs::write(&path, &output.bytes)?;
+                            dunce::canonicalize(&path)?
+                        };
+                        output.format = image::ImageFormat::Png;
+                        repaired = true;
+                        continue;
+                    }
+                }
+                // Unrepairable (scene background, or subject too close to the
+                // backdrop color for a safe fill): try a fresh seed while
+                // attempts remain for a better composition — but NEVER fail
+                // the job. The human checkpoint A exists precisely to judge
+                // the concept; a complete-but-tight image still reconstructs,
+                // and the user can hit Regenerate Concept if they dislike it.
+                if job.attempt_count < job.max_attempts {
+                    return Err(image_generation::ImageError::CroppedComposition);
+                }
+            }
+            if repaired {
+                update_image_progress_for_project(
+                    project,
+                    &job,
+                    owner,
+                    85,
+                    "concept reframed for 3D safety",
+                )
+                .map_err(|error| image_generation::ImageError::Http(error.to_string()))?;
+            }
             Ok(result)
         });
         match result {
@@ -1243,13 +1509,49 @@ pub fn tick_with_configs(
         }
         #[cfg(not(test))]
         {
-            finish_model3d_error(
-                project,
-                &job,
-                &model3d_generation::Model3dError::Unavailable(
-                    "no compatible 3D generation provider is configured".into(),
-                ),
-            )?;
+            // Execute via Hunyuan3D API (local.hunyuan provider on port 8081)
+            let hunyuan_request = crate::hunyuan_generation::HunyuanGenerationRequest {
+                schema_version: 1,
+                mode: match payload.request.mode {
+                    crate::model3d_generation::Model3dMode::TextTo3d => crate::hunyuan_generation::HunyuanMode::TextTo3d,
+                    crate::model3d_generation::Model3dMode::ImageTo3d => crate::hunyuan_generation::HunyuanMode::ImageTo3d,
+                },
+                prompt: payload.request.prompt.clone(),
+                negative_prompt: payload.request.negative_prompt.clone(),
+                source_asset_id: payload.request.source_asset_id.clone(),
+                profile: crate::hunyuan_generation::HUNYUAN_PROFILE_ID.to_string(),
+                quality: payload.request.quality.clone(),
+                seed: payload.request.seed,
+                output_format: "glb".to_string(),
+                generate_texture: Some(true),
+            };
+            let hunyuan_payload = crate::hunyuan_generation::HunyuanJobPayload {
+                provider_id: "local.hunyuan".to_string(),
+                provider_version: "1.0.0".to_string(),
+                request: hunyuan_request,
+            };
+            let result = crate::hunyuan_generation::run_hunyuan_generation(project, &job.job_id, owner, &hunyuan_payload);
+            let mut db = project.db.lock().unwrap();
+            match result {
+                Ok(r) if r.status == "completed" || r.status == "READY_FOR_REVIEW" => {
+                    let tx = db.transaction()?;
+                    transition(&tx, &job.job_id, "running", "completed", "completed", None, None, Some(100))?;
+                    tx.commit()?;
+                }
+                Ok(r) => {
+                    let tx = db.transaction()?;
+                    let code = "MODEL3D_FAILED";
+                    let message = r.status.clone();
+                    transition(&tx, &job.job_id, "running", "failed", "failed", Some(&message), Some((code, &message, false)), None)?;
+                    tx.commit()?;
+                }
+                Err(error) => {
+                    let tx = db.transaction()?;
+                    let message = error.to_string();
+                    transition(&tx, &job.job_id, "running", "failed", "failed", Some(&message), Some(("MODEL3D_ERROR", &message, false)), None)?;
+                    tx.commit()?;
+                }
+            }
             return Ok(true);
         }
         #[cfg(test)]
@@ -1297,8 +1599,16 @@ pub fn tick_with_configs(
     }
 
     let elapsed = now_ms().saturating_sub(job.started_at_ms) as u64;
-    let progress = ((elapsed.saturating_mul(100) / payload.duration_ms()).min(99)) as u32;
-    if elapsed < payload.duration_ms() {
+    // duration_ms() is 0 for payload kinds that report progress internally
+    // (e.g. hunyuan.generate); skip the elapsed-based progress math for them
+    // and fall through to their dispatch arm below.
+    let duration_ms = payload.duration_ms();
+    let progress = if duration_ms > 0 {
+        ((elapsed.saturating_mul(100) / duration_ms).min(99)) as u32
+    } else {
+        0
+    };
+    if duration_ms > 0 && elapsed < duration_ms {
         if progress >= current_progress.saturating_add(5) {
             let timestamp = now_ms();
             let tx = db.transaction()?;
@@ -1421,15 +1731,13 @@ pub fn tick_with_configs(
 
             let result =
                 blender_adapter::run_model3d_processing(project, &job.job_id, owner, &payload);
-            let result = match result {
-                Ok(r) => Ok(r),
-                Err(e) => Err(e),
-            };
 
             // Re-acquire the database lock for post-processing
             let mut db = project.db.lock().unwrap();
             match result {
                 Ok(result) => {
+                    // Persist the processing result so the UI can read it back
+                    persist_model3d_processing_result(&db, &job.job_id, &payload, &result);
                     if result.status == "completed" || result.status == "READY_FOR_REVIEW" {
                         let tx = db.transaction()?;
                         transition(
@@ -1478,7 +1786,6 @@ pub fn tick_with_configs(
                     Ok(true)
                 }
                 Err(e) => {
-                    let mut db = project.db.lock().unwrap();
                     let tx = db.transaction()?;
                     transition(
                         &tx,
@@ -1548,7 +1855,6 @@ pub fn tick_with_configs(
                     Ok(true)
                 }
                 Err(e) => {
-                    let mut db = project.db.lock().unwrap();
                     let tx = db.transaction()?;
                     transition(
                         &tx,
@@ -1694,6 +2000,28 @@ fn finish_image_error(
             None,
         )?;
     } else if error.retryable() && job.attempt_count < job.max_attempts {
+        // A cropped generation must not repeat: the seed is baked into the
+        // stored payload, so re-queueing unchanged would reproduce the exact
+        // same framing. Crop rejections get a fresh seed AND an escalated CFG
+        // (+2.5 per retry, capped at 13) — stronger guidance breaks the
+        // model's close-up prior that no prompt alone could beat. Transient
+        // provider errors keep their payload because the request was fine.
+        if error.needs_reseed() {
+            if let Ok(mut payload) =
+                serde_json::from_str::<image_generation::ImageJobPayload>(&job.payload_json)
+            {
+                let bytes = Uuid::now_v7().into_bytes();
+                payload.request.seed =
+                    Some(i64::from_be_bytes(bytes[..8].try_into().unwrap()) & i64::MAX);
+                payload.request.guidance = (payload.request.guidance + 2.5).min(13.0);
+                if let Ok(json) = serde_json::to_string(&payload) {
+                    tx.execute(
+                        "UPDATE jobs SET payload_json=?1 WHERE job_id=?2",
+                        rusqlite::params![json, &job.job_id],
+                    )?;
+                }
+            }
+        }
         transition(
             &tx,
             &job.job_id,
@@ -1864,6 +2192,23 @@ pub fn recover(project: &ProjectState) -> Result<usize, JobError> {
     for (job_id, job_type, cancellation, attempts, max_attempts, payload_json, payload_version) in
         running
     {
+        // A corrupt job id must fail the row, not the whole project open.
+        if validate_job_id(&job_id).is_err() {
+            let tx = db.transaction()?;
+            transition(
+                &tx,
+                &job_id,
+                "running",
+                "failed",
+                "recovered_failed",
+                Some("corrupt job id recovered as failed"),
+                Some(("INVALID_JOB_ID", "corrupt job id", false)),
+                None,
+            )?;
+            tx.commit()?;
+            recovered += 1;
+            continue;
+        }
         let payload = parse_payload(&job_type, payload_version, &payload_json);
         cleanup_uncommitted(&project.root, &job_id)?;
         if job_type == IMAGE_GENERATION_JOB_TYPE {
@@ -1959,8 +2304,8 @@ pub fn approve_model3d_asset(
     // Verify processing job exists and is a model3d.processing job
     let job: Option<(String, String)> = tx
         .query_row(
-            "SELECT job_id, job_type FROM jobs WHERE job_id=?1 AND project_id=?2",
-            rusqlite::params![processing_job_id, project.manifest.project_id],
+            "SELECT job_id, job_type FROM jobs WHERE job_id=?1",
+            rusqlite::params![processing_job_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
@@ -2006,10 +2351,69 @@ pub fn approve_model3d_asset(
 
     // Update asset processing_status
     tx.execute(
-        "UPDATE assets SET processing_status = 'approved', updated_at_ms = ?1 WHERE asset_id = ?2",
-        rusqlite::params![now, asset_id],
+        "UPDATE assets SET processing_status = 'approved' WHERE asset_id = ?1",
+        rusqlite::params![asset_id],
     )?;
 
+    tx.commit()?;
+    Ok(())
+}
+
+/// Approve a generated 2D image at the first pipeline gate.
+///
+/// The approval is stored in the same audit table as the final 3D approval,
+/// while the media kind and generating job are checked here so an image
+/// approval cannot be used to unlock an unrelated asset.
+pub fn approve_image_asset(
+    project: &ProjectState,
+    asset_id: &str,
+    generation_job_id: Option<&str>,
+) -> Result<(), JobError> {
+    let mut db = project
+        .db
+        .lock()
+        .map_err(|_| JobError::Database(rusqlite::Error::ExecuteReturnedResults))?;
+    let mut tx = db.transaction()?;
+
+    let asset: Option<(String, String, String)> = tx
+        .query_row(
+            "SELECT asset_id, media_kind, COALESCE(source_type, '') FROM assets WHERE asset_id=?1 AND project_id=?2 AND status='ready'",
+            rusqlite::params![asset_id, project.manifest.project_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let (asset_id, media_kind, _source_type) =
+        asset.ok_or(JobError::InvalidInput("image asset not found or not ready".into()))?;
+    if media_kind != "image" {
+        return Err(JobError::InvalidInput(
+            "only image assets can be approved at the image gate".into(),
+        ));
+    }
+
+    if let Some(job_id) = generation_job_id {
+        let job_type: Option<String> = tx
+            .query_row(
+                "SELECT job_type FROM jobs WHERE job_id=?1",
+                rusqlite::params![job_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if job_type.as_deref() != Some("image.generate") {
+            return Err(JobError::InvalidInput(
+                "image approval must reference an image generation job".into(),
+            ));
+        }
+    }
+
+    let now = now_ms();
+    tx.execute(
+        "INSERT INTO asset_approvals (asset_id, status, approved_by, approved_at_ms, approved_job_id, created_at_ms, updated_at_ms)
+         VALUES (?1, 'approved', 'user', ?2, ?3, ?4, ?5)
+         ON CONFLICT(asset_id) DO UPDATE SET
+           status='approved', approved_by='user', approved_at_ms=?2,
+           approved_job_id=?3, rejection_reason=NULL, updated_at_ms=?5",
+        rusqlite::params![asset_id, now, generation_job_id, now, now],
+    )?;
     tx.commit()?;
     Ok(())
 }
@@ -2043,8 +2447,8 @@ pub fn reject_model3d_asset(
     // Verify processing job exists and is a model3d.processing job
     let job: Option<(String, String)> = tx
         .query_row(
-            "SELECT job_id, job_type FROM jobs WHERE job_id=?1 AND project_id=?2",
-            rusqlite::params![processing_job_id, project.manifest.project_id],
+            "SELECT job_id, job_type FROM jobs WHERE job_id=?1",
+            rusqlite::params![processing_job_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
@@ -2092,8 +2496,8 @@ pub fn reject_model3d_asset(
 
     // Update asset processing_status
     tx.execute(
-        "UPDATE assets SET processing_status = 'rejected', updated_at_ms = ?1 WHERE asset_id = ?2",
-        rusqlite::params![now, asset_id],
+        "UPDATE assets SET processing_status = 'rejected' WHERE asset_id = ?1",
+        rusqlite::params![asset_id],
     )?;
 
     tx.commit()?;
@@ -2109,56 +2513,63 @@ pub fn reprocess_model3d_asset(
     profile: Option<String>,
     quality: Option<String>,
 ) -> Result<CreateModel3dProcessingJobResult, JobError> {
-    // Verify asset exists and is a model3d
-    let mut db = project
-        .db
-        .lock()
-        .map_err(|_| JobError::Database(rusqlite::Error::ExecuteReturnedResults))?;
-    let asset: Option<(String, String)> = db
-        .query_row(
-            "SELECT asset_id, media_kind FROM assets WHERE asset_id=?1 AND project_id=?2",
-            rusqlite::params![asset_id, project.manifest.project_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
+    // All lookups happen inside a scoped block: the db guard MUST be dropped
+    // before create_model3d_processing runs below - it re-locks project.db,
+    // and holding the non-reentrant mutex across that call deadlocked the
+    // whole deploy/job pipeline (Reprocess button hung forever).
+    let (asset_id, new_profile, new_quality) = {
+        let db = project
+            .db
+            .lock()
+            .map_err(|_| JobError::Database(rusqlite::Error::ExecuteReturnedResults))?;
+        let asset: Option<(String, String)> = db
+            .query_row(
+                "SELECT asset_id, media_kind FROM assets WHERE asset_id=?1 AND project_id=?2",
+                rusqlite::params![asset_id, project.manifest.project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
 
-    let (asset_id, media_kind) = asset.ok_or(JobError::InvalidInput("asset not found".into()))?;
-    if media_kind != "model3d" {
-        return Err(JobError::InvalidInput("asset is not a model3d".into()));
-    }
+        let (asset_id, media_kind) =
+            asset.ok_or(JobError::InvalidInput("asset not found".into()))?;
+        if media_kind != "model3d" {
+            return Err(JobError::InvalidInput("asset is not a model3d".into()));
+        }
 
-    // Verify processing job exists and is a model3d.processing job
-    let job: Option<(String, String)> = db
-        .query_row(
-            "SELECT job_id, job_type FROM jobs WHERE job_id=?1 AND project_id=?2",
-            rusqlite::params![processing_job_id, project.manifest.project_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
+        // Verify processing job exists and is a model3d.processing job
+        let job: Option<(String, String)> = db
+            .query_row(
+                "SELECT job_id, job_type FROM jobs WHERE job_id=?1",
+                rusqlite::params![processing_job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
 
-    let (job_id, job_type) =
-        job.ok_or(JobError::InvalidInput("processing job not found".into()))?;
-    if job_type != "model3d.processing" {
-        return Err(JobError::InvalidInput(
-            "job is not a model3d processing job".into(),
-        ));
-    }
+        let (job_id, job_type) =
+            job.ok_or(JobError::InvalidInput("processing job not found".into()))?;
+        if job_type != "model3d.processing" {
+            return Err(JobError::InvalidInput(
+                "job is not a model3d processing job".into(),
+            ));
+        }
 
-    // Get the original processing job details to reuse profile/quality if not specified
-    let original: Option<(String, String)> = db
-        .query_row(
-            "SELECT profile, quality FROM model3d_processing_jobs WHERE job_id=?1",
-            rusqlite::params![job_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
+        // Get the original processing job details to reuse profile/quality if not specified
+        let original: Option<(String, String)> = db
+            .query_row(
+                "SELECT profile, quality FROM model3d_processing_jobs WHERE job_id=?1",
+                rusqlite::params![job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
 
-    let (orig_profile, orig_quality) = original.ok_or(JobError::InvalidInput(
-        "original processing job details not found".into(),
-    ))?;
+        let (orig_profile, orig_quality) = original.ok_or(JobError::InvalidInput(
+            "original processing job details not found".into(),
+        ))?;
 
-    let new_profile = profile.unwrap_or(orig_profile);
-    let new_quality = quality.unwrap_or(orig_quality);
+        let quality = quality.unwrap_or(orig_quality);
+        let profile = profile.unwrap_or(orig_profile);
+        (asset_id, profile, quality)
+    };
 
     // Create a new model3d processing job
     let input = CreateModel3dProcessingJobInput {
@@ -2216,6 +2627,13 @@ fn parse_payload(
             let payload: Model3dProcessingJobPayload = serde_json::from_str(payload_json)
                 .map_err(|_| "invalid model3d processing payload".to_string())?;
             Ok(JobPayload::Model3dProcessing(payload))
+        }
+        hunyuan_generation::HUNYUAN_JOB_TYPE => {
+            let payload: HunyuanJobPayload = serde_json::from_str(payload_json)
+                .map_err(|_| "invalid hunyuan generation payload".to_string())?;
+            hunyuan_generation::validate_payload(&payload)
+                .map_err(|_| "invalid hunyuan generation payload".to_string())?;
+            Ok(JobPayload::Hunyuan(payload))
         }
         _ => Err("unsupported persisted job type".to_string()),
     }
@@ -2324,7 +2742,7 @@ fn write_provider_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{hardware::HardwareSnapshot, project::ProjectState, providers::ProviderRegistry};
+    use crate::{hardware::HardwareSnapshot, hardware::GpuSnapshot, project::ProjectState, providers::ProviderRegistry};
     use sha2::{Digest, Sha256};
     use std::{
         sync::{Arc, atomic::AtomicBool},
@@ -3603,6 +4021,131 @@ mod tests {
         drop(reopened);
         drop(dir);
     }
+
+    #[test]
+    fn model3d_processing_result_is_persisted_and_queryable() {
+        let (dir, project) = project();
+        let source_id = Uuid::now_v7().to_string();
+        let masters = project.root.join("assets").join("masters");
+        std::fs::create_dir_all(&masters).unwrap();
+        let master = masters.join(format!("{}.glb", source_id));
+        std::fs::write(&master, b"glb-source-bytes").unwrap();
+        project
+            .with_db(|db| {
+                db.execute(
+                    "INSERT INTO assets (asset_id, project_id, original_filename, managed_master_path, file_size, checksum, imported_at_ms, status, source_type, media_kind, media_container, media_format, validation_level, model_metadata_schema_version, model_metadata_json, processing_status) VALUES (?1, ?2, 'raw.glb', ?3, 15, 'abc', 1, 'ready', 'imported', 'model3d', 'GLB', 'glTF 2.0', 'structural', 1, '{}', 'raw')",
+                    rusqlite::params![source_id, project.manifest.project_id, master.to_string_lossy()],
+                )
+            })
+            .unwrap();
+
+        let registry = ProviderRegistry::phase8(false, false).unwrap();
+        let snapshot = crate::providers::tests::snapshot(Some(16_000), Some(50_000), None);
+        let input = CreateModel3dProcessingJobInput {
+            schema_version: 1,
+            source_asset_id: source_id.clone(),
+            profile: "vehicle".into(),
+            quality: "master".into(),
+            provider_id: None,
+        };
+        let created =
+            create_model3d_processing(&project, &registry, &snapshot, input).unwrap();
+
+        // The result row must exist from the moment the job is created.
+        let seeded = project
+            .with_db(|db| {
+                db.query_row(
+                    "SELECT source_asset_id, profile FROM model3d_processing_jobs WHERE job_id=?1",
+                    rusqlite::params![created.job.job_id],
+                    |row| Ok((row.get::<_, String>(0), row.get::<_, String>(1))),
+                )
+            })
+            .unwrap();
+        assert_eq!(seeded.0.unwrap(), source_id);
+        assert_eq!(seeded.1.unwrap(), "vehicle");
+
+        // Simulate the worker's persist step (run_model3d_processing is covered by its own adapter tests).
+        let out_dir = project
+            .root
+            .join(".nexora")
+            .join("jobs")
+            .join(&created.job.job_id)
+            .join("model3d_processing");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let processed_master = out_dir.join("clean_master.glb");
+        std::fs::write(&processed_master, b"glb-processed-bytes").unwrap();
+        let result = crate::model3d_processing::Model3dProcessingResult {
+            job_id: created.job.job_id.clone(),
+            status: "READY_FOR_REVIEW".into(),
+            asset_ids: vec![],
+            processing_stage: Some("completed".into()),
+            progress: 100,
+            output_master_path: Some(processed_master.to_string_lossy().to_string()),
+            lod0_path: None,
+            lod1_path: Some(out_dir.join("vehicle_lod1.glb").to_string_lossy().to_string()),
+            lod2_path: None,
+            vehicle_analysis_path: None,
+            material_status: Some("standard_pbr".into()),
+            pre_analysis_report: None,
+            post_analysis_report: None,
+            pbr_stats: serde_json::Value::Null,
+            error_code: None,
+            error_message: None,
+        };
+        {
+            let payload = Model3dProcessingJobPayload {
+                provider_id: "local.blender".into(),
+                provider_version: "1".into(),
+                request: Model3dProcessingJobRequest {
+                    schema_version: 1,
+                    source_asset_id: source_id.clone(),
+                    profile: "vehicle".into(),
+                    quality: "master".into(),
+                },
+            };
+            let db = project.db.lock().unwrap();
+            persist_model3d_processing_result(&db, &created.job.job_id, &payload, &result);
+        }
+
+        // Simulate the worker's post-persist job transition, then get_result must resolve it.
+        project.with_db(|db| {
+            db.execute(
+                "UPDATE jobs SET status='completed', progress=100 WHERE job_id=?1",
+                rusqlite::params![created.job.job_id],
+            )
+        })
+        .unwrap();
+        let view = crate::model3d_processing::get_result(&project, &created.job.job_id).unwrap();
+        assert_eq!(view.status, "completed");
+        assert_eq!(view.progress, 100);
+        assert!(view.output_master_path.is_some());
+
+        // A new managed asset was registered with provenance, parented to the source.
+        let provenance_count: i64 = project
+            .with_db(|db| {
+                db.query_row(
+                    "SELECT count(*) FROM asset_provenance WHERE generating_job_id=?1 AND parent_asset_id=?2",
+                    rusqlite::params![created.job.job_id, source_id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(provenance_count, 1);
+
+        // The source asset is marked ready_for_review so the approval gate can accept it.
+        let src_status: String = project
+            .with_db(|db| {
+                db.query_row(
+                    "SELECT processing_status FROM assets WHERE asset_id=?1",
+                    rusqlite::params![source_id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(src_status, "ready_for_review");
+
+        drop(dir);
+    }
 }
 
 pub fn create_unity_delivery(
@@ -3653,8 +4196,8 @@ pub fn create_unity_delivery(
     // Verify processing job exists and is a model3d.processing job
     let job: Option<(String, String)> = tx
         .query_row(
-            "SELECT job_id, job_type FROM jobs WHERE job_id=?1 AND project_id=?2",
-            rusqlite::params![processing_job_id, project.manifest.project_id],
+            "SELECT job_id, job_type FROM jobs WHERE job_id=?1",
+            rusqlite::params![processing_job_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
@@ -3957,4 +4500,78 @@ pub struct UpdateUnityDeliveryStatusInput {
     pub imported_asset_path: Option<String>,
     pub prefab_path: Option<String>,
     pub validation_report: Option<String>,
+}
+
+#[cfg(test)]
+mod vram_preflight_tests {
+    use super::*;
+    use crate::hardware::GpuSnapshot;
+
+    fn gpu(vendor: &str, free_mib: Option<u64>, confidence: Confidence) -> GpuSnapshot {
+        GpuSnapshot {
+            name: "Test GPU".into(),
+            vendor: vendor.into(),
+            vram_total_mib: Some(4096),
+            vram_used_mib: None,
+            vram_free_mib: free_mib,
+            driver: None,
+            source: "test".into(),
+            confidence,
+        }
+    }
+
+    fn snapshot_with(gpus: Vec<GpuSnapshot>) -> HardwareSnapshot {
+        let mut snapshot = HardwareSnapshot::unknown();
+        snapshot.gpus = gpus;
+        snapshot
+    }
+
+    fn request(quality: &str) -> HunyuanGenerationRequest {
+        HunyuanGenerationRequest {
+            schema_version: 1,
+            mode: HunyuanMode::TextTo3d,
+            prompt: "test car".into(),
+            negative_prompt: None,
+            source_asset_id: None,
+            profile: crate::hunyuan_generation::HUNYUAN_PROFILE_ID.into(),
+            quality: quality.into(),
+            seed: None,
+            output_format: "glb".into(),
+            generate_texture: Some(true),
+        }
+    }
+
+    #[test]
+    fn high_quality_blocked_when_free_vram_below_threshold() {
+        let snapshot = snapshot_with(vec![gpu("nvidia", Some(1024), Confidence::High)]);
+        let error = hunyuan_vram_preflight(&request("high"), &snapshot).unwrap_err();
+        assert!(error.contains("2048 MiB free VRAM"));
+        assert!(error.contains("1024 MiB free"));
+    }
+
+    #[test]
+    fn high_quality_allowed_at_threshold() {
+        let snapshot = snapshot_with(vec![gpu("nvidia", Some(2048), Confidence::High)]);
+        assert!(hunyuan_vram_preflight(&request("high"), &snapshot).is_ok());
+    }
+
+    #[test]
+    fn standard_quality_never_gated() {
+        let snapshot = snapshot_with(vec![gpu("nvidia", Some(0), Confidence::High)]);
+        assert!(hunyuan_vram_preflight(&request("standard"), &snapshot).is_ok());
+        assert!(hunyuan_vram_preflight(&request("draft"), &snapshot).is_ok());
+    }
+
+    #[test]
+    fn low_confidence_probe_never_gates() {
+        let snapshot = snapshot_with(vec![gpu("nvidia", Some(100), Confidence::Medium)]);
+        assert!(hunyuan_vram_preflight(&request("high"), &snapshot).is_ok());
+    }
+
+    #[test]
+    fn missing_gpu_or_free_vram_never_gates() {
+        assert!(hunyuan_vram_preflight(&request("high"), &snapshot_with(vec![])).is_ok());
+        let snapshot = snapshot_with(vec![gpu("nvidia", None, Confidence::High)]);
+        assert!(hunyuan_vram_preflight(&request("high"), &snapshot).is_ok());
+    }
 }

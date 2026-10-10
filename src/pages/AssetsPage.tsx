@@ -1,8 +1,9 @@
 import { useEffect, useState, useCallback, useRef } from "react";
-import { importAsset, listAssets, searchAssets, pickAssetFile, isDuplicateError, formatFileSize, formatTimestamp } from "../services/assets";
+import { importAsset, listAssets, searchAssets, deleteAsset, deleteAssets, pickAssetFile, isDuplicateError, formatFileSize, formatTimestamp } from "../services/assets";
 import { classifyAssetPreview, getImagePreviewSource } from "../services/assetPreview";
 import { formatModel3dAssetFormat, formatModel3dBounds, formatModel3dCount, getSupportedModel3dMetadata } from "../services/assetModel3d";
 import { AssetVideoPreview } from "../components/AssetVideoPreview";
+import { Model3dViewer } from "../components/Model3dViewer";
 import type { AssetInfo } from "../types/core";
 
 export function AssetsPage() {
@@ -13,6 +14,10 @@ export function AssetsPage() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [checkedIds, setCheckedIds] = useState<Set<string>>(new Set());
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
   const [previewData, setPreviewData] = useState<string | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const projectOpen = useRef(true);
@@ -28,13 +33,15 @@ export function AssetsPage() {
       setError(null);
       projectOpen.current = true;
     } catch (err) {
-      if (err instanceof Error && err.message.includes("no project open")) {
+      // Tauri command rejections arrive as plain strings, not Error objects.
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes("no project open")) {
         projectOpen.current = false;
         setError("No project open. Please create or open a project first.");
         setAssets([]);
         setFilteredAssets([]);
       } else {
-        setError(err instanceof Error ? err.message : "Failed to load assets");
+        setError(message || "Failed to load assets");
       }
     } finally {
       setLoading(false);
@@ -94,6 +101,72 @@ export function AssetsPage() {
 
   const handleAssetSelect = (asset: AssetInfo) => {
     setSelectedAssetId(asset.assetId);
+  };
+
+  const handleDelete = async (asset: AssetInfo) => {
+    if (deleting) return;
+    const confirmed = window.confirm(
+      `Delete "${asset.originalFilename}" permanently?\n\n` +
+      `Its database record, master file, preview and generation job files are removed from this project. This cannot be undone.`
+    );
+    if (!confirmed) return;
+    setError(null);
+    setDeleting(true);
+    try {
+      await deleteAsset(asset.assetId);
+      setCheckedIds((current) => {
+        const next = new Set(current);
+        next.delete(asset.assetId);
+        return next;
+      });
+      if (selectedAssetId === asset.assetId) setSelectedAssetId(null);
+      await loadAssets();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setError(message || "Delete failed");
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  const toggleChecked = (assetId: string) => {
+    setCheckedIds((current) => {
+      const next = new Set(current);
+      if (next.has(assetId)) next.delete(assetId);
+      else next.add(assetId);
+      return next;
+    });
+  };
+
+  const handleBulkDelete = async () => {
+    if (checkedIds.size === 0 || bulkDeleting) return;
+    const confirmed = window.confirm(
+      `Delete ${checkedIds.size} selected asset(s) permanently?\n\n` +
+      `Their database records, master files, previews and generation job files are removed from this project.\n` +
+      `Assets already delivered to Unity are skipped automatically. This cannot be undone.`
+    );
+    if (!confirmed) return;
+    setError(null);
+    setNotice(null);
+    setBulkDeleting(true);
+    try {
+      const result = await deleteAssets([...checkedIds]);
+      const failedNote = result.failed.length
+        ? ` Skipped ${result.failed.length}: ${result.failed
+            .map((f) => `${f.assetId.slice(0, 8)} — ${f.error}`)
+            .join("; ")}`
+        : "";
+      setNotice(`Deleted ${result.deleted.length} asset(s).${failedNote}`);
+      const deletedIds = new Set(result.deleted.map((d) => d.assetId));
+      setCheckedIds(new Set());
+      if (selectedAssetId && deletedIds.has(selectedAssetId)) setSelectedAssetId(null);
+      await loadAssets();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setError(message || "Bulk delete failed");
+    } finally {
+      setBulkDeleting(false);
+    }
   };
 
   const selectedAsset = assets.find((a) => a.assetId === selectedAssetId);
@@ -165,6 +238,22 @@ export function AssetsPage() {
       </header>
 
       {error && <div className="error-banner" role="alert">{error}</div>}
+      {notice && <div className="notice-banner" role="status">{notice}</div>}
+
+      {checkedIds.size > 0 && (
+        <div className="bulk-delete-bar" role="toolbar" aria-label="Bulk actions">
+          <strong>{checkedIds.size} selected</strong>
+          <button className="btn btn--danger" type="button" disabled={bulkDeleting} onClick={() => void handleBulkDelete()}>
+            {bulkDeleting ? "Deleting..." : `Delete ${checkedIds.size} selected`}
+          </button>
+          <button className="btn btn--secondary" type="button" disabled={bulkDeleting} onClick={() => setCheckedIds(new Set(filteredAssets.map((a) => a.assetId)))}>
+            Select all shown
+          </button>
+          <button className="btn btn--secondary" type="button" disabled={bulkDeleting} onClick={() => setCheckedIds(new Set())}>
+            Clear selection
+          </button>
+        </div>
+      )}
 
       <div className="assets-layout">
         <aside className="assets-list" aria-label="Asset list">
@@ -186,6 +275,14 @@ export function AssetsPage() {
                   role="option"
                   aria-selected={selectedAssetId === asset.assetId}
                 >
+                  <input
+                    type="checkbox"
+                    className="asset-list-item__check"
+                    checked={checkedIds.has(asset.assetId)}
+                    onChange={() => toggleChecked(asset.assetId)}
+                    onClick={(event) => event.stopPropagation()}
+                    aria-label={`Select ${asset.originalFilename} for deletion`}
+                  />
                   <div className="asset-list-item__preview">
                     {asset.mediaKind === "model3d" ? (
                       <div className="asset-preview-placeholder"><span className="preview-format preview-format--model3d">MODEL 3D</span></div>
@@ -221,14 +318,24 @@ export function AssetsPage() {
             <article className="asset-detail">
               <header className="asset-detail__header">
                 <h3>{selectedAsset.originalFilename}</h3>
-                <span className={`status-badge status-badge--${selectedAsset.status}`}>{selectedAsset.status.toUpperCase()}</span>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span className={`status-badge status-badge--${selectedAsset.status}`}>{selectedAsset.status.toUpperCase()}</span>
+                  <button
+                    className="btn btn--danger asset-detail__delete"
+                    type="button"
+                    disabled={deleting}
+                    title={selectedAsset.approvalStatus === "approved" ? "Approved asset — deleting also removes its approval" : "Permanently delete this asset and its files"}
+                    onClick={() => void handleDelete(selectedAsset)}
+                  >
+                    {deleting ? "Deleting..." : "Delete"}
+                  </button>
+                </div>
               </header>
 
               <div className="asset-detail__preview">
-                {selectedPreviewKind === "model3d" ? (
+                {selectedPreviewKind === "model3d" && selectedAsset ? (
                   <div className="asset-preview asset-preview--model3d">
-                    <strong>MODEL 3D</strong>
-                    <span>Interactive 3D preview is not available in Phase 8.</span>
+                    <Model3dViewer assetId={selectedAsset.assetId} presetView="perspective" />
                   </div>
                 ) : selectedPreviewKind === "video" ? (
                   <AssetVideoPreview key={selectedAsset.assetId} assetId={selectedAsset.assetId} />

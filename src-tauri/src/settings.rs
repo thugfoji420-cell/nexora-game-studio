@@ -68,7 +68,7 @@ impl Default for A1111Config {
             launcher_path: None,
             base_url: "http://127.0.0.1:7860".to_string(),
             auto_start: true,
-            startup_args: vec!["--api".to_string(), "--medvram".to_string()],
+            startup_args: vec!["--api".to_string(), "--nowebui".to_string()],
             working_directory: None,
         }
     }
@@ -137,6 +137,15 @@ impl HunyuanConfig {
             args.push("--enable_tex".to_string());
         }
 
+        let mut environment = HashMap::new();
+        // 4 GB GPUs crash the server mid-job without this allocator setting:
+        // fragmentation makes even 20 MiB allocations fail with 2 GB "free"
+        // (observed 2026-10-04 during a text-to-3d pipeline load).
+        environment.insert(
+            "PYTORCH_CUDA_ALLOC_CONF".to_string(),
+            "expandable_segments:True".to_string(),
+        );
+
         RuntimeConfig {
             runtime_id: "hunyuan3d".to_string(),
             display_name: "Hunyuan3D".to_string(),
@@ -145,11 +154,11 @@ impl HunyuanConfig {
             install_path: self.root_path.clone(),
             launcher_path: self.python_executable.clone(),
             base_url: Some(self.base_url.clone()),
-            health_endpoint: Some("/docs".to_string()),
+            health_endpoint: Some("/health".to_string()),
             auto_start: self.auto_start,
             startup_args: args,
             working_directory: self.root_path.clone(),
-            environment: HashMap::new(),
+            environment,
         }
     }
 }
@@ -257,6 +266,8 @@ pub struct AppSettings {
     pub unity_targets: HashMap<String, UnityProjectTarget>,
     #[serde(default)]
     pub active_unity_target: Option<String>,
+    #[serde(default)]
+    pub skip_runtime_startup_on_launch: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -278,6 +289,7 @@ impl Default for AppSettings {
             blender: BlenderConfig::default(),
             unity_targets: HashMap::new(),
             active_unity_target: None,
+            skip_runtime_startup_on_launch: false,
         }
     }
 }

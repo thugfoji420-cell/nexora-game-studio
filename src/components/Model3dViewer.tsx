@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import * as THREE from "three";
 import { GLTFLoader, OrbitControls } from "three-stdlib";
 
@@ -36,6 +37,10 @@ export function Model3dViewer({ assetId, presetView = "perspective", onLoad, onE
     hasTextures: boolean;
   } | null>(null);
   const [currentPreset, setCurrentPreset] = useState(presetView);
+  const [wireframe, setWireframe] = useState(false);
+  const [showGrid, setShowGrid] = useState(true);
+  const gridRef = useRef<THREE.GridHelper | null>(null);
+  const modelRef = useRef<THREE.Object3D | null>(null);
 
   useEffect(() => {
     if (!canvasRef.current || !assetId) return;
@@ -99,29 +104,31 @@ export function Model3dViewer({ assetId, presetView = "perspective", onLoad, onE
         scene.add(hemiLight);
 
         // Grid helper
-        const grid = new THREE.GridHelper(20, 20, 0x444466, 0x222244);
-        scene.add(grid);
+        gridRef.current = new THREE.GridHelper(20, 20, 0x444466, 0x222244);
+        scene.add(gridRef.current);
 
         // Load GLB
         const loader = new GLTFLoader();
-        const url = `nexora-media://${assetId}`;
+        // convertFileSrc maps to the scheme URL WebView2 can actually fetch
+        // (http://<scheme>.localhost/<id> on Windows); a raw nexora-media:// URL fails.
+        const url = convertFileSrc(assetId, "nexora-media");
         
         const gltf = await loader.loadAsync(url);
         
         if (!mounted) return;
 
-        const model = gltf.scene;
-        scene.add(model);
+        modelRef.current = gltf.scene;
+        scene.add(modelRef.current);
 
         // Compute model bounds and center
-        const box = new THREE.Box3().setFromObject(model);
+        const box = new THREE.Box3().setFromObject(modelRef.current);
         const center = new THREE.Vector3();
         box.getCenter(center);
         const size = new THREE.Vector3();
         box.getSize(size);
 
         // Center model
-        model.position.sub(center);
+        modelRef.current.position.sub(center);
         controls.target.set(0, 0, 0);
 
         // Fit camera to model
@@ -142,13 +149,13 @@ export function Model3dViewer({ assetId, presetView = "perspective", onLoad, onE
           }
         }
 
-        // Collect model info
+        // Collect model info and store original materials
         let materialCount = 0;
         let textureCount = 0;
         let triangleCount = 0;
         let hasTextures = false;
 
-        model.traverse((child) => {
+        modelRef.current.traverse((child) => {
           if (isMesh(child)) {
             const mesh = child;
             const geometry = mesh.geometry;
@@ -173,6 +180,18 @@ export function Model3dViewer({ assetId, presetView = "perspective", onLoad, onE
             }
           }
         });
+
+        // Apply initial wireframe state
+        if (wireframe && modelRef.current) {
+          modelRef.current.traverse((child) => {
+            if (isMesh(child)) {
+              const materials = Array.isArray(child.material) ? child.material : [child.material];
+              for (const mat of materials) {
+                (mat as THREE.MeshStandardMaterial).wireframe = true;
+              }
+            }
+          });
+        }
 
         setModelInfo({ materials: materialCount, textures: textureCount, triangles: triangleCount, hasTextures });
 
@@ -224,8 +243,9 @@ export function Model3dViewer({ assetId, presetView = "perspective", onLoad, onE
           const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
           for (const mat of mats) {
             Object.values(mat).forEach((value) => {
-              if (value && typeof value === "object" && "dispose" in value) {
-                (value as any).dispose?.();
+              const candidate = value as { dispose?: unknown } | null;
+              if (candidate && typeof candidate.dispose === "function") {
+                (candidate.dispose as () => void)();
               }
             });
           }
@@ -239,6 +259,26 @@ export function Model3dViewer({ assetId, presetView = "perspective", onLoad, onE
   useEffect(() => {
     setCurrentPreset(presetView);
   }, [presetView]);
+
+  // Toggle wireframe
+  useEffect(() => {
+    if (!modelRef.current || state !== "ready") return;
+    modelRef.current.traverse((child) => {
+      if (isMesh(child)) {
+        const materials = Array.isArray(child.material) ? child.material : [child.material];
+        for (const mat of materials) {
+          (mat as THREE.MeshStandardMaterial).wireframe = wireframe;
+        }
+      }
+    });
+  }, [wireframe, state]);
+
+  // Toggle grid
+  useEffect(() => {
+    if (gridRef.current) {
+      gridRef.current.visible = showGrid;
+    }
+  }, [showGrid, state]);
 
   if (state === "loading") {
     return (
@@ -271,66 +311,82 @@ export function Model3dViewer({ assetId, presetView = "perspective", onLoad, onE
   return (
     <div className="model3d-viewer model3d-viewer--ready">
       <canvas ref={canvasRef} className="model3d-viewer__canvas" />
-      <div className="model3d-viewer__controls">
-        <div className="model3d-viewer__presets" role="group" aria-label="Camera presets">
-          <button
-            className={`model3d-viewer__preset-btn ${currentPreset === "front" ? "active" : ""}`}
-            onClick={() => handlePresetChange("front")}
-            disabled={currentPreset === "front"}
-            title="Front view"
-          >
-            FRONT
-          </button>
-          <button
-            className={`model3d-viewer__preset-btn ${currentPreset === "rear" ? "active" : ""}`}
-            onClick={() => handlePresetChange("rear")}
-            disabled={currentPreset === "rear"}
-            title="Rear view"
-          >
-            REAR
-          </button>
-          <button
-            className={`model3d-viewer__preset-btn ${currentPreset === "left" ? "active" : ""}`}
-            onClick={() => handlePresetChange("left")}
-            disabled={currentPreset === "left"}
-            title="Left view"
-          >
-            LEFT
-          </button>
-          <button
-            className={`model3d-viewer__preset-btn ${currentPreset === "right" ? "active" : ""}`}
-            onClick={() => handlePresetChange("right")}
-            disabled={currentPreset === "right"}
-            title="Right view"
-          >
-            RIGHT
-          </button>
-          <button
-            className={`model3d-viewer__preset-btn ${currentPreset === "perspective" ? "active" : ""}`}
-            onClick={() => handlePresetChange("perspective")}
-            disabled={currentPreset === "perspective"}
-            title="Perspective view"
-          >
-            PERSPECTIVE
-          </button>
-          <button
-            className={`model3d-viewer__preset-btn ${currentPreset === "reset" ? "active" : ""}`}
-            onClick={() => handlePresetChange("reset")}
-            disabled={currentPreset === "reset"}
-            title="Reset to fit"
-          >
-            RESET
-          </button>
-        </div>
-        {modelInfo && (
-          <div className="model3d-viewer__info">
-            <span>{modelInfo.triangles.toLocaleString()} triangles</span>
-            <span>{modelInfo.materials} materials</span>
-            <span>{modelInfo.textures} textures</span>
-            {modelInfo.hasTextures && <span className="has-textures">✓ Textures</span>}
+        <div className="model3d-viewer__controls">
+          <div className="model3d-viewer__presets" role="group" aria-label="Camera presets">
+            <button
+              className={`model3d-viewer__preset-btn ${currentPreset === "front" ? "active" : ""}`}
+              onClick={() => handlePresetChange("front")}
+              disabled={currentPreset === "front"}
+              title="Front view"
+            >
+              FRONT
+            </button>
+            <button
+              className={`model3d-viewer__preset-btn ${currentPreset === "rear" ? "active" : ""}`}
+              onClick={() => handlePresetChange("rear")}
+              disabled={currentPreset === "rear"}
+              title="Rear view"
+            >
+              REAR
+            </button>
+            <button
+              className={`model3d-viewer__preset-btn ${currentPreset === "left" ? "active" : ""}`}
+              onClick={() => handlePresetChange("left")}
+              disabled={currentPreset === "left"}
+              title="Left view"
+            >
+              LEFT
+            </button>
+            <button
+              className={`model3d-viewer__preset-btn ${currentPreset === "right" ? "active" : ""}`}
+              onClick={() => handlePresetChange("right")}
+              disabled={currentPreset === "right"}
+              title="Right view"
+            >
+              RIGHT
+            </button>
+            <button
+              className={`model3d-viewer__preset-btn ${currentPreset === "perspective" ? "active" : ""}`}
+              onClick={() => handlePresetChange("perspective")}
+              disabled={currentPreset === "perspective"}
+              title="Perspective view"
+            >
+              PERSPECTIVE
+            </button>
+            <button
+              className={`model3d-viewer__preset-btn ${currentPreset === "reset" ? "active" : ""}`}
+              onClick={() => handlePresetChange("reset")}
+              disabled={currentPreset === "reset"}
+              title="Reset to fit"
+            >
+              RESET
+            </button>
           </div>
-        )}
-      </div>
+          <div className="model3d-viewer__toggles" role="group" aria-label="Viewport options">
+            <button
+              className={`model3d-viewer__preset-btn ${wireframe ? "active" : ""}`}
+              onClick={() => setWireframe(!wireframe)}
+              title="Toggle wireframe"
+            >
+              WIREFRAME
+            </button>
+            <button
+              className={`model3d-viewer__preset-btn ${showGrid ? "active" : ""}`}
+              onClick={() => setShowGrid(!showGrid)}
+              title="Toggle grid"
+            >
+              GRID
+            </button>
+          </div>
+          {modelInfo && (
+            <div className="model3d-viewer__info">
+              <span>{modelInfo.triangles.toLocaleString()} triangles</span>
+              <span>{modelInfo.materials} materials</span>
+              <span>{modelInfo.textures} textures</span>
+              {modelInfo.hasTextures && <span className="has-textures">✓ Textures</span>}
+            </div>
+          )}
+        </div>
     </div>
   );
 }

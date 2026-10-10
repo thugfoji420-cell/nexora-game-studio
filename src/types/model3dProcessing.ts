@@ -3,7 +3,17 @@ import type { ProviderFit } from "./providers";
 
 export const MODEL3D_PROCESSING_PROFILE_ID = "foundation.processing.v1" as const;
 
-export type Model3dProcessingProfile = "generic" | "vehicle";
+export type Model3dProcessingProfile = 
+  | "generic" 
+  | "vehicle" 
+  | "character" 
+  | "environment" 
+  | "prop" 
+  | "weapon" 
+  | "building" 
+  | "vegetation" 
+  | "furniture" 
+  | "equipment";
 
 export type Model3dProcessingQuality = "master" | "mobile_high" | "mobile_balanced" | "mobile_low";
 
@@ -52,6 +62,14 @@ export interface ProcessingReport {
   lod0Triangles: number | null;
   lod1Triangles: number | null;
   lod2Triangles: number | null;
+  collisionGenerated?: boolean | null;
+  collisionTriangles?: number | null;
+  qualityScore?: number | null;
+  qualityRating?: string | null;
+  categoryDetected: string;
+  categoryConfidence: number;
+  categoryNeedsReview: boolean;
+  categoryDetails: Record<string, unknown>;
   vehicleDetected: boolean;
   wheelCandidates: number;
   wheelSeparationPossible: boolean;
@@ -75,6 +93,19 @@ export interface Model3dProcessingResult {
   materialStatus: string | null;
   preAnalysisReport: ProcessingReport | null;
   postAnalysisReport: ProcessingReport | null;
+  /** PBR upgrade stats (normal/roughness/AO/metallic clamp counts) from the processor. */
+  pbrStats: {
+    materials_processed?: number;
+    normal_maps_created?: number;
+    roughness_maps_created?: number;
+    ao_baked?: boolean;
+    metallic_clamped?: number;
+    roughness_clamped?: number;
+    segmented?: boolean;
+    segmentation_classes?: string[];
+    quality_score?: number;
+    quality_rating?: string;
+  } | null;
   errorCode: string | null;
   errorMessage: string | null;
 }
@@ -153,4 +184,18 @@ export interface UpdateUnityDeliveryStatusInput {
   importedAssetPath?: string;
   prefabPath?: string;
   validationReport?: string;
+}
+
+export interface UnityDeploymentDto {
+  deliveryId: string;
+  assetId: string;
+  targetId: string;
+  unityProjectRoot: string;
+  destinationFolder: string;
+  deployedPath: string;
+  metaPath: string;
+  fileSize: number;
+  bytesWritten: number;
+  checksum: string;
+  category: string;
 }
