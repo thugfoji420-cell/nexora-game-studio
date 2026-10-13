@@ -52,6 +52,13 @@ temp/
 *.zip
 *.7z
 
+# Bundled llama.cpp engine (fetched from official llama.cpp releases, see
+# docs/offline-self-coding.md). Never commit the 43 MB engine blob — the
+# NSIS bundle pulls it from src-tauri/binaries/ at build time; teammates
+# drop the release zip there themselves, or the build fails loudly.
+/src-tauri/binaries/*.dll
+/src-tauri/binaries/LICENSE-LLVM-OpenMP
+
 # IDE / OS
 .vscode/
 .idea/

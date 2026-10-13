@@ -1,0 +1,55 @@
+{
+ "prompts": [
+  "P1_sql_top_products",
+  "P2_bugfix_average",
+  "P3_rust_chunk_ranges"
+ ],
+ "results": {
+  "qwen2.5-coder:3b": {
+   "P1_sql_top_products": {
+    "model": "qwen2.5-coder:3b",
+    "wall_s": 6.6,
+    "tokens": 34,
+    "tok_s": 5.2,
+    "reply": "```sql\nSELECT product_name, SUM(quantity) AS total_quantity\nFROM orders\nGROUP BY product_name\nORDER BY total_quantity DESC\nLIMIT 3;\n```"
+   },
+   "P2_bugfix_average": {
+    "model": "qwen2.5-coder:3b",
+    "wall_s": 2.6,
+    "tokens": 42,
+    "tok_s": 15.9,
+    "reply": "```python\ndef average(nums):\n    \"\"\"\n    Calculate the average of a list of numbers.\n    \"\"\"\n    if not nums:\n        return 0\n    return sum(nums) / len(nums)\n```"
+   },
+   "P3_rust_chunk_ranges": {
+    "model": "qwen2.5-coder:3b",
+    "wall_s": 5.3,
+    "tokens": 230,
+    "tok_s": 43.8,
+    "reply": "```rust\nfn chunk_ranges(total: usize, chunks: usize) -> Vec<(usize, usize)> {\n    if chunks == 0 {\n        return Vec::new();\n    }\n\n    let mut ranges = Vec::new();\n    let chunk_size = total / chunks;\n    let remainder = total % chunks;\n\n    for i in 0..chunks {\n        let start = i * chunk_size + (i.min(remainder) as usize);\n        let end = start + chunk_size;\n        ranges.push((start, end));\n    }\n\n    ranges\n}\n\nfn main() {\n    // Example usage:\n    let total = 10;\n    let chunks = 3;\n    let ranges = chunk_ranges(total, chunks);\n    println!(\"{:?}\", ranges); // Output: [(0, 4), (4, 8), (8, 10)]\n}\n```\n\nThis function calculates the start and end of each chunk, handling the case where `chunks` is 0 by returning an empty vector. It ensures that the last chunk covers the remaining elements if `chunks` is less than the total number of elements."
+   }
+  },
+  "qwen2.5-coder:7b": {
+   "P1_sql_top_products": {
+    "model": "qwen2.5-coder:7b",
+    "wall_s": 14.4,
+    "tokens": 34,
+    "tok_s": 2.4,
+    "reply": "```sql\nSELECT product_name, SUM(quantity) AS total_quantity\nFROM orders\nGROUP BY product_name\nORDER BY total_quantity DESC\nLIMIT 3;\n```"
+   },
+   "P2_bugfix_average": {
+    "model": "qwen2.5-coder:7b",
+    "wall_s": 6.5,
+    "tokens": 52,
+    "tok_s": 7.9,
+    "reply": "```python\ndef average(nums):\n    \"\"\"Return the average of a list of numbers, or 0 if the list is empty.\"\"\"\n    if len(nums) == 0:\n        return 0\n    return sum(nums) / len(nums)\n```"
+   },
+   "P3_rust_chunk_ranges": {
+    "model": "qwen2.5-coder:7b",
+    "wall_s": 15.2,
+    "tokens": 143,
+    "tok_s": 9.4,
+    "reply": "```rust\nfn chunk_ranges(total: usize, chunks: usize) -> Vec<(usize, usize)> {\n    if chunks == 0 {\n        return vec![];\n    }\n\n    let mut ranges = Vec::with_capacity(chunks);\n    let chunk_size = total / chunks;\n    let mut remainder = total % chunks;\n\n    for i in 0..chunks {\n        let start = i * chunk_size + if i < remainder { 1 } else { 0 };\n        let end = if i < remainder {\n            start + chunk_size + 1\n        } else {\n            start + chunk_size\n        };\n        ranges.push((start, end));\n    }\n\n    ranges\n}\n```"
+   }
+  }
+ }
+}

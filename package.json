@@ -1,6 +1,6 @@
 {
   "name": "nexora-game-studio",
-  "version": "0.2.1",
+  "version": "0.2.10",
   "private": true,
   "license": "Apache-2.0",
   "type": "module",
@@ -8,11 +8,17 @@
     "dev": "vite --configLoader runner",
     "build": "tsc && vite build --configLoader runner",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --configLoader runner",
-    "tauri": "tauri"
+    "test": "vitest run --configLoader runner && npm run test:rust",
+    "test:js": "vitest run --configLoader runner",
+    "test:rust": "python scripts/fix_test_manifest.py --run -- --lib",
+    "test:rust:all": "python scripts/fix_test_manifest.py --run",
+    "ci": "npm run typecheck && npm test && npm run build && cargo check --manifest-path src-tauri/Cargo.toml",
+    "tauri": "tauri",
+    "health:ollama": "python scripts/health_check_ollama.py"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.8.0",
+    "@respan/respan": "^2.5.0",
+    "@tauri-apps/api": "^2.12.3",
     "@tauri-apps/plugin-dialog": "^2.2.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
@@ -27,6 +33,6 @@
     "@vitejs/plugin-react": "^5.0.2",
     "typescript": "^5.9.3",
     "vite": "^7.1.5",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.11"
   }
 }

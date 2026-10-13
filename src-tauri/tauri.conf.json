@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Nexora Game Studio",
-  "version": "0.2.1",
+  "version": "0.2.10",
   "identifier": "com.nexora.gamestudio.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -18,19 +18,25 @@
         "minWidth": 720,
         "minHeight": 520,
         "resizable": true,
+        "maximized": true,
         "center": true,
-        "devtools": true,
+        "devtools": false,
         "dataDirectory": "webview-v2",
-        "additionalBrowserArgs": "--disable-gpu-compositing --disable-gpu-sandbox"
+        "additionalBrowserArgs": "--disable-gpu-compositing"
       }
     ],
     "security": {
-      "csp": "default-src 'self' data: blob:; style-src 'self' 'unsafe-inline' data:; script-src 'self' 'unsafe-inline' 'unsafe-eval' data:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:* data: blob:; img-src 'self' data: blob: http: https:; media-src 'self' data: blob: nexora-media: http://nexora-media.localhost; font-src 'self' data:"
+      "csp": "default-src 'self' data: blob:; style-src 'self' 'unsafe-inline' data:; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:* data: blob: nexora-media: http://nexora-media.localhost; img-src 'self' data: blob: http: https:; media-src 'self' data: blob: nexora-media: http://nexora-media.localhost; font-src 'self' data:"
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
+    "externalBin": [
+      "binaries/llama-server"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -40,6 +46,33 @@
     "shortDescription": "Nexora visual production studio",
     "longDescription": "A local-first visual production studio foundation for Nexora games.",
     "copyright": "Copyright 2026 Nexora",
-    "category": "DeveloperTool"
+    "category": "DeveloperTool",
+    "resources": {
+      "blender/nexora_mesh_processor.py": "blender/nexora_mesh_processor.py",
+      "blender/nexora_fbx_convert.py": "blender/nexora_fbx_convert.py",
+      "binaries/llama-server-impl.dll": "llama-server-impl.dll",
+      "binaries/llama.dll": "llama.dll",
+      "binaries/llama-common.dll": "llama-common.dll",
+      "binaries/mtmd.dll": "mtmd.dll",
+      "binaries/ggml.dll": "ggml.dll",
+      "binaries/ggml-base.dll": "ggml-base.dll",
+      "binaries/ggml-rpc.dll": "ggml-rpc.dll",
+      "binaries/ggml-cpu-x64.dll": "ggml-cpu-x64.dll",
+      "binaries/ggml-cpu-alderlake.dll": "ggml-cpu-alderlake.dll",
+      "binaries/ggml-cpu-cannonlake.dll": "ggml-cpu-cannonlake.dll",
+      "binaries/ggml-cpu-cascadelake.dll": "ggml-cpu-cascadelake.dll",
+      "binaries/ggml-cpu-cooperlake.dll": "ggml-cpu-cooperlake.dll",
+      "binaries/ggml-cpu-haswell.dll": "ggml-cpu-haswell.dll",
+      "binaries/ggml-cpu-icelake.dll": "ggml-cpu-icelake.dll",
+      "binaries/ggml-cpu-ivybridge.dll": "ggml-cpu-ivybridge.dll",
+      "binaries/ggml-cpu-piledriver.dll": "ggml-cpu-piledriver.dll",
+      "binaries/ggml-cpu-sandybridge.dll": "ggml-cpu-sandybridge.dll",
+      "binaries/ggml-cpu-sapphirerapids.dll": "ggml-cpu-sapphirerapids.dll",
+      "binaries/ggml-cpu-skylakex.dll": "ggml-cpu-skylakex.dll",
+      "binaries/ggml-cpu-sse42.dll": "ggml-cpu-sse42.dll",
+      "binaries/ggml-cpu-zen4.dll": "ggml-cpu-zen4.dll",
+      "binaries/libomp.dll": "libomp.dll",
+      "binaries/LICENSE-LLVM-OpenMP": "LICENSE-LLVM-OpenMP"
+    }
   }
 }

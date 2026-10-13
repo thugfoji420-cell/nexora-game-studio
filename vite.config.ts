@@ -9,7 +9,7 @@ export default defineConfig({
     strictPort: true,
     host: "127.0.0.1",
     watch: {
-      ignored: ["**/src-tauri/**", "**/target/**"],
+      ignored: ["**/src-tauri/**", "**/target/**", "**/.cache/**", "**/*.log", "**/*.exe"],
     },
   },
 });
