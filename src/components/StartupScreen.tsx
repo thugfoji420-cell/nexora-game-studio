@@ -79,6 +79,11 @@ export function StartupScreen({ onComplete, onContinueToStudio }: StartupScreenP
   const initializationStartedRef = useRef(false);
 
   const refreshStatus = useCallback(async () => {
+    if (!(window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) {
+      successTransitionRef.current = true;
+      setShowSuccess(true);
+      return;
+    }
     try {
       const status = await getOrchestratorStatus();
       setOrchestratorStatus(status);
@@ -97,11 +102,20 @@ export function StartupScreen({ onComplete, onContinueToStudio }: StartupScreenP
       }
     } catch (e) {
       console.error("Failed to get orchestrator status:", e);
+      // Browser dev preview (no Tauri backend): skip the wait and enter the studio.
+      if (!(window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ && !successTransitionRef.current) {
+        successTransitionRef.current = true;
+        setShowSuccess(true);
+      }
     }
   }, [onComplete]);
 
   useEffect(() => {
     let mounted = true;
+    if (!(window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) {
+      void refreshStatus();
+      return () => { mounted = false; };
+    }
 
     const init = async () => {
       try {
@@ -133,7 +147,7 @@ export function StartupScreen({ onComplete, onContinueToStudio }: StartupScreenP
           setInitLog(prev => [...prev, payload].slice(-100));
         }
       }
-    );
+    ).catch(() => null);
 
     const unlistenProgress = listen<OrchestratorStatus>(
       "orchestrator://progress",
@@ -154,7 +168,7 @@ export function StartupScreen({ onComplete, onContinueToStudio }: StartupScreenP
           }
         }
       }
-    );
+    ).catch(() => null);
 
     // Poll status periodically
     const interval = setInterval(() => {
@@ -168,8 +182,8 @@ export function StartupScreen({ onComplete, onContinueToStudio }: StartupScreenP
 
     return () => {
       mounted = false;
-      unlistenLog.then(fn => fn());
-      unlistenProgress.then(fn => fn());
+      void unlistenLog.then(fn => fn?.());
+      void unlistenProgress.then(fn => fn?.());
       clearInterval(interval);
       clearInterval(tickInterval);
       if (successTimeoutRef.current) clearTimeout(successTimeoutRef.current);
@@ -369,6 +383,9 @@ export function StartupScreen({ onComplete, onContinueToStudio }: StartupScreenP
           </div>
         )}
 
+        <button className="btn btn--ghost" type="button" onClick={onContinueToStudio}>
+          Continue to studio · engines can finish in the background
+        </button>
         <button 
           className="startup-screen__log-toggle"
           onClick={() => setShowLog(!showLog)}

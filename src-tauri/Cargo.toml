@@ -1,6 +1,6 @@
 [package]
 name = "nexora-game-studio"
-version = "0.2.1"
+version = "0.2.10"
 description = "Local-first visual production studio foundation"
 authors = ["Nexora"]
 license = "Apache-2.0"
@@ -28,8 +28,10 @@ dirs = "6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "ico"] }
 sha2 = "0.10"
 base64 = "0.22"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
-tokio = { version = "1", features = ["time", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
+tokio = { version = "1", features = ["time", "sync", "macros"] }
+tauri-plugin-shell = "2"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 which = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -42,4 +44,4 @@ lto = true
 codegen-units = 1
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["winbase", "winuser", "processthreadsapi", "handleapi", "errhandlingapi", "libloaderapi"] }
+winapi = { version = "0.3", features = ["winbase", "winuser", "processthreadsapi", "handleapi", "errhandlingapi", "libloaderapi", "shellapi"] }

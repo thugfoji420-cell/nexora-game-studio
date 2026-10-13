@@ -1,22 +1,36 @@
+mod agent;
+mod asset_delete;
 mod asset_delivery;
+mod batch_queue;
+mod chat_history;
 mod blender;
+mod code_agent;
+mod code_agent_protocol;
+mod gpu_guard;
 mod blender_adapter;
 pub mod hardware;
 pub mod hunyuan_generation;
 mod image_generation;
 pub mod jobs;
 mod logging;
+pub mod llama_local;
+
+/// Concurrent-download gate for the managed GGUF model.
+pub static MODEL_DOWNLOAD_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 mod model3d_generation;
 mod model3d_import;
 mod model3d_processing;
 mod model3d_validation;
-mod openrouter;
 mod project;
 pub mod provider_orchestrator;
 pub mod providers;
 pub mod runtime_manager;
 mod settings;
+mod llm;
 mod source_normalization;
+mod unity_scripts;
+mod workspace_files;
 mod video_generation;
 mod video_validation;
 
@@ -47,6 +61,7 @@ use settings::AppSettings;
 use tracing_subscriber;
 
 #[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct UnityProjectValidation {
     pub is_valid: bool,
     pub unity_version: Option<String>,
@@ -288,13 +303,20 @@ impl JobWorker {
                 if let Some(project) = project {
                     let config = image_config.lock().ok().map(|value| value.clone());
                     let video = video_config.lock().ok().map(|value| value.clone());
-                    let _ = jobs::tick_with_configs(
-                        &project,
-                        &owner,
-                        config.as_ref(),
-                        video.as_ref(),
-                        Some(&thread_stop),
-                    );
+                    // A panic inside tick must not kill the worker thread —
+                    // that silently halts every future job until restart.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        jobs::tick_with_configs(
+                            &project,
+                            &owner,
+                            config.as_ref(),
+                            video.as_ref(),
+                            Some(&thread_stop),
+                        )
+                    }));
+                    if result.is_err() {
+                        eprintln!("[job-worker] tick panicked; continuing");
+                    }
                 }
                 thread::sleep(Duration::from_millis(25));
             }
@@ -319,11 +341,20 @@ impl Drop for JobWorker {
     }
 }
 
+fn config_dir() -> std::path::PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("com.nexora.gamestudio")
+}
+
 struct AppState {
+    chat_history_path: PathBuf,
     settings_path: PathBuf,
     settings: Mutex<AppSettings>,
     image_provider_config_path: PathBuf,
     image_provider_config: Arc<Mutex<image_generation::ImageProviderConfig>>,
+    llm_config: Arc<Mutex<llm::LlmConfig>>,
+    llm_config_path: std::path::PathBuf,
     video_provider_config_path: PathBuf,
     video_provider_config: Arc<Mutex<video_generation::VideoProviderConfig>>,
     logger: JsonLogger,
@@ -332,10 +363,11 @@ struct AppState {
     recent_projects_path: PathBuf,
     recent_projects: Mutex<Vec<RecentProjectInfo>>,
     hardware_snapshot: Mutex<hardware::HardwareSnapshot>,
-    provider_registry: Mutex<ProviderRegistry>,
+    provider_registry: Arc<Mutex<ProviderRegistry>>,
     media_integrity_cache: asset_delivery::IntegrityCache,
     runtime_manager: Arc<Mutex<RuntimeManager>>,
     provider_orchestrator: Arc<Mutex<provider_orchestrator::ProviderOrchestrator>>,
+    active_batch: batch_queue::ActiveBatch,
 }
 
 #[derive(Serialize)]
@@ -349,9 +381,6 @@ struct AppInfo {
 }
 
 /// Public-facing `AppSettings` shape exchanged with the frontend.
-///
-/// Mirrors `settings::AppSettings` but exposes the masked OpenRouter
-/// configuration so the raw API key never leaves the Rust process.
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PublicAppSettings {
@@ -364,7 +393,6 @@ struct PublicAppSettings {
     blender: settings::BlenderConfig,
     unity_targets: HashMap<String, settings::UnityProjectTarget>,
     active_unity_target: Option<String>,
-    openrouter: openrouter::MaskedOpenRouterConfig,
     skip_runtime_startup_on_launch: bool,
 }
 
@@ -380,10 +408,20 @@ impl From<settings::AppSettings> for PublicAppSettings {
             blender: value.blender,
             unity_targets: value.unity_targets,
             active_unity_target: value.active_unity_target,
-            openrouter: value.openrouter.masked(),
             skip_runtime_startup_on_launch: value.skip_runtime_startup_on_launch,
         }
     }
+}
+
+/// The AI-Studio key from the active Gemini LLM provider, so image jobs can
+/// use the same credential as chat without a second settings field.
+fn active_gemini_key(state: &AppState) -> Option<String> {
+    let config = state.llm_config.lock().unwrap().clone();
+    config
+        .providers
+        .get(&llm::LlmProvider::Gemini)
+        .and_then(|entry| entry.api_key.clone())
+        .filter(|key| !key.trim().is_empty())
 }
 
 fn command_error(state: &AppState, event: &str, error: impl std::fmt::Display) -> String {
@@ -398,6 +436,41 @@ fn retire_current_project(guard: &mut Option<Arc<ProjectState>>) -> Result<(), S
         jobs::recover(&project).map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+/// Storage root for the auto-created scratch project.
+fn scratch_project_root() -> PathBuf {
+    config_dir().join("scratch")
+}
+
+/// Returns the open project, or auto-opens/creates an always-available
+/// scratch project so image/video/3D/batch jobs never fail with "no project
+/// open". The scratch project lives in the app data dir and is reopened on
+/// demand; opening a real project later simply replaces it (its lock is
+/// released by retire_current_project, no data is touched).
+fn ensure_project_for_jobs(state: &State<'_, AppState>) -> Result<Arc<ProjectState>, String> {
+    if let Some(project) = state.current_project.lock().unwrap().as_ref().cloned() {
+        return Ok(project);
+    }
+    let root = scratch_project_root();
+    std::fs::create_dir_all(&root).map_err(|error| {
+        command_error(state, "scratch_project_dir_failed", error)
+    })?;
+    let project = if root.join(MANIFEST_FILENAME).exists() {
+        ProjectState::open_scoped(&root, None)
+    } else {
+        ProjectState::create_scoped(&root, "Nexora Scratch", None)
+    }
+    .map_err(|error| command_error(state, "scratch_project_open_failed", error))?;
+    let project = Arc::new(project);
+    let info = project.info();
+    *state.current_project.lock().unwrap() = Some(project.clone());
+    *state.hardware_snapshot.lock().unwrap() = hardware::detect(Some(&root));
+    state.logger.info(
+        "scratch_project_auto_opened",
+        &format!("{} at {}", info.manifest.name, info.root.display()),
+    );
+    Ok(project)
 }
 
 #[tauri::command]
@@ -423,9 +496,7 @@ fn save_settings(
     settings: PublicAppSettings,
     state: State<'_, AppState>,
 ) -> Result<PublicAppSettings, String> {
-    // Persist the supplied settings to disk. The frontend only ever sees the
-    // masked OpenRouter config, so the real API key is preserved from the
-    // current in-memory state.
+    // Persist the supplied settings to disk.
     let mut current = state.settings.lock().unwrap();
     let merged = settings::AppSettings {
         schema_version: settings.schema_version,
@@ -437,7 +508,6 @@ fn save_settings(
         blender: settings.blender,
         unity_targets: settings.unity_targets,
         active_unity_target: settings.active_unity_target,
-        openrouter: current.openrouter.clone(),
         skip_runtime_startup_on_launch: settings.skip_runtime_startup_on_launch,
     };
     settings::save(&state.settings_path, &merged)
@@ -559,6 +629,35 @@ fn create_project(
 }
 
 #[tauri::command]
+fn initialize_project(
+    root: String,
+    engine_scope: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<ProjectInfo, String> {
+    // Turn ANY selected folder into a Nexora project in place — the folder
+    // itself becomes the project root (no new subfolder).
+    let project_root = PathBuf::from(&root);
+    if !project_root.is_dir() {
+        return Err("folder does not exist".into());
+    }
+    let name = project_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("Nexora Project")
+        .to_string();
+    let project = ProjectState::create_scoped(&project_root, &name, engine_scope.as_deref()).map_err(|e| {
+        state.logger.error("project_initialize_failed", &e.to_string());
+        e.to_string()
+    })?;
+    let info = project.info();
+    state.logger.info(
+        "project_initialized",
+        &format!("{} at {}", info.manifest.name, info.root.display()),
+    );
+    Ok(info)
+}
+
+#[tauri::command]
 fn open_project(root: String, engine_scope: Option<String>, state: State<'_, AppState>) -> Result<CreateProjectResult, String> {
     let project_root = PathBuf::from(root);
     let project = ProjectState::open_scoped(&project_root, engine_scope.as_deref()).map_err(|e| {
@@ -614,9 +713,8 @@ fn create_diagnostic_job(
     input: jobs::CreateDiagnosticJobInput,
     state: State<'_, AppState>,
 ) -> Result<jobs::JobInfo, String> {
-    let guard = state.current_project.lock().unwrap();
-    let project = guard.as_ref().ok_or("no project open")?;
-    jobs::create(project, input).map_err(|error| command_error(&state, "job_create_failed", error))
+    let project = ensure_project_for_jobs(&state)?;
+    jobs::create(&project, input).map_err(|error| command_error(&state, "job_create_failed", error))
 }
 
 #[tauri::command]
@@ -626,24 +724,21 @@ fn create_provider_diagnostic_job(
 ) -> Result<jobs::JobInfo, String> {
     let snapshot = current_hardware_snapshot(&state);
     let registry = state.provider_registry.lock().unwrap().clone();
-    let guard = state.current_project.lock().unwrap();
-    let project = guard.as_ref().ok_or("no project open")?;
-    jobs::create_provider_diagnostic(project, &registry, &snapshot, input)
+    let project = ensure_project_for_jobs(&state)?;
+    jobs::create_provider_diagnostic(&project, &registry, &snapshot, input)
         .map_err(|error| command_error(&state, "provider_diagnostic_job_create_failed", error))
 }
 
 #[tauri::command]
 fn list_jobs(state: State<'_, AppState>) -> Result<Vec<jobs::JobInfo>, String> {
-    let guard = state.current_project.lock().unwrap();
-    let project = guard.as_ref().ok_or("no project open")?;
-    jobs::list(project).map_err(|error| command_error(&state, "job_list_failed", error))
+    let project = ensure_project_for_jobs(&state)?;
+    jobs::list(&project).map_err(|error| command_error(&state, "job_list_failed", error))
 }
 
 #[tauri::command]
 fn get_job_details(job_id: String, state: State<'_, AppState>) -> Result<jobs::JobDetails, String> {
-    let guard = state.current_project.lock().unwrap();
-    let project = guard.as_ref().ok_or("no project open")?;
-    jobs::details(project, &job_id)
+    let project = ensure_project_for_jobs(&state)?;
+    jobs::details(&project, &job_id)
         .map_err(|error| command_error(&state, "job_details_failed", error))
 }
 
@@ -652,17 +747,15 @@ fn request_job_cancellation(
     job_id: String,
     state: State<'_, AppState>,
 ) -> Result<jobs::JobInfo, String> {
-    let guard = state.current_project.lock().unwrap();
-    let project = guard.as_ref().ok_or("no project open")?;
-    jobs::request_cancellation(project, &job_id)
+    let project = ensure_project_for_jobs(&state)?;
+    jobs::request_cancellation(&project, &job_id)
         .map_err(|error| command_error(&state, "job_cancellation_failed", error))
 }
 
 #[tauri::command]
 fn retry_job(job_id: String, state: State<'_, AppState>) -> Result<jobs::JobInfo, String> {
-    let guard = state.current_project.lock().unwrap();
-    let project = guard.as_ref().ok_or("no project open")?;
-    jobs::retry(project, &job_id).map_err(|error| command_error(&state, "job_retry_failed", error))
+    let project = ensure_project_for_jobs(&state)?;
+    jobs::retry(&project, &job_id).map_err(|error| command_error(&state, "job_retry_failed", error))
 }
 
 #[derive(Serialize)]
@@ -719,15 +812,14 @@ fn compute_checksum(data: &[u8]) -> String {
 
 #[tauri::command]
 fn import_asset(path: String, state: State<'_, AppState>) -> Result<AssetInfo, String> {
-    let project_guard = state.current_project.lock().unwrap();
-    let project = project_guard.as_ref().ok_or("no project open")?;
+    let project = ensure_project_for_jobs(&state)?;
     let source_path = PathBuf::from(&path);
     let extension = source_path
         .extension()
         .and_then(|value| value.to_str())
         .map(str::to_ascii_lowercase);
     if matches!(extension.as_deref(), Some("glb" | "gltf")) {
-        let info = import_model_asset(project, &source_path)?;
+        let info = import_model_asset(&project, &source_path)?;
         state.logger.info(
             "asset_imported",
             &format!(
@@ -1042,6 +1134,52 @@ fn import_model_asset(
     result
 }
 
+/// Permanently delete an asset: its DB rows, managed master file, preview and
+/// any job directories that only it referenced. Refuses assets already
+/// delivered to Unity so deployed copies never outlive their source.
+#[tauri::command]
+fn delete_asset(
+    asset_id: String,
+    state: State<'_, AppState>,
+) -> Result<asset_delete::DeleteAssetReport, String> {
+    let project = ensure_project_for_jobs(&state)?;
+    let report = asset_delete::delete_asset(&project, &asset_id)
+        .map_err(|error| command_error(&state, "asset_delete_failed", error))?;
+    state.logger.info(
+        "asset_deleted",
+        &format!(
+            "{} removed (rows: {:?}, files: {}, skipped: {})",
+            report.asset_id,
+            report.deleted_rows,
+            report.deleted_files.len(),
+            report.skipped_files.len()
+        ),
+    );
+    Ok(report)
+}
+
+/// Bulk delete: per-asset results, blocked assets (delivered to Unity) are
+/// skipped and reported instead of failing the whole batch.
+#[tauri::command]
+fn delete_assets(
+    asset_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<asset_delete::DeleteAssetsReport, String> {
+    let project = ensure_project_for_jobs(&state)?;
+    let report = asset_delete::delete_assets(&project, asset_ids)
+        .map_err(|error| command_error(&state, "assets_bulk_delete_failed", error))?;
+    state.logger.info(
+        "assets_bulk_deleted",
+        &format!(
+            "requested {}, deleted {}, failed {}",
+            report.requested,
+            report.deleted.len(),
+            report.failed.len()
+        ),
+    );
+    Ok(report)
+}
+
 fn verify_managed_model(
     path: &std::path::Path,
     expected_size: u64,
@@ -1091,8 +1229,7 @@ fn extract_image_metadata(path: &PathBuf) -> Result<(u32, u32, String, bool), St
 
 #[tauri::command]
 fn list_assets(state: State<'_, AppState>) -> Result<Vec<AssetInfo>, String> {
-    let project_guard = state.current_project.lock().unwrap();
-    let project = project_guard.as_ref().ok_or("no project open")?;
+    let project = ensure_project_for_jobs(&state)?;
 
     let db = project.db.lock().unwrap();
 
@@ -1165,8 +1302,7 @@ fn list_assets(state: State<'_, AppState>) -> Result<Vec<AssetInfo>, String> {
 fn search_assets(query: String, state: State<'_, AppState>) -> Result<Vec<AssetInfo>, String> {
     let pattern = format!("%{}%", query);
 
-    let project_guard = state.current_project.lock().unwrap();
-    let project = project_guard.as_ref().ok_or("no project open")?;
+    let project = ensure_project_for_jobs(&state)?;
 
     let db = project.db.lock().unwrap();
 
@@ -1238,8 +1374,7 @@ fn search_assets(query: String, state: State<'_, AppState>) -> Result<Vec<AssetI
 
 #[tauri::command]
 fn get_asset_preview(asset_id: String, state: State<'_, AppState>) -> Result<String, String> {
-    let project_guard = state.current_project.lock().unwrap();
-    let project = project_guard.as_ref().ok_or("no project open")?;
+    let project = ensure_project_for_jobs(&state)?;
 
     let db = project.db.lock().unwrap();
     let row = db.query_row(
@@ -1279,17 +1414,9 @@ fn get_asset_preview(asset_id: String, state: State<'_, AppState>) -> Result<Str
 fn parse_model_metadata(
     value: Option<String>,
 ) -> rusqlite::Result<Option<model3d_validation::Model3dMetadata>> {
-    value
-        .map(|json| {
-            serde_json::from_str(&json).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    json.len(),
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })
-        })
-        .transpose()
+    // Legacy rows may carry empty or partial metadata; a corrupt row must
+    // not fail the whole asset list. Treat unparseable metadata as absent.
+    Ok(value.and_then(|json| serde_json::from_str(&json).unwrap_or(None)))
 }
 
 #[tauri::command]
@@ -1360,7 +1487,7 @@ fn delete_project(root: String, state: State<'_, AppState>) -> Result<bool, Stri
         }
     }
 
-    fs::remove_dir_all(&canonical).map_err(|e| format!("could not delete project folder: {}", e))?;
+    delete_folder_to_recycle_bin(&canonical)?;
 
     let mut recent = state.recent_projects.lock().unwrap();
     recent.retain(|project| project.manifest.project_id != manifest.project_id);
@@ -1370,6 +1497,55 @@ fn delete_project(root: String, state: State<'_, AppState>) -> Result<bool, Stri
         &format!("{} at {}", manifest.name, canonical.display()),
     );
     Ok(true)
+}
+
+/// Windows Recycle-Bin safe delete via SHFileOperationW (FO_DELETE +
+/// FOF_ALLOWUNDO). Restorable from the Recycle Bin, unlike a hard
+/// remove_dir_all. Falls back to remove_dir_all only if the shell call
+/// itself cannot run (non-Windows builds keep plain delete).
+fn delete_folder_to_recycle_bin(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use winapi::um::shellapi::{SHFileOperationW, SHFILEOPSTRUCTW};
+        use winapi::shared::minwindef::FALSE;
+
+        // SHFileOperation needs a double-NUL-terminated path list.
+        let mut wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .collect();
+        wide.push(0);
+        wide.push(0);
+
+        let mut operation = SHFILEOPSTRUCTW {
+            hwnd: std::ptr::null_mut(),
+            wFunc: 3, // FO_DELETE
+            pFrom: wide.as_ptr(),
+            pTo: std::ptr::null(),
+            fFlags: 0x40 | 0x4 | 0x400 | 0x10, // FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT
+            fAnyOperationsAborted: FALSE,
+            hNameMappings: std::ptr::null_mut(),
+            lpszProgressTitle: std::ptr::null(),
+        };
+        let result = unsafe { SHFileOperationW(&mut operation) };
+        if result == 0 {
+            return Ok(());
+        }
+        // Fall back to a hard delete if the shell op is unavailable so the
+        // user's explicit typed-confirm intent is still honored.
+        let fallback = fs::remove_dir_all(path);
+        if let Err(error) = fallback {
+            return Err(format!(
+                "could not move folder to Recycle Bin (code {result}) and hard delete failed: {error}"
+            ));
+        }
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
+        fs::remove_dir_all(path).map_err(|e| format!("could not delete project folder: {}", e))
+    }
 }
 
 fn active_project_root(state: &AppState) -> Option<PathBuf> {
@@ -1423,9 +1599,6 @@ fn refresh_provider_health(
     let refresh_video = provider_id
         .as_deref()
         .is_none_or(|id| id == video_generation::PROVIDER_ID);
-    let refresh_openrouter = provider_id
-        .as_deref()
-        .is_none_or(|id| id == openrouter::PROVIDER_ID);
     let mut registry = state.provider_registry.lock().unwrap();
     let mut health = registry
         .refresh_health(provider_id.as_deref())
@@ -1459,31 +1632,6 @@ fn refresh_provider_health(
             )
             .map_err(|error| command_error(&state, "provider_health_refresh_failed", error))?;
         health.retain(|value| value.provider_id != video_generation::PROVIDER_ID);
-        health.push(item);
-    }
-    if refresh_openrouter {
-        let config = state.settings.lock().unwrap().openrouter.clone();
-        let item = registry
-            .set_openrouter_state(
-                config.enabled,
-                if config.enabled && !config.api_key.is_empty() && !config.default_model.is_empty() {
-                    match openrouter::test_connection(&config) {
-                        Ok(_) => providers::HealthState::Healthy,
-                        Err(openrouter::OpenRouterError::InvalidApiKey)
-                        | Err(openrouter::OpenRouterError::Unauthorized)
-                        | Err(openrouter::OpenRouterError::Forbidden) => providers::HealthState::Misconfigured,
-                        Err(openrouter::OpenRouterError::RateLimited) => providers::HealthState::Degraded,
-                        _ => providers::HealthState::Unavailable,
-                    }
-                } else if !config.enabled {
-                    providers::HealthState::Unavailable
-                } else {
-                    providers::HealthState::Misconfigured
-                },
-                None,
-            )
-            .map_err(|error| command_error(&state, "provider_health_refresh_failed", error))?;
-        health.retain(|value| value.provider_id != openrouter::PROVIDER_ID);
         health.push(item);
     }
     // Refresh local Hunyuan3D
@@ -1568,7 +1716,10 @@ fn list_image_generation_providers(state: State<'_, AppState>) -> Vec<ProviderVi
         .unwrap()
         .list(Some(Capability::TextToImage), &snapshot)
         .into_iter()
-        .filter(|view| view.manifest.provider_id == image_generation::PROVIDER_ID)
+        .filter(|view| {
+            view.manifest.provider_id == image_generation::PROVIDER_ID
+                || view.manifest.provider_id == image_generation::CLOUD_PROVIDER_ID
+        })
         .collect()
 }
 
@@ -1593,13 +1744,36 @@ fn create_image_generation_job(
             health.as_ref().err().map(ToString::to_string),
         )
         .map_err(|error| error.to_string())?;
+    let cloud_key = active_gemini_key(&state);
+    if let Some(key) = cloud_key {
+        // Cloud Gemini (Nano Banana): mirror the chat key; skip the loopback
+        // a1111 health gate entirely — the cloud provider has its own key check.
+        state
+            .provider_registry
+            .lock()
+            .unwrap()
+            .set_cloud_gemini_state(true, providers::HealthState::Healthy, None)
+            .map_err(|error| error.to_string())?;
+        let snapshot = current_hardware_snapshot(&state);
+        let registry = state.provider_registry.lock().unwrap().clone();
+        let project = ensure_project_for_jobs(&state)?;
+        let mut cloud_input = input;
+        cloud_input.provider_id = Some(image_generation::CLOUD_PROVIDER_ID.into());
+        return jobs::create_image_generation_with_key(
+            &project,
+            &registry,
+            &snapshot,
+            cloud_input,
+            key,
+        )
+        .map_err(|error| command_error(&state, "image_generation_job_create_failed", error));
+    }
     health
         .map_err(|error| command_error(&state, "image_generation_provider_unavailable", error))?;
     let snapshot = current_hardware_snapshot(&state);
     let registry = state.provider_registry.lock().unwrap().clone();
-    let guard = state.current_project.lock().unwrap();
-    let project = guard.as_ref().ok_or("no project open")?;
-    jobs::create_image_generation(project, &registry, &snapshot, input)
+    let project = ensure_project_for_jobs(&state)?;
+    jobs::create_image_generation(&project, &registry, &snapshot, input)
         .map_err(|error| command_error(&state, "image_generation_job_create_failed", error))
 }
 
@@ -1608,9 +1782,8 @@ fn get_image_generation_result(
     job_id: String,
     state: State<'_, AppState>,
 ) -> Result<image_generation::ImageGenerationResult, String> {
-    let guard = state.current_project.lock().unwrap();
-    let project = guard.as_ref().ok_or("no project open")?;
-    image_generation::get_result(project, &job_id).map_err(|error| error.to_string())
+    let project = ensure_project_for_jobs(&state)?;
+    image_generation::get_result(&project, &job_id).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1689,9 +1862,8 @@ fn create_video_generation_job(
     }
     let snapshot = current_hardware_snapshot(&state);
     let registry = state.provider_registry.lock().unwrap().clone();
-    let guard = state.current_project.lock().unwrap();
-    let project = guard.as_ref().ok_or("no project open")?;
-    jobs::create_video_generation(project, &registry, &snapshot, input)
+    let project = ensure_project_for_jobs(&state)?;
+    jobs::create_video_generation(&project, &registry, &snapshot, input)
         .map_err(|error| command_error(&state, "video_generation_job_create_failed", error))
 }
 
@@ -1700,9 +1872,8 @@ fn get_video_generation_result(
     job_id: String,
     state: State<'_, AppState>,
 ) -> Result<video_generation::VideoGenerationResult, String> {
-    let guard = state.current_project.lock().unwrap();
-    let project = guard.as_ref().ok_or("no project open")?;
-    video_generation::get_result(project, &job_id).map_err(|error| error.to_string())
+    let project = ensure_project_for_jobs(&state)?;
+    video_generation::get_result(&project, &job_id).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1712,9 +1883,8 @@ fn create_model3d_generation_job(
 ) -> Result<jobs::CreateModel3dGenerationJobResult, String> {
     let snapshot = current_hardware_snapshot(&state);
     let registry = state.provider_registry.lock().unwrap().clone();
-    let guard = state.current_project.lock().unwrap();
-    let project = guard.as_ref().ok_or("no project open")?;
-    jobs::create_model3d_generation(project, &registry, &snapshot, input)
+    let project = ensure_project_for_jobs(&state)?;
+    jobs::create_model3d_generation(&project, &registry, &snapshot, input)
         .map_err(|error| command_error(&state, "model3d_generation_job_create_failed", error))
 }
 
@@ -1723,9 +1893,8 @@ fn get_model3d_generation_result(
     job_id: String,
     state: State<'_, AppState>,
 ) -> Result<model3d_generation::Model3dGenerationResult, String> {
-    let guard = state.current_project.lock().unwrap();
-    let project = guard.as_ref().ok_or("no project open")?;
-    model3d_generation::get_result(project, &job_id).map_err(|error| error.to_string())
+    let project = ensure_project_for_jobs(&state)?;
+    model3d_generation::get_result(&project, &job_id).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1735,9 +1904,8 @@ fn create_model3d_processing_job(
 ) -> Result<jobs::CreateModel3dProcessingJobResult, String> {
     let snapshot = current_hardware_snapshot(&state);
     let registry = state.provider_registry.lock().unwrap().clone();
-    let guard = state.current_project.lock().unwrap();
-    let project = guard.as_ref().ok_or("no project open")?;
-    jobs::create_model3d_processing(project, &registry, &snapshot, input)
+    let project = ensure_project_for_jobs(&state)?;
+    jobs::create_model3d_processing(&project, &registry, &snapshot, input)
         .map_err(|error| command_error(&state, "model3d_processing_job_create_failed", error))
 }
 
@@ -1746,9 +1914,8 @@ fn get_model3d_processing_result(
     job_id: String,
     state: State<'_, AppState>,
 ) -> Result<model3d_processing::Model3dProcessingResult, String> {
-    let guard = state.current_project.lock().unwrap();
-    let project = guard.as_ref().ok_or("no project open")?;
-    model3d_processing::get_result(project, &job_id).map_err(|error| error.to_string())
+    let project = ensure_project_for_jobs(&state)?;
+    model3d_processing::get_result(&project, &job_id).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1757,9 +1924,8 @@ fn approve_model3d_asset(
     processing_job_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let guard = state.current_project.lock().unwrap();
-    let project = guard.as_ref().ok_or("no project open")?;
-    jobs::approve_model3d_asset(project, &asset_id, &processing_job_id)
+    let project = ensure_project_for_jobs(&state)?;
+    jobs::approve_model3d_asset(&project, &asset_id, &processing_job_id)
         .map_err(|error| command_error(&state, "model3d_asset_approve_failed", error))
 }
 
@@ -1769,9 +1935,8 @@ fn approve_image_asset(
     generation_job_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let guard = state.current_project.lock().unwrap();
-    let project = guard.as_ref().ok_or("no project open")?;
-    jobs::approve_image_asset(project, &asset_id, generation_job_id.as_deref())
+    let project = ensure_project_for_jobs(&state)?;
+    jobs::approve_image_asset(&project, &asset_id, generation_job_id.as_deref())
         .map_err(|error| command_error(&state, "image_asset_approve_failed", error))
 }
 
@@ -1782,9 +1947,8 @@ fn reject_model3d_asset(
     rejection_reason: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let guard = state.current_project.lock().unwrap();
-    let project = guard.as_ref().ok_or("no project open")?;
-    jobs::reject_model3d_asset(project, &asset_id, &processing_job_id, rejection_reason)
+    let project = ensure_project_for_jobs(&state)?;
+    jobs::reject_model3d_asset(&project, &asset_id, &processing_job_id, rejection_reason)
         .map_err(|error| command_error(&state, "model3d_asset_reject_failed", error))
 }
 
@@ -1796,12 +1960,11 @@ fn reprocess_model3d_asset(
     quality: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<jobs::CreateModel3dProcessingJobResult, String> {
-    let guard = state.current_project.lock().unwrap();
-    let project = guard.as_ref().ok_or("no project open")?;
+    let project = ensure_project_for_jobs(&state)?;
     let registry = state.provider_registry.lock().unwrap().clone();
     let snapshot = current_hardware_snapshot(&state);
     jobs::reprocess_model3d_asset(
-        project,
+        &project,
         &registry,
         &snapshot,
         &asset_id,
@@ -1819,10 +1982,109 @@ fn create_hunyuan_generation_job(
 ) -> Result<jobs::CreateHunyuanGenerationJobResult, String> {
     let snapshot = current_hardware_snapshot(&state);
     let registry = state.provider_registry.lock().unwrap().clone();
-    let guard = state.current_project.lock().unwrap();
-    let project = guard.as_ref().ok_or("no project open")?;
-    jobs::create_hunyuan_generation(project, &registry, &snapshot, input)
+    let project = ensure_project_for_jobs(&state)?;
+    jobs::create_hunyuan_generation(&project, &registry, &snapshot, input)
         .map_err(|error| command_error(&state, "hunyuan_generation_job_create_failed", error))
+}
+
+#[tauri::command]
+async fn agent_interpret_prompt(
+    prompt: String,
+    history: Option<Vec<llm::ChatMessage>>,
+    state: State<'_, AppState>,
+) -> Result<agent::AgentPlan, String> {
+    let prompt = prompt.trim().to_string();
+    if prompt.is_empty() {
+        return Err("prompt is empty".into());
+    }
+    let config = state.llm_config.lock().unwrap().clone();
+    let history = history.unwrap_or_default();
+    Ok(agent::interpret(&config, &prompt, &history).await)
+}
+
+#[tauri::command]
+fn create_batch_queue(
+    prompts: Vec<String>,
+    quality: String,
+    state: State<'_, AppState>,
+) -> Result<batch_queue::BatchManifest, String> {
+    let project = ensure_project_for_jobs(&state)?;
+    let registry = state.provider_registry.clone();
+    let snapshot = current_hardware_snapshot(&state);
+    let shared = batch_queue::start_batch(project, registry, snapshot, prompts, quality)?;
+    let manifest = shared.lock().unwrap().clone();
+    *state.active_batch.lock().unwrap() = Some(shared);
+    Ok(manifest)
+}
+
+#[tauri::command]
+fn get_active_batch_queue(
+    state: State<'_, AppState>,
+) -> Result<Option<batch_queue::BatchManifest>, String> {
+    // Lazy recovery: the first poll after an app restart re-loads a batch
+    // that was interrupted mid-run and offers it for resume.
+    if state.active_batch.lock().unwrap().is_none() {
+        let project = {
+            let guard = state.current_project.lock().unwrap();
+            guard.as_ref().cloned()
+        };
+        if let Some(project) = project {
+            batch_queue::recover_interrupted(&project);
+        }
+    }
+    Ok(state
+        .active_batch
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|m| m.lock().unwrap().clone()))
+}
+
+#[tauri::command]
+fn pause_batch_queue(state: State<'_, AppState>) -> Result<batch_queue::BatchManifest, String> {
+    let project = ensure_project_for_jobs(&state)?;
+    let shared = state
+        .active_batch
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("no active batch")?;
+    batch_queue::pause_batch(&project, &shared)?;
+    Ok(shared.lock().unwrap().clone())
+}
+
+#[tauri::command]
+fn cancel_batch_queue(state: State<'_, AppState>) -> Result<batch_queue::BatchManifest, String> {
+    let project = ensure_project_for_jobs(&state)?;
+    let shared = state
+        .active_batch
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("no active batch")?;
+    batch_queue::cancel_batch(&project, &shared)?;
+    Ok(shared.lock().unwrap().clone())
+}
+
+#[tauri::command]
+fn resume_batch_queue(state: State<'_, AppState>) -> Result<batch_queue::BatchManifest, String> {
+    let project = ensure_project_for_jobs(&state)?;
+    let registry = state.provider_registry.clone();
+    let snapshot = current_hardware_snapshot(&state);
+    let shared = state
+        .active_batch
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("no active batch")?;
+    batch_queue::resume_batch(project, registry, snapshot, &shared)?;
+    Ok(shared.lock().unwrap().clone())
+}
+
+#[tauri::command]
+fn clear_active_batch_queue(state: State<'_, AppState>) -> Result<(), String> {
+    *state.active_batch.lock().unwrap() = None;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1830,9 +2092,8 @@ fn get_hunyuan_generation_result(
     job_id: String,
     state: State<'_, AppState>,
 ) -> Result<hunyuan_generation::HunyuanGenerationResult, String> {
-    let guard = state.current_project.lock().unwrap();
-    let project = guard.as_ref().ok_or("no project open")?;
-    hunyuan_generation::get_result(project, &job_id).map_err(|error| error.to_string())
+    let project = ensure_project_for_jobs(&state)?;
+    hunyuan_generation::get_result(&project, &job_id).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -2435,65 +2696,6 @@ fn save_hunyuan_config(
 }
 
 #[tauri::command]
-fn get_openrouter_config(state: State<'_, AppState>) -> openrouter::MaskedOpenRouterConfig {
-    state.settings.lock().unwrap().openrouter.masked()
-}
-
-#[tauri::command]
-fn save_openrouter_config(
-    config: openrouter::OpenRouterConfig,
-    state: State<'_, AppState>,
-) -> Result<openrouter::MaskedOpenRouterConfig, String> {
-    config.validate().map_err(|e| e.to_string())?;
-    let mut app_settings = state.settings.lock().unwrap();
-    app_settings.openrouter = config.clone();
-    let settings_path = state.settings_path.clone();
-    settings::save(&settings_path, &app_settings).map_err(|e| e.to_string())?;
-    Ok(app_settings.openrouter.masked())
-}
-
-#[tauri::command]
-fn remove_openrouter_key(state: State<'_, AppState>) -> Result<openrouter::MaskedOpenRouterConfig, String> {
-    let mut app_settings = state.settings.lock().unwrap();
-    app_settings.openrouter.api_key.clear();
-    app_settings.openrouter.enabled = false;
-    let settings_path = state.settings_path.clone();
-    settings::save(&settings_path, &app_settings).map_err(|e| e.to_string())?;
-    Ok(app_settings.openrouter.masked())
-}
-
-#[tauri::command]
-fn test_openrouter_connection(
-    state: State<'_, AppState>,
-) -> Result<openrouter::OpenRouterHealth, String> {
-    let config = state.settings.lock().unwrap().openrouter.clone();
-    let health = openrouter::health(&config);
-    Ok(health)
-}
-
-#[tauri::command]
-fn list_openrouter_models(
-    state: State<'_, AppState>,
-) -> Result<Vec<openrouter::OpenRouterModel>, String> {
-    let config = state.settings.lock().unwrap().openrouter.clone();
-    openrouter::list_models(&config).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn openrouter_chat_completion(
-    model_id: String,
-    system_prompt: Option<String>,
-    user_prompt: String,
-    temperature: Option<f32>,
-    max_tokens: Option<u32>,
-    state: State<'_, AppState>,
-) -> Result<openrouter::OpenRouterChatResponse, String> {
-    let config = state.settings.lock().unwrap().openrouter.clone();
-    openrouter::chat_completion(&config, &model_id, system_prompt.as_deref(), &user_prompt, temperature, max_tokens)
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
 fn get_skip_runtime_startup(state: State<'_, AppState>) -> bool {
     state.settings.lock().unwrap().skip_runtime_startup_on_launch
 }
@@ -2508,12 +2710,19 @@ fn set_skip_runtime_startup(enabled: bool, state: State<'_, AppState>) -> Result
 }
 
 #[tauri::command]
-fn discover_runtimes(_state: State<'_, AppState>) -> Vec<RuntimeConfig> {
+fn discover_runtimes(state: State<'_, AppState>) -> Vec<RuntimeConfig> {
     let mut runtimes = Vec::new();
     if let Some(config) = RuntimeManager::discover_a1111() {
         runtimes.push(config);
     }
-    if let Some(config) = RuntimeManager::discover_hunyuan3d() {
+    if let Some(mut config) = RuntimeManager::discover_hunyuan3d() {
+        // Settings must win over hardcoded discovery args, otherwise the
+        // Providers "Texture generation" toggle can never reach the server.
+        if state.settings.lock().unwrap().hunyuan.texture_generation
+            && !config.startup_args.iter().any(|a| a == "--enable_tex")
+        {
+            config.startup_args.push("--enable_tex".to_string());
+        }
         runtimes.push(config);
     }
     if let Some(config) = RuntimeManager::discover_blender() {
@@ -2749,7 +2958,7 @@ mod asset_tests {
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         "#;
 
-        let mut db = project.db.lock().unwrap();
+        let db = project.db.lock().unwrap();
         db.execute(
             sql,
             rusqlite::params![
@@ -2836,7 +3045,7 @@ mod asset_tests {
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         "#;
 
-        let mut db = project.db.lock().unwrap();
+        let db = project.db.lock().unwrap();
         db.execute(
             sql,
             rusqlite::params![
@@ -2976,7 +3185,7 @@ mod asset_tests {
         "#;
 
         {
-            let mut db = project.db.lock().unwrap();
+            let db = project.db.lock().unwrap();
             db.execute(
                 sql,
                 rusqlite::params![
@@ -3050,7 +3259,7 @@ mod asset_tests {
         "#;
 
         {
-            let mut db = project.db.lock().unwrap();
+            let db = project.db.lock().unwrap();
             db.execute(
                 sql,
                 rusqlite::params![
@@ -3100,7 +3309,7 @@ mod asset_tests {
         fs::copy(&staging_path2, &master_path2).unwrap();
 
         {
-            let mut db = project.db.lock().unwrap();
+            let db = project.db.lock().unwrap();
             db.execute(
                 sql,
                 rusqlite::params![
@@ -3347,7 +3556,7 @@ mod asset_tests {
         "#;
 
         {
-            let mut db = project.db.lock().unwrap();
+            let db = project.db.lock().unwrap();
             db.execute(
                 sql,
                 rusqlite::params![
@@ -3713,6 +3922,7 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_shell::init())
         .register_asynchronous_uri_scheme_protocol("nexora-media", |context, request, responder| {
             asset_delivery::handle_protocol(context.app_handle(), request, responder);
         })
@@ -3729,7 +3939,16 @@ pub fn run() {
 
             let current_project = Arc::new(Mutex::new(None));
             let hardware_snapshot = hardware::detect(None);
-            let image_provider_config_path = settings_dir.join("image-provider.v1.json");
+            let chat_history_path = config_dir().join("chat_history.db");
+            let _ = chat_history::load(&chat_history_path, chat_history::MODE_AGENT);
+            let _ = chat_history::load(&chat_history_path, chat_history::MODE_CHAT);
+            let llm_config_path = config_dir().join("llm_config.json");
+    let llm_config: llm::LlmConfig = if llm_config_path.exists() {
+        llm::load_config(&llm_config_path)
+    } else {
+        llm::LlmConfig::default()
+    };
+    let image_provider_config_path = settings_dir.join("image-provider.v1.json");
             let image_provider_config = image_generation::load_config(&image_provider_config_path)?;
             let video_provider_config_path = settings_dir.join("video-provider.v1.json");
             let video_provider_config = video_generation::load_config(&video_provider_config_path)?;
@@ -3738,7 +3957,6 @@ pub fn run() {
             let provider_registry = ProviderRegistry::phase8(
                 image_provider_config.enabled,
                 video_provider_config.enabled,
-                app_settings.openrouter.enabled,
             )
             .map_err(|error| std::io::Error::other(error.to_string()))?;
             let image_provider_config = Arc::new(Mutex::new(image_provider_config));
@@ -3753,11 +3971,18 @@ pub fn run() {
             let mut runtime_manager = RuntimeManager::new();
             runtime_manager.set_app_handle(app.handle().clone());
 
-            // Use discovered configurations for auto-starting runtimes
+            // Use discovered configurations for auto-starting runtimes.
+            // Settings overrides are merged on top of discovery so user
+            // toggles (e.g. texture generation) reach the launched engines.
+            let mut hunyuan_config = RuntimeManager::discover_hunyuan3d()
+                .unwrap_or_else(|| app_settings.hunyuan.to_runtime_config());
+            if app_settings.hunyuan.texture_generation
+                && !hunyuan_config.startup_args.iter().any(|a| a == "--enable_tex")
+            {
+                hunyuan_config.startup_args.push("--enable_tex".to_string());
+            }
             let a1111_config = RuntimeManager::discover_a1111()
                 .unwrap_or_else(|| app_settings.a1111.to_runtime_config());
-            let hunyuan_config = RuntimeManager::discover_hunyuan3d()
-                .unwrap_or_else(|| app_settings.hunyuan.to_runtime_config());
             let blender_config =
                 RuntimeManager::discover_blender().unwrap_or_else(|| RuntimeConfig {
                     runtime_id: "blender".to_string(),
@@ -3789,9 +4014,19 @@ pub fn run() {
                 let guard = runtime_manager.lock().unwrap();
                 Arc::new((*guard).clone())
             };
-            let mut provider_orchestrator = provider_orchestrator::ProviderOrchestrator::new(runtime_manager_arc);
+            let mut provider_orchestrator = provider_orchestrator::ProviderOrchestrator::new(runtime_manager_arc.clone());
             provider_orchestrator.set_app_handle(app.handle().clone());
             let provider_orchestrator = Arc::new(Mutex::new(provider_orchestrator));
+
+            // GPU watchdog: restarts auto-start services whose health endpoint
+            // goes down (e.g. the Hunyuan3D server crashing mid-batch).
+            gpu_guard::install(runtime_manager_arc.clone());
+            let watchdog_runtime_manager = runtime_manager_arc.clone();
+            tauri::async_runtime::spawn(async move {
+                watchdog_runtime_manager
+                    .run_watchdog(std::time::Duration::from_secs(15))
+                    .await;
+            });
 
             // Start sequential provider initialization
             let provider_orchestrator_clone = provider_orchestrator.clone();
@@ -3808,8 +4043,11 @@ pub fn run() {
             });
 
             app.manage(AppState {
+                chat_history_path,
                 settings_path: settings_dir.join("settings.json"),
                 settings: Mutex::new(app_settings),
+                llm_config: Arc::new(Mutex::new(llm_config)),
+                llm_config_path,
                 image_provider_config_path,
                 image_provider_config,
                 video_provider_config_path,
@@ -3820,10 +4058,11 @@ pub fn run() {
                 recent_projects_path,
                 recent_projects: Mutex::new(load_recent_projects(&settings_dir.join("recent-projects.v1.json"))),
                 hardware_snapshot: Mutex::new(hardware_snapshot),
-                provider_registry: Mutex::new(provider_registry),
+                provider_registry: Arc::new(Mutex::new(provider_registry)),
                 media_integrity_cache: asset_delivery::IntegrityCache::default(),
                 runtime_manager,
                 provider_orchestrator,
+                active_batch: Arc::new(Mutex::new(None)),
             });
             Ok(())
         })
@@ -3833,6 +4072,7 @@ pub fn run() {
             save_settings,
             get_log_location,
             create_project,
+            initialize_project,
             open_project,
             close_project,
             get_current_project,
@@ -3842,6 +4082,8 @@ pub fn run() {
             import_asset,
             list_assets,
             search_assets,
+            delete_asset,
+            delete_assets,
             get_asset_preview,
             create_diagnostic_job,
             create_provider_diagnostic_job,
@@ -3884,6 +4126,23 @@ pub fn run() {
             validate_unity_import,
             create_hunyuan_generation_job,
             get_hunyuan_generation_result,
+            agent_interpret_prompt,
+            code_agent::code_agent_run,
+            code_agent::code_agent_cancel,
+            code_agent::code_agent_list_runs,
+            code_agent::detect_local_runtimes_cmd,
+            unity_scripts::unity_list_scripts,
+            unity_scripts::project_list_files,
+            unity_scripts::project_read_file,
+            unity_scripts::project_write_file,
+            unity_scripts::unity_read_script,
+            unity_scripts::unity_write_script,
+            create_batch_queue,
+            get_active_batch_queue,
+            pause_batch_queue,
+            cancel_batch_queue,
+            resume_batch_queue,
+            clear_active_batch_queue,
             discover_unity_project,
             detect_engine_targets,
             validate_unity_project,
@@ -3901,18 +4160,27 @@ pub fn run() {
             save_a1111_config,
             get_hunyuan_config,
             save_hunyuan_config,
-            get_openrouter_config,
-            save_openrouter_config,
-            remove_openrouter_key,
-            test_openrouter_connection,
-            list_openrouter_models,
-            openrouter_chat_completion,
             get_skip_runtime_startup,
             set_skip_runtime_startup,
             discover_runtimes,
             deploy_model3d_to_unity,
             get_orchestrator_status,
             start_orchestrator,
+            chat_history::chat_history_load,
+            chat_history::chat_history_append,
+            chat_history::chat_history_update,
+            chat_history::chat_history_clear,
+            llm::get_llm_config,
+            llm::save_llm_config,
+            llm::llm_chat_command,
+            llm::llm_list_providers,
+            llm::llm_refresh_model_lists,
+            llm::llm_test_connection,
+            llm::open_external_url,
+            llama_local::local_ai_status,
+            llama_local::local_ai_start,
+            llama_local::local_ai_setup,
+            llama_local::local_ai_download_model,
         ])
         .build(tauri::generate_context!())
         .expect("failed to initialize Nexora Game Studio");

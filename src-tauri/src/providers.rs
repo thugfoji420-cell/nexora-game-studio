@@ -344,20 +344,12 @@ impl ProviderRegistry {
         registry
             .register_core_local_http(local_comfyui(video_enabled), HealthState::Unavailable)?;
         Ok(registry)
-    }
-
-    pub fn phase8(image_enabled: bool, video_enabled: bool, openrouter_configured: bool) -> Result<Self, ProviderError> {
+    }    pub fn phase8(image_enabled: bool, video_enabled: bool) -> Result<Self, ProviderError> {
         let mut registry = Self::phase7(image_enabled, video_enabled)?;
-        registry.register_core_local_http(local_hunyuan(true), HealthState::Healthy)?;
+        registry
+            .register_core_local_http(local_hunyuan(true), HealthState::Healthy)?;
         registry.register_core_local_cli(local_blender(), HealthState::Healthy)?;
-        let openrouter_health = crate::openrouter::health(&crate::openrouter::OpenRouterConfig {
-            enabled: openrouter_configured,
-            ..Default::default()
-        });
-        registry.register_remote_api(
-            crate::openrouter::provider_manifest(),
-            openrouter_health.state,
-        )?;
+        registry.register_remote_api(cloud_gemini_image(), HealthState::Unknown)?;
         Ok(registry)
     }
 
@@ -373,7 +365,10 @@ impl ProviderRegistry {
         self.insert(manifest, health)
     }
 
-    fn register_remote_api(
+    /// Registers a remote-API provider (cloud hosted models, e.g. Gemini
+    /// Nano Banana). Validation happens up front; enabled state and health
+    /// are managed by the caller.
+    pub fn register_remote_api(
         &mut self,
         manifest: ProviderManifest,
         health: HealthState,
@@ -448,6 +443,25 @@ impl ProviderRegistry {
         Ok(())
     }
 
+    /// Cloud Gemini (Nano Banana) health/enabled state; mirrors the local
+    /// a1111 setter so job creation keeps a single code path.
+    pub fn set_cloud_gemini_state(
+        &mut self,
+        enabled: bool,
+        state: HealthState,
+        detail: Option<String>,
+    ) -> Result<ProviderHealth, ProviderError> {
+        let provider = self
+            .providers
+            .get_mut("cloud.gemini")
+            .ok_or_else(|| ProviderError::UnknownProvider("cloud.gemini".into()))?;
+        provider.manifest.enabled = enabled;
+        provider.health.state = state;
+        provider.health.checked_at = Utc::now();
+        provider.health.detail = detail;
+        Ok(provider.health.clone())
+    }
+
     pub fn set_local_a1111_state(
         &mut self,
         enabled: bool,
@@ -513,23 +527,6 @@ impl ProviderRegistry {
         Ok(provider.health.clone())
     }
 
-    pub fn set_openrouter_state(
-        &mut self,
-        enabled: bool,
-        state: HealthState,
-        detail: Option<String>,
-    ) -> Result<ProviderHealth, ProviderError> {
-        let provider = self
-            .providers
-            .get_mut("remote.openrouter")
-            .ok_or_else(|| ProviderError::UnknownProvider("remote.openrouter".into()))?;
-        provider.manifest.enabled = enabled;
-        provider.health.state = state;
-        provider.health.checked_at = Utc::now();
-        provider.health.detail = detail;
-        Ok(provider.health.clone())
-    }
-
     pub fn validate_video_generation(
         &self,
         provider_id: &str,
@@ -567,9 +564,12 @@ impl ProviderRegistry {
             .get(provider_id)
             .ok_or_else(|| ProviderError::UnknownProvider(provider_id.to_string()))?;
         let view = provider_view(provider, snapshot);
-        if view.manifest.provider_id != "local.a1111"
+        let is_local = view.manifest.provider_id == "local.a1111"
+            && view.manifest.execution_mode == ExecutionMode::LocalHttp;
+        let is_cloud = view.manifest.provider_id == "cloud.gemini"
+            && view.manifest.execution_mode == ExecutionMode::RemoteApi;
+        if !(is_local || is_cloud)
             || view.manifest.nature != ProviderNature::Real
-            || view.manifest.execution_mode != ExecutionMode::LocalHttp
             || !view.manifest.enabled
             || !view
                 .manifest
@@ -1161,6 +1161,29 @@ fn local_blender() -> ProviderManifest {
     }
 }
 
+fn cloud_gemini_image() -> ProviderManifest {
+    ProviderManifest {
+        schema_version: PROVIDER_MANIFEST_SCHEMA_VERSION,
+        provider_id: "cloud.gemini".into(),
+        display_name: "Gemini Nano Banana (Cloud)".into(),
+        version: "1.0.0".into(),
+        provider_type: ProviderType::ImageGeneration,
+        execution_mode: ExecutionMode::RemoteApi,
+        nature: ProviderNature::Real,
+        classification: Classification::Remote,
+        enabled: false,
+        capabilities: vec![Capability::TextToImage],
+        health_check: HealthCheckType::Manual,
+        requirements: requirements(ResourceClass::Standard),
+        license: unknown_license(),
+        permissions: vec![
+            Permission::JobWorkingDirectoryWrite,
+            Permission::OutputStagingWrite,
+            Permission::Network,
+        ],
+    }
+}
+
 fn mock_basic() -> ProviderManifest {
     mock_manifest(
         "mock.image.basic",
@@ -1527,7 +1550,7 @@ pub(crate) mod tests {
         // expose local.blender as a selectable MeshProcessing provider or
         // every Blender optimization fails with "no compatible 3D processing
         // provider is configured".
-        let registry = ProviderRegistry::phase8(true, true, false).unwrap();
+        let registry = ProviderRegistry::phase8(true, true).unwrap();
         let selected = registry
             .select(Capability::MeshProcessing, &snapshot(Some(16_000), Some(50_000), None))
             .expect("local.blender must be selectable for MeshProcessing");

@@ -1,23 +1,24 @@
-import { useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { open as openDirectoryDialog } from "@tauri-apps/plugin-dialog";
 import { Sidebar } from "./components/Sidebar";
 import { StartupScreen } from "./components/StartupScreen";
 import { DiagnosticsPage } from "./pages/DiagnosticsPage";
-import { HomePage } from "./pages/HomePage";
 import { PlaceholderPage } from "./pages/PlaceholderPage";
 import { SettingsPage } from "./pages/SettingsPage";
-import { AssetsPage } from "./pages/AssetsPage";
+const AssetsPage = lazy(() => import("./pages/AssetsPage").then(m => ({ default: m.AssetsPage })));
 import { JobsPage } from "./pages/JobsPage";
 import { ProvidersPage } from "./pages/ProvidersPage";
-import { AIDesignPage } from "./pages/AIDesignPage";
-import { ImageGeneratorPage } from "./pages/ImageGeneratorPage";
-import { VideoGeneratorPage } from "./pages/VideoGeneratorPage";
-import { Model3dGeneratorPage } from "./pages/Model3dGeneratorPage";
-import { Model3dReviewPage } from "./pages/Model3dReviewPage";
-import { HunyuanGeneratorPage } from "./pages/HunyuanGeneratorPage";
+import { StudioChatPage } from "./pages/StudioChatPage";
+const ImageGeneratorPage = lazy(() => import("./pages/ImageGeneratorPage").then(m => ({ default: m.ImageGeneratorPage })));
+const VideoGeneratorPage = lazy(() => import("./pages/VideoGeneratorPage").then(m => ({ default: m.VideoGeneratorPage })));
+const Model3dGeneratorPage = lazy(() => import("./pages/Model3dGeneratorPage").then(m => ({ default: m.Model3dGeneratorPage })));
+const Model3dReviewPage = lazy(() => import("./pages/Model3dReviewPage").then(m => ({ default: m.Model3dReviewPage })));
+const HunyuanGeneratorPage = lazy(() => import("./pages/HunyuanGeneratorPage").then(m => ({ default: m.HunyuanGeneratorPage })));
+import LlmSettingsPage from "./pages/LlmSettingsPage";
 import { ProjectsPage } from "./pages/ProjectsPage";
 import { resolveWorkspaceId, workspaces, type WorkspaceId } from "./pages/workspaces";
-import { closeProject, createProject, deleteProject, getAppInfo, getCurrentProject, getLogLocation, getRecentProjects, loadSettings, openProject, saveSettings } from "./services/core";
+import { archiveProject, closeProject, createProject, deleteProject, getAppInfo, getCurrentProject, getLogLocation, getRecentProjects, loadSettings, openProject, saveSettings } from "./services/core";
 import type { AppInfo, AppSettings, EngineProjectScope, ProjectInfo, RecentProjectInfo } from "./types/core";
 
 interface InitialState {
@@ -40,7 +41,13 @@ function scopeForWorkspace(workspace: WorkspaceId): EngineProjectScope | null {
   if (workspace === "video-generator") return "video";
   // 3D Engine owns the "3d" project scope. 3D Studio uses its own "studio"
   // scope so the two never share projects.
-  if (workspace === "model3d-generator" || workspace === "model3d-review") return "3d";
+  if (workspace === "model3d-generator") return "3d";
+  // model3d-review is the studio pipeline's own Blender-cleanup / approval /
+  // deployment stage (the "Advanced Review" button on the one-click pipeline
+  // and the workspaces.ts stage aliases all route here). Syncing the "3d"
+  // scope here force-opened the engine project and shadowed the studio
+  // project's processing jobs, so the review page always saw an empty list.
+  if (workspace === "model3d-review") return "studio";
   if (workspace === "hunyuan-generator") return "studio";
   return null;
 }
@@ -64,14 +71,14 @@ function buildEngineProjects(recentProjects: RecentProjectInfo[], currentProject
 }
 function workspaceFromHash(): WorkspaceId {
   const value = window.location.hash.slice(1);
-  return resolveWorkspaceId(value) ?? "home";
+  return resolveWorkspaceId(value) ?? "studio-chat";
 }
 
 function createDefaultInitialState(): InitialState {
   return {
     info: {
       name: "Nexora Game Studio",
-      version: "0.2.1",
+      version: "0.2.10",
       foundationStatus: "Operational",
       localFirst: true,
       telemetryEnabled: false,
@@ -86,7 +93,6 @@ function createDefaultInitialState(): InitialState {
       blender: { executablePath: null, version: null, validatedAtMs: null },
       unityTargets: {},
       activeUnityTarget: null,
-      openrouter: { schemaVersion: 1, enabled: false, providerId: "openrouter", baseUrl: "https://openrouter.ai/api/v1", apiKeyMasked: "", apiKeyConfigured: false, referer: "Nexora Game Studio", title: "Nexora Game Studio", defaultModel: "openai/gpt-4o", timeoutSeconds: 30 },
       skipRuntimeStartupOnLaunch: false,
     },
     logLocation: "",
@@ -239,7 +245,7 @@ export function App() {
     // from a neutral page (Projects/home) routes to 3D Engine, never 3D Studio.
     const projectScope = result.project.manifest.engineScope;
     const returnWs = projectModalReturnWorkspace;
-    const returnTo = returnWs && scopeForWorkspace(returnWs) ? returnWs : (projectScope ? workspaceForScope(projectScope) : "home");
+    const returnTo = returnWs && scopeForWorkspace(returnWs) ? returnWs : (projectScope ? workspaceForScope(projectScope) : "studio-chat");
     navigate(returnTo);
     setProjectModalReturnWorkspace(null);
   };
@@ -250,7 +256,7 @@ export function App() {
     setShowProjectModal(null);
     const projectScope = result.project.manifest.engineScope;
     const returnWs = projectModalReturnWorkspace;
-    const returnTo = returnWs && scopeForWorkspace(returnWs) ? returnWs : (projectScope ? workspaceForScope(projectScope) : "home");
+    const returnTo = returnWs && scopeForWorkspace(returnWs) ? returnWs : (projectScope ? workspaceForScope(projectScope) : "studio-chat");
     navigate(returnTo);
     setProjectModalReturnWorkspace(null);
   };
@@ -279,6 +285,25 @@ export function App() {
       };
     });
   };
+  /** Remove a project from the Nexora list only — folder & files stay on
+   *  disk. Use for projects already deleted in Explorer, or just to tidy the
+   *  Open Project window. */
+  const handleRemoveProject = async (root: string) => {
+    await archiveProject(root);
+    setInitial((current) => {
+      if (!current) return current;
+      const next = { ...current.engineProjects };
+      for (const scope of ["image", "video", "3d", "studio"] as EngineProjectScope[]) {
+        if (next[scope]?.root === root) next[scope] = null;
+      }
+      return {
+        ...current,
+        recentProjects: current.recentProjects.filter((project) => project.root !== root),
+        engineProjects: next,
+      };
+    });
+  };
+
   const handleStartupComplete = useCallback(() => {
     setStartupComplete(true);
     setShowStartupScreen(false);
@@ -353,20 +378,19 @@ export function App() {
         </div>
       );
     }
-    if (workspaceId === "home") return <HomePage info={initial.info} />;
-    if (workspaceId === "projects") return <ProjectsPage currentProject={initial.currentProject} recentProjects={initial.recentProjects} onCreate={handleCreateProject} onOpen={handleOpenProject} onClose={handleCloseProject} onDelete={handleDeleteProject} />;
+    if (workspaceId === "studio-chat") return <StudioChatPage key={projectKey} currentProject={engineProject} onOpenProjectModal={openProjectModal} />;
+    if (workspaceId === "projects") return <ProjectsPage currentProject={initial.currentProject} recentProjects={initial.recentProjects} onCreate={handleCreateProject} onOpen={handleOpenProject} onClose={handleCloseProject} onDelete={handleDeleteProject} onRemove={handleRemoveProject} />;
     if (workspaceId === "settings") return <SettingsPage settings={initial.settings} saving={saving} message={saveMessage} onChange={updateSettings} />;
     if (workspaceId === "diagnostics") return <DiagnosticsPage logLocation={initial.logLocation} />;
     if (workspaceId === "assets") return <AssetsPage />;
     if (workspaceId === "jobs") return <JobsPage />;
     if (workspaceId === "providers") return <ProvidersPage />;
-    if (workspaceId === "ai-design") return <AIDesignPage />;
     if (workspaceId === "image-generator") return <ImageGeneratorPage key={projectKey} currentProject={engineProject} onOpenProjectModal={openProjectModal} />;
     if (workspaceId === "video-generator") return <VideoGeneratorPage key={projectKey} currentProject={engineProject} onOpenProjectModal={openProjectModal} />;
     if (workspaceId === "model3d-generator") return <Model3dGeneratorPage key={projectKey} currentProject={engineProject} onOpenProjectModal={openProjectModal} />;
     if (workspaceId === "model3d-review") return <Model3dReviewPage key={projectKey} />;
     if (workspaceId === "hunyuan-generator") return <HunyuanGeneratorPage key={projectKey} currentProject={engineProject} onOpenProjectModal={openProjectModal} />;
-    return <PlaceholderPage description={definition.description} />;
+    if (workspaceId === "llm-settings") return <LlmSettingsPage />;
   };
 
   const workspace = workspaces.find(({ id }) => id === active) ?? workspaces[0];
@@ -379,7 +403,8 @@ export function App() {
         onNavigate={navigate}
         onToggleCompact={toggleSidebar}
       />
-      <main className="workspace">
+      <a className="skip-link" href="#workspace-content">Skip to workspace</a>
+      <main className="workspace" id="workspace-content" tabIndex={-1}>
         <header className="workspace__header">
           <div className="workspace__header-left">
             <div className="workspace__breadcrumb">
@@ -389,8 +414,10 @@ export function App() {
             </div>
           </div>
           <div className="workspace__actions">
-            {active !== "home" && (
-              <button className="btn btn--ghost btn--sm" type="button" onClick={() => navigate("home")}>
+            <button className="btn btn--ghost btn--sm" type="button" onClick={() => navigate("projects")}>Projects</button>
+            <button className="btn btn--ghost btn--sm" type="button" onClick={() => navigate("jobs")}>Jobs</button>
+            {active !== "studio-chat" && (
+              <button className="btn btn--ghost btn--sm" type="button" onClick={() => navigate("studio-chat")}>
                 ← Back
               </button>
             )}
@@ -402,7 +429,9 @@ export function App() {
         </header>
         <div className="workspace__body">
           <div className="workspace-view">
-            {renderWorkspace(active)}
+            <Suspense fallback={<div className="loading-placeholder" role="status">Opening workspace…</div>}>
+              {renderWorkspace(active)}
+            </Suspense>
           </div>
         </div>      </main>
 
@@ -433,6 +462,7 @@ export function App() {
                 currentProject={initial.currentProject}
                 onOpen={(root) => handleOpenProject(root, projectModalScope ?? undefined)}
                 onDelete={handleDeleteProject}
+                onRemove={handleRemoveProject}
                 onClose={() => setShowProjectModal(null)}
               />
             </div>
@@ -514,6 +544,7 @@ function ProjectPicker({
   currentProject,
   onOpen,
   onDelete,
+  onRemove,
   onClose,
 }: {
   recentProjects: RecentProjectInfo[];
@@ -521,25 +552,68 @@ function ProjectPicker({
   currentProject: ProjectInfo | null;
   onOpen: (root: string) => Promise<void>;
   onDelete: (root: string) => Promise<void>;
+  /** List-only remove: keeps the folder on disk. */
+  onRemove: (root: string) => Promise<void>;
   onClose: () => void;
 }) {
   const [busyRoot, setBusyRoot] = useState<string | null>(null);
   const [error, setError] = useState("");
-  const scopedProjects = scope ? recentProjects.filter((project) => project.manifest.engineScope === scope) : recentProjects;
+  const [initCandidate, setInitCandidate] = useState<string | null>(null);
+  // Pending removal dialog: which project, and which confirm text is filled.
+  const [removeTarget, setRemoveTarget] = useState<RecentProjectInfo | null>(null);
+  const [removeConfirmText, setRemoveConfirmText] = useState("");
+  const [removeMode, setRemoveMode] = useState<"list" | "permanent">("list");
+  // Generic (engine-scope-less) projects — e.g. any pre-existing code project
+  // initialized in-place — are usable from every engine list.
+  const scopedProjects = scope
+    ? recentProjects.filter((project) => !project.manifest.engineScope || project.manifest.engineScope === scope)
+    : recentProjects;
+
+  /** Initialize any folder in place, then open it — zero extra clicks. */
+  const initializeAndOpen = async (root: string) => {
+    await invoke<ProjectInfo>("initialize_project", { root, engineScope: scope ?? null });
+    await onOpen(root);
+    setInitCandidate(null);
+  };
 
   const openRoot = async (root: string) => {
     setBusyRoot(root);
     setError("");
+    setInitCandidate(null);
     try {
       await onOpen(root);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const normalized = message.toLowerCase();
-      setError(
-        normalized.includes("manifest") || normalized.includes("nexora project")
-          ? "This folder is not a Nexora project yet. Use New Project to initialize it, or select a folder that already contains nexora.project.json."
-          : message && message !== "[object Object]" ? `Project could not be opened: ${message}` : "Could not open this project",
-      );
+      if (normalized.includes("manifest") || normalized.includes("nexora project")) {
+        // Auto-initialize: selecting ANY folder just works — no extra click.
+        try {
+          await initializeAndOpen(root);
+        } catch (initErr) {
+          const initMessage = initErr instanceof Error ? initErr.message : String(initErr);
+          setInitCandidate(root);
+          setError(
+            initMessage && initMessage !== "[object Object]"
+              ? `Could not initialize this folder: ${initMessage}`
+              : "Could not initialize this folder — try the button below.",
+          );
+        }
+      } else {
+        setError(message && message !== "[object Object]" ? `Project could not be opened: ${message}` : "Could not open this project");
+      }
+    } finally {
+      setBusyRoot(null);
+    }
+  };
+
+  const initializeHere = async (root: string) => {
+    setBusyRoot(root);
+    setError("");
+    try {
+      await initializeAndOpen(root);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setError(message && message !== "[object Object]" ? `Could not initialize: ${message}` : "Could not initialize this folder");
     } finally {
       setBusyRoot(null);
     }
@@ -551,7 +625,7 @@ function ProjectPicker({
       const selected = await openDirectoryDialog({
         directory: true,
         multiple: false,
-        title: "Select an existing Nexora project folder",
+        title: "Select any project folder (existing code projects work too)",
       });
       if (typeof selected === "string") await openRoot(selected);
     } catch (err) {
@@ -560,16 +634,41 @@ function ProjectPicker({
     }
   };
 
-  const removeProject = async (root: string) => {
+  /** Ask what "Remove" should mean before touching anything. */
+  const askRemove = (root: string) => {
+    const project = scopedProjects.find((item) => item.root === root);
+    if (!project) return;
+    setRemoveMode("list");
+    setRemoveConfirmText("");
+    setRemoveTarget(project);
+  };
+
+  /** Remove from the Nexora list only — the folder and all files stay on disk. */
+  const removeListOnly = async (root: string) => {
     setBusyRoot(root);
     setError("");
+    setRemoveTarget(null);
     try {
-      const project = scopedProjects.find((item) => item.root === root);
-      if (!project || !window.confirm(`Delete "${project.manifest.name}" and all files in this project folder from your PC? This cannot be undone.`)) return;
+      await onRemove(root);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setError(message && message !== "[object Object]" ? `Could not remove from the list: ${message}` : "Could not remove this project from the list");
+    } finally {
+      setBusyRoot(null);
+    }
+  };
+
+  /** PROTECTIVE: delete_every_file passes the typed command; anything else aborts. */
+  const removePermanently = async (root: string, confirmText: string) => {
+    if (confirmText !== "delete_every_file") return;
+    setBusyRoot(root);
+    setError("");
+    setRemoveTarget(null);
+    try {
       await onDelete(root);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      setError(message && message !== "[object Object]" ? `Project could not be removed: ${message}` : "Could not remove this project from the list");
+      setError(message && message !== "[object Object]" ? `Could not delete: ${message}` : "Could not delete this project");
     } finally {
       setBusyRoot(null);
     }
@@ -578,14 +677,27 @@ function ProjectPicker({
   return (
     <div className="project-picker">
       {error && <div className="error-banner" role="alert">{error}</div>}
+      {initCandidate && (
+        <div className="project-picker__init" style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 10 }}>
+          <code style={{ flex: 1, fontSize: 12 }}>{initCandidate}</code>
+          <button
+            className="btn btn--primary btn--sm"
+            type="button"
+            disabled={busyRoot !== null}
+            onClick={() => void initializeHere(initCandidate)}
+          >
+            {busyRoot === initCandidate ? "Initializing..." : "⚡ Initialize project here"}
+          </button>
+        </div>
+    )}
       <div className="project-picker__intro">
-        <div className="panel-label">YOUR NEXORA PROJECTS</div>
-        <p className="muted">Select a saved project for this engine. Projects from other engines are kept separate and are not shown here.</p>
+        <div className="panel-label">YOUR PROJECTS</div>
+        <p className="muted">Open any project — a Nexora project, or ANY existing code project (web, mobile, desktop). Non-Nexora folders get initialized in one click, then the agent can modify them.</p>
       </div>
       {scopedProjects.length === 0 ? (
         <div className="project-picker__empty">
           <strong>No saved projects yet</strong>
-          <span>Create a new project first, or browse to an existing Nexora project folder.</span>
+          <span>Select any folder below — an existing code project or a fresh folder — and start working on it.</span>
         </div>
       ) : (
         <div className="recent-project-list project-picker__list">
@@ -602,7 +714,7 @@ function ProjectPicker({
                   <button className="btn btn--primary btn--sm" type="button" disabled={isCurrent || busyRoot !== null} onClick={() => void openRoot(recent.root)}>
                     {busyRoot === recent.root ? "Working..." : isCurrent ? "Open" : "Open Project"}
                   </button>
-                  <button className="btn btn--ghost btn--sm" type="button" disabled={busyRoot !== null} onClick={() => void removeProject(recent.root)}>
+                  <button className="btn btn--ghost btn--sm" type="button" disabled={busyRoot !== null} onClick={() => askRemove(recent.root)}>
                     Remove
                   </button>
                 </div>
@@ -617,6 +729,56 @@ function ProjectPicker({
         </button>
         <button className="btn btn--ghost" type="button" onClick={onClose}>Cancel</button>
       </div>
+      {removeTarget && (
+        <div className="modal-overlay" style={{ zIndex: 1100 }} onClick={() => setRemoveTarget(null)}>
+          <div className="modal" style={{ maxWidth: 460 }} onClick={(e) => e.stopPropagation()}>
+            <div className="modal__header">
+              <h2 className="modal__title">Remove &quot;{removeTarget.manifest.name}&quot;?</h2>
+              <button className="modal__close" onClick={() => setRemoveTarget(null)} type="button">✕</button>
+            </div>
+            <div className="modal__body">
+              {removeMode === "list" ? (
+                <>
+                  <p>Is project ko Nexora ki list se hata dein, ya iske saare files PC se permanently delete kar dein?</p>
+                  <p className="muted" style={{ marginTop: 6 }}>Remove from list: folder <code>{removeTarget.root}</code> disk par mehfooz rahega — baad mein dobara Open kar sakte hain.</p>
+                  <div style={{ display: "flex", gap: 10, marginTop: 14, flexWrap: "wrap" }}>
+                    <button className="btn btn--primary" type="button" disabled={busyRoot !== null} onClick={() => void removeListOnly(removeTarget.root)}>
+                      Remove from Nexora only
+                    </button>
+                    <button className="btn btn--danger" type="button" disabled={busyRoot !== null} onClick={() => setRemoveMode("permanent")}>
+                      Delete permanently
+                    </button>
+                    <button className="btn btn--ghost" type="button" onClick={() => setRemoveTarget(null)}>Cancel</button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <p><strong>{removeTarget.manifest.name}</strong> ka poora folder disk se delete ho jayega:</p>
+                  <code style={{ display: "block", margin: "8px 0", fontSize: 12 }}>{removeTarget.root}</code>
+                  <p className="muted">Ye action undo nahi ho sakta. Confirm karne ke liye neeche <code>delete_every_file</code> type karein.</p>
+                  <input
+                    value={removeConfirmText}
+                    onChange={(e) => setRemoveConfirmText(e.target.value)}
+                    placeholder="delete_every_file"
+                    style={{ width: "100%", marginTop: 8 }}
+                  />
+                  <div style={{ display: "flex", gap: 10, marginTop: 14, flexWrap: "wrap" }}>
+                    <button
+                      className="btn btn--danger"
+                      type="button"
+                      disabled={busyRoot !== null || removeConfirmText !== "delete_every_file"}
+                      onClick={() => void removePermanently(removeTarget.root, removeConfirmText)}
+                    >
+                      {busyRoot === removeTarget.root ? "Deleting..." : "Yes, delete every file"}
+                    </button>
+                    <button className="btn btn--ghost" type="button" onClick={() => setRemoveTarget(null)}>Cancel</button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

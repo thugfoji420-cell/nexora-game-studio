@@ -1,5 +1,4 @@
 use crate::runtime_manager::{RuntimeConfig, RuntimeKind, RuntimeType};
-use crate::openrouter::OpenRouterConfig;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, io, path::Path, thread, time::Duration};
 
@@ -69,11 +68,7 @@ impl Default for A1111Config {
             launcher_path: None,
             base_url: "http://127.0.0.1:7860".to_string(),
             auto_start: true,
-            startup_args: vec![
-                "--api".to_string(),
-                "--medvram".to_string(),
-                "--nowebui".to_string(),
-            ],
+            startup_args: vec!["--api".to_string(), "--nowebui".to_string()],
             working_directory: None,
         }
     }
@@ -142,6 +137,15 @@ impl HunyuanConfig {
             args.push("--enable_tex".to_string());
         }
 
+        let mut environment = HashMap::new();
+        // 4 GB GPUs crash the server mid-job without this allocator setting:
+        // fragmentation makes even 20 MiB allocations fail with 2 GB "free"
+        // (observed 2026-10-04 during a text-to-3d pipeline load).
+        environment.insert(
+            "PYTORCH_CUDA_ALLOC_CONF".to_string(),
+            "expandable_segments:True".to_string(),
+        );
+
         RuntimeConfig {
             runtime_id: "hunyuan3d".to_string(),
             display_name: "Hunyuan3D".to_string(),
@@ -154,7 +158,7 @@ impl HunyuanConfig {
             auto_start: self.auto_start,
             startup_args: args,
             working_directory: self.root_path.clone(),
-            environment: HashMap::new(),
+            environment,
         }
     }
 }
@@ -222,6 +226,8 @@ impl UnityProjectTarget {
         }
     }
 
+    /// Test-only constructor used by the settings validation tests.
+    #[cfg(test)]
     pub fn with_id(target_id: String, display_name: String, project_root: String) -> Self {
         Self {
             target_id,
@@ -263,8 +269,6 @@ pub struct AppSettings {
     #[serde(default)]
     pub active_unity_target: Option<String>,
     #[serde(default)]
-    pub openrouter: OpenRouterConfig,
-    #[serde(default)]
     pub skip_runtime_startup_on_launch: bool,
 }
 
@@ -287,7 +291,6 @@ impl Default for AppSettings {
             blender: BlenderConfig::default(),
             unity_targets: HashMap::new(),
             active_unity_target: None,
-            openrouter: OpenRouterConfig::default(),
             skip_runtime_startup_on_launch: false,
         }
     }

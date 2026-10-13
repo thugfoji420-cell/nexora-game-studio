@@ -6,7 +6,7 @@ import type { WorkspaceId } from "./workspaces";
  * different stage's settings panel.
  */
 export const studioRoutes = {
-  dashboard: "home",
+  dashboard: "studio-chat",
   projects: "projects",
   conceptStudio: "image-generator",
   imageGeneration: "image-generator",

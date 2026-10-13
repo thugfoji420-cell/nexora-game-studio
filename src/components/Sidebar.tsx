@@ -127,6 +127,8 @@ export function Sidebar({ active, compact, onNavigate, onToggleCompact }: Sideba
           className="sidebar__toggle" 
           onClick={onToggleCompact}
           title={compact ? "Expand sidebar" : "Collapse sidebar"}
+          aria-label={compact ? "Expand sidebar" : "Collapse sidebar"}
+          aria-expanded={!compact}
         >
           {compact ? icons.chevronRight : icons.chevronLeft}
         </button>
@@ -140,6 +142,8 @@ export function Sidebar({ active, compact, onNavigate, onToggleCompact }: Sideba
             className={`sidebar__nav-item ${active === workspace.id ? "sidebar__nav-item--active" : ""}`}
             onClick={() => onNavigate(workspace.id)}
             title={compact ? workspace.shortLabel : undefined}
+            aria-label={workspace.shortLabel}
+            aria-current={active === workspace.id ? "page" : undefined}
             type="button"
           >
             <span className="sidebar__nav-icon">
@@ -156,6 +160,8 @@ export function Sidebar({ active, compact, onNavigate, onToggleCompact }: Sideba
             className={`sidebar__nav-item ${active === workspace.id ? "sidebar__nav-item--active" : ""}`}
             onClick={() => onNavigate(workspace.id)}
             title={compact ? workspace.shortLabel : undefined}
+            aria-label={workspace.shortLabel}
+            aria-current={active === workspace.id ? "page" : undefined}
             type="button"
           >
             <span className="sidebar__nav-icon">
@@ -172,6 +178,8 @@ export function Sidebar({ active, compact, onNavigate, onToggleCompact }: Sideba
             className={`sidebar__nav-item ${active === workspace.id ? "sidebar__nav-item--active" : ""}`}
             onClick={() => onNavigate(workspace.id)}
             title={compact ? workspace.shortLabel : undefined}
+            aria-label={workspace.shortLabel}
+            aria-current={active === workspace.id ? "page" : undefined}
             type="button"
           >
             <span className="sidebar__nav-icon">
@@ -188,6 +196,8 @@ export function Sidebar({ active, compact, onNavigate, onToggleCompact }: Sideba
             className={`sidebar__nav-item ${active === workspace.id ? "sidebar__nav-item--active" : ""}`}
             onClick={() => onNavigate(workspace.id)}
             title={compact ? workspace.shortLabel : undefined}
+            aria-label={workspace.shortLabel}
+            aria-current={active === workspace.id ? "page" : undefined}
             type="button"
           >
             <span className="sidebar__nav-icon">
@@ -201,7 +211,7 @@ export function Sidebar({ active, compact, onNavigate, onToggleCompact }: Sideba
       <div className="sidebar__footer">
         <div className="sidebar__status">
           <span className="sidebar__status-dot" />
-          {!compact && <span>System Ready</span>}
+          {!compact && <span>Local-first workspace</span>}
         </div>
       </div>
     </aside>

@@ -10,7 +10,6 @@ use std::{
 use tauri::Emitter;
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
-use which::which;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -134,6 +133,9 @@ pub struct RuntimeManager {
     runtimes: Arc<AsyncMutex<HashMap<String, RuntimeState>>>,
     child_processes: Arc<AsyncMutex<HashMap<String, std::process::Child>>>,
     app_handle: Option<tauri::AppHandle>,
+    /// Runtimes the GPU guard temporarily parks (skipped by the watchdog).
+    suppressed: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    last_restart_attempt: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
 }
 
 impl RuntimeManager {
@@ -142,6 +144,8 @@ impl RuntimeManager {
             runtimes: Arc::new(AsyncMutex::new(HashMap::new())),
             child_processes: Arc::new(AsyncMutex::new(HashMap::new())),
             app_handle: None,
+            suppressed: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            last_restart_attempt: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -221,6 +225,112 @@ impl RuntimeManager {
             Ok(runtimes.get(runtime_id).cloned().unwrap())
         } else {
             Ok(state.clone())
+        }
+    }
+
+    /// Mark a runtime as temporarily managed by the GPU guard: the watchdog
+    /// skips it entirely until unsuppressed, so A1111 is not auto-restarted
+    /// while Hunyuan generations hold the VRAM.
+    pub async fn suppress_runtime(&self, runtime_id: &str, suppressed: bool) {
+        let mut set = self.suppressed.lock().unwrap();
+        if suppressed {
+            set.insert(runtime_id.to_string());
+        } else {
+            set.remove(runtime_id);
+        }
+    }
+
+    pub fn is_suppressed(&self, runtime_id: &str) -> bool {
+        self.suppressed.lock().unwrap().contains(runtime_id)
+    }
+
+    /// Long-running watchdog: every `interval`, probe every auto-start
+    /// long-running service and restart it when its health endpoint stops
+    /// answering. Health check is quiet (no log spam); restarts are
+    /// rate-limited to one attempt per 90 s per runtime so a persistently
+    /// broken service cannot loop-spawn processes.
+    pub async fn run_watchdog(self: Arc<Self>, interval: Duration) {
+        loop {
+            tokio::time::sleep(interval).await;
+            let ids: Vec<String> = {
+                let runtimes = self.runtimes.lock().await;
+                runtimes
+                    .values()
+                    .filter(|state| {
+                        state.config.kind == RuntimeKind::LongRunningService
+                            && state.config.auto_start
+                    })
+                    .map(|state| state.config.runtime_id.clone())
+                    .collect()
+            };
+            for runtime_id in ids {
+                if self.is_suppressed(&runtime_id) {
+                    continue;
+                }
+                let config = match self.get_runtime(&runtime_id).await {
+                    Ok(state) => state.config,
+                    Err(_) => continue,
+                };
+                let health = match config.runtime_type {
+                    RuntimeType::Automatic1111 => self.check_a1111_health(&config).await,
+                    RuntimeType::Hunyuan3D => self.check_hunyuan_health(&config).await,
+                    RuntimeType::Blender => self.check_blender_health(&config).await,
+                };
+                match health {
+                    Ok(()) => {
+                        // Adopt (or keep) healthy status — covers services
+                        // started outside Nexora.
+                        let _ = self
+                            .update_runtime_state(&runtime_id, |state| {
+                                if state.status != RuntimeStatus::Ready {
+                                    state.status = RuntimeStatus::Ready;
+                                    state.error = None;
+                                }
+                            })
+                            .await;
+                    }
+                    _ => {
+                        let due = {
+                            let mut attempts = self.last_restart_attempt.lock().unwrap();
+                            let allowed = attempts
+                                .get(&runtime_id)
+                                .map(|t| t.elapsed() >= Duration::from_secs(90))
+                                .unwrap_or(true);
+                            if allowed {
+                                attempts.insert(runtime_id.clone(), Instant::now());
+                            }
+                            allowed
+                        };
+                        if !due {
+                            continue;
+                        }
+                        self.emit_init_log(
+                            "warn",
+                            &format!(
+                                "[watchdog] {} unhealthy — restarting",
+                                config.display_name
+                            ),
+                            Some(&runtime_id),
+                        );
+                        // Clear a stale Ready/Stopped flag so start_runtime
+                        // actually spawns a new process.
+                        let _ = self
+                            .update_runtime_state(&runtime_id, |state| {
+                                if state.status != RuntimeStatus::Starting {
+                                    state.status = RuntimeStatus::Failed;
+                                }
+                            })
+                            .await;
+                        if let Err(error) = self.start_runtime(&runtime_id).await {
+                            self.emit_init_log(
+                                "error",
+                                &format!("[watchdog] {} restart failed: {error}", config.display_name),
+                                Some(&runtime_id),
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -431,7 +541,7 @@ impl RuntimeManager {
         #[cfg(windows)]
         cmd.creation_flags(0x08000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
 
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .map_err(|e| RuntimeError::ProcessSpawn(e.to_string()))?;
 
@@ -486,7 +596,7 @@ impl RuntimeManager {
     }
 
     pub async fn stop_runtime(&self, runtime_id: &str) -> Result<(), RuntimeError> {
-        let (started_by_nexora, pid) = {
+        let (started_by_nexora, _pid) = {
             let state = self.get_runtime(runtime_id).await?;
             (state.started_by_nexora, state.process_id)
         };
@@ -619,7 +729,6 @@ impl RuntimeManager {
                 startup_args: vec![
                     "launch.py".to_string(),
                     "--api".to_string(),
-                    "--medvram".to_string(),
                     "--nowebui".to_string(),
                     "--port".to_string(),
                     "7860".to_string(),
@@ -638,7 +747,7 @@ impl RuntimeManager {
                 base_url: Some("http://127.0.0.1:7860".to_string()),
                 health_endpoint: Some("/sdapi/v1/options".to_string()),
                 auto_start: true,
-                startup_args: vec!["--api".to_string(), "--medvram".to_string()],
+                startup_args: vec!["--api".to_string(), "--nowebui".to_string()],
                 working_directory: Some(base_path.to_string_lossy().to_string()),
                 environment: HashMap::new(),
             })

@@ -13,7 +13,7 @@ if (!root) {
 
 createRoot(root).render(
   <StrictMode>
-    <ErrorBoundary fallback={<div style={{padding: '40px', color: '#ff6b6b', textAlign: 'center'}}><h1>React Error</h1><p>Something went wrong during rendering.</p></div>}>
+    <ErrorBoundary>
       <App />
     </ErrorBoundary>
   </StrictMode>,
