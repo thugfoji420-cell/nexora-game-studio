@@ -20,14 +20,9 @@ import {
   RuntimeState,
   RuntimeStatus,
 } from "../services/providers";
-import {
-  getOpenRouterConfig,
-  testOpenRouterConnection,
-} from "../services/openrouter";
 import type {
   Capability,
   HardwareSnapshot,
-  MaskedOpenRouterConfig,
   ProviderView,
   RuntimeStatus as RuntimeStatusType,
   A1111Config,
@@ -93,9 +88,6 @@ export function ProvidersPage() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [initializing, setInitializing] = useState(false);
-  const [openRouterConfig, setOpenRouterConfig] = useState<MaskedOpenRouterConfig | null>(null);
-  const [openRouterTesting, setOpenRouterTesting] = useState(false);
-  const [openRouterStatus, setOpenRouterStatus] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [showDetails, setShowDetails] = useState<string | null>(null);
@@ -115,13 +107,12 @@ export function ProvidersPage() {
 
   useEffect(() => {
     let mounted = true;
-    Promise.all([getHardwareSnapshot(), listProviders(), listRuntimes(), getOpenRouterConfig(), getA1111Config(), getHunyuanConfig()])
-      .then(([nextHardware, nextProviders, nextRuntimes, nextOpenRouterConfig, nextA1111Config, nextHunyuanConfig]) => {
+    Promise.all([getHardwareSnapshot(), listProviders(), listRuntimes(), getA1111Config(), getHunyuanConfig()])
+      .then(([nextHardware, nextProviders, nextRuntimes, nextA1111Config, nextHunyuanConfig]) => {
         if (!mounted) return;
         setHardware(nextHardware);
         setProviders(nextProviders);
         setRuntimes(nextRuntimes);
-        setOpenRouterConfig(nextOpenRouterConfig);
         setA1111Config(nextA1111Config);
         setHunyuanConfig(nextHunyuanConfig);
       })
@@ -185,23 +176,6 @@ export function ProvidersPage() {
       setError(presentError(nextError));
     } finally {
       setInitializing(false);
-    }
-  };
-
-  const handleOpenRouterTest = async () => {
-    setOpenRouterTesting(true);
-    setOpenRouterStatus(null);
-    try {
-      const result = await testOpenRouterConnection();
-      setOpenRouterStatus(
-        result.state === "healthy"
-          ? `Connected: ${result.detail ?? "OK"}`
-          : `Unavailable: ${result.detail ?? "check configuration"}`
-      );
-    } catch (nextError) {
-      setOpenRouterStatus(presentError(nextError));
-    } finally {
-      setOpenRouterTesting(false);
     }
   };
 
@@ -454,51 +428,6 @@ export function ProvidersPage() {
                 )}
               </div>
             )}
-          </div>
-        </div>
-      </div>
-
-      {/* Cloud Engines */}
-      <div className="providers-section">
-        <div className="providers-section__header">
-          <div className="panel-label">CLOUD ENGINES</div>
-          <h3>Remote Services</h3>
-        </div>
-
-        <div className="engine-card engine-card--cloud">
-          <div className="engine-card__header">
-            <div className="engine-card__icon">☁️</div>
-            <div className="engine-card__info">
-              <h4>OpenRouter</h4>
-              <p>AI Model Gateway</p>
-            </div>
-            <span className={`badge ${openRouterConfig?.apiKeyConfigured ? "badge--success" : "badge--neutral"}`}>
-              {openRouterConfig?.apiKeyConfigured ? "Configured" : "Not Configured"}
-            </span>
-          </div>
-          <div className="engine-card__details">
-            <span>Remote API</span>
-            <span>{openRouterConfig?.defaultModel || "No default model"}</span>
-          </div>
-          {openRouterStatus && (
-            <div className="engine-card__status">
-              {openRouterStatus}
-            </div>
-          )}
-          <div className="engine-card__actions">
-            <button 
-              className="btn btn--sm btn--secondary" 
-              disabled={openRouterTesting}
-              onClick={() => void handleOpenRouterTest()}
-            >
-              {openRouterTesting ? "Testing..." : "Test Connection"}
-            </button>
-            <button 
-              className="btn btn--sm btn--secondary"
-              onClick={() => window.location.hash = "settings"}
-            >
-              Configure
-            </button>
           </div>
         </div>
       </div>

@@ -38,6 +38,16 @@ import {
 import type { Model3dProcessingProfile, Model3dProcessingResult, ProcessingReport, UnityDeploymentDto } from "../types/model3dProcessing";
 import { checkRuntimeHealth, listProviders, listRuntimes, refreshProviderHealth } from "../services/providers";
 import { Model3dViewer } from "../components/Model3dViewer";
+import {
+  cancelBatchQueue,
+  clearActiveBatchQueue,
+  createBatchQueue,
+  getActiveBatchQueue,
+  pauseBatchQueue,
+  resumeBatchQueue,
+  summarizeBatch,
+  type BatchManifest,
+} from "../services/batchQueue";
 import { AssetReadinessReport } from "../components/AssetReadinessReport";
 import {
   canCancelVideoGenerationJob,
@@ -52,7 +62,9 @@ import {
 import {
   HUNYUAN_GENERATION_PROFILE_ID,
   HUNYUAN_OUTPUT_FORMAT,
-  HUNYUAN_QUALITY,
+  HUNYUAN_DEFAULT_QUALITY,
+  MODEL3D_GENERATION_QUALITIES,
+  type HunyuanGenerationQuality,
   type AssetInfo,
   type JobInfo,
   type HunyuanGenerationMode,
@@ -116,26 +128,45 @@ function promptForCreationStyle(prompt: string, style: AssetCreationStyle): stri
 
 // 3D reconstruction (Hunyuan3D) needs a clean single-object reference: object
 // centered and fully visible, plain background, even lighting — any scene detail
-// (streets, buildings, neon haze) becomes garbage geometry in the mesh. Directives
-// go FIRST because diffusion models weight early tokens more strongly.
+// (streets, buildings, neon haze) becomes garbage geometry in the mesh. Framing
+// directives lead the prompt ("wide shot, small in frame") because diffusion
+// models weight early tokens most and their prior defaults to cropped close-ups
+// that Hunyuan3D cannot reconstruct (verified by direct A1111 comparisons).
 function buildConceptPrompt(prompt: string, style: AssetCreationStyle): string {
   const styleAccent = style === "neon"
     ? "sleek futuristic hard-surface design with subtle cyan and magenta emissive accents"
     : "natural materials, balanced colors, practical proportions";
   return [
-    `game asset concept of a single ${prompt.trim()}`,
-    "entire object fully visible in frame, centered, three-quarter view",
-    "isolated on plain solid white background",
-    "even neutral studio lighting, soft shadow under object only",
-    "clean product shot, no environment",
+    `wide shot of a single ${prompt.trim()}`,
+    "small in frame, entire object fully visible with generous empty space on all sides",
+    "nothing cropped, centered, three-quarter view",
+    "plain solid white background, studio product photography",
+    "even neutral lighting, soft shadow under object only, no environment",
     styleAccent,
   ].join(", ");
 }
 
-// Scene blockers merged into every concept negative prompt: these are the terms
-// that keep A1111 from rendering a full environment around the asset.
+// Scene and framing blockers merged into every concept negative prompt: the
+// scene terms keep A1111 from rendering an environment around the asset, and the
+// framing terms stop the close-up zooms that Hunyuan3D cannot reconstruct.
 const CONCEPT_NEGATIVE_EXTRAS =
-  "environment, scenery, background buildings, street, road, ground plane, night city, multiple objects, cropped, out of frame, close-up, dramatic lighting, fog, haze, rain";
+  "environment, scenery, background buildings, street, road, ground plane, night city, multiple objects, cropped, out of frame, close-up, zoomed in, fills entire frame, cut off, macro, dramatic lighting, fog, haze, rain";
+
+const HUNYUAN_QUALITY_OPTIONS = MODEL3D_GENERATION_QUALITIES.map((value) => ({
+  value,
+  label:
+    value === "draft"
+      ? "Draft (fast preview)"
+      : value === "standard"
+        ? "Standard (props & fillers)"
+        : "AAA High (hero assets)",
+}));
+
+const HUNYUAN_QUALITY_HINTS: Record<HunyuanGenerationQuality, string> = {
+  draft: "Fastest pass for blocking out shapes. Lowest detail, quickest to redo.",
+  standard: "Balanced quality for props and background assets. Fits alongside other GPU apps.",
+  high: "Highest detail for hero assets the camera focuses on. Needs ~2 GB free GPU memory — close A1111 and other GPU-heavy apps first, or the job will be refused.",
+};
 
 const initialRequest: HunyuanGenerationRequest = {
   schemaVersion: 1,
@@ -144,9 +175,10 @@ const initialRequest: HunyuanGenerationRequest = {
   negativePrompt: "blurry, ugly, deformed, low quality, artifacts, distorted, noisy, watermark",
   sourceAssetId: null,
   profile: HUNYUAN_GENERATION_PROFILE_ID,
-  quality: HUNYUAN_QUALITY,
+  quality: HUNYUAN_DEFAULT_QUALITY,
   seed: null,
   outputFormat: HUNYUAN_OUTPUT_FORMAT,
+  generateTexture: true,
 };
 
 export function HunyuanGeneratorPage({
@@ -160,7 +192,65 @@ export function HunyuanGeneratorPage({
   const [assetCreationStyle, setAssetCreationStyle] = useState<AssetCreationStyle>("normal");
   const [factoryStep, setFactoryStep] = useState<FactoryStep>("prompt");
   const [request, setRequest] = useState(initialRequest);
+  const [quality, setQuality] = useState<HunyuanGenerationQuality>(HUNYUAN_DEFAULT_QUALITY);
   const [randomSeed, setRandomSeed] = useState(true);
+
+  useEffect(() => {
+    setRequest((prev) => (prev.quality === quality ? prev : { ...prev, quality }));
+  }, [quality]);
+
+  const [batch, setBatch] = useState<BatchManifest | null>(null);
+  const [batchPrompts, setBatchPrompts] = useState("");
+  const [batchBusy, setBatchBusy] = useState(false);
+
+  useEffect(() => {
+    let mounted = true;
+    const poll = () => {
+      getActiveBatchQueue()
+        .then((manifest) => {
+          if (mounted) setBatch(manifest);
+        })
+        .catch(() => {});
+    };
+    poll();
+    const timer = window.setInterval(poll, 2000);
+    return () => {
+      mounted = false;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  const startBatch = async () => {
+    const prompts = batchPrompts
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (!prompts.length) {
+      setError("Batch queue needs at least one prompt (one per line).");
+      return;
+    }
+    setBatchBusy(true);
+    setError("");
+    try {
+      setBatch(await createBatchQueue(prompts, quality));
+      setBatchPrompts("");
+    } catch (err) {
+      setError(`Batch queue failed to start: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
+  const batchAction = async (action: () => Promise<BatchManifest>) => {
+    setBatchBusy(true);
+    try {
+      setBatch(await action());
+    } catch (err) {
+      setError(`Batch queue action failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setBatchBusy(false);
+    }
+  };
   const [providers, setProviders] = useState<ProviderView[]>([]);
   const [runtimes, setRuntimes] = useState<RuntimeState[]>([]);
   const [runtimeHealth, setRuntimeHealth] = useState<Record<string, RuntimeStatus>>({});
@@ -190,6 +280,13 @@ export function HunyuanGeneratorPage({
   const [importingImage, setImportingImage] = useState(false);
   const [validationErrors, setValidationErrors] = useState<string[]>([]);
   const [error, setError] = useState("");
+  // Pipeline failures surface at the page-top banner; scroll it into view so a
+  // user watching the stage panel cannot miss why generation bounced back to
+  // the prompt step.
+  const errorBannerRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (error) errorBannerRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [error]);
   const activeJobId = useRef<string | null>(null);
   // Completed-3D auto-continue must fire once per asset; the workspace load
   // loop re-runs on an interval and would otherwise retry a failed Blender
@@ -347,7 +444,8 @@ export function HunyuanGeneratorPage({
       mounted = false;
       unlisten.then((stopListening) => stopListening());
     };
-  }, []);
+    // Re-run when the current project changes so assets/tray never go stale.
+  }, [currentProject?.root]);
 
   // Poll Active Job
   useEffect(() => {
@@ -390,6 +488,18 @@ export function HunyuanGeneratorPage({
             setRaw3dAssetId(rawId);
             void triggerBlenderProcessing(rawId);
           }
+        }
+
+        // When any pipeline job fails, surface the failure instead of spinning forever.
+        if (nextJob.status === "failed") {
+          const stage = nextJob.jobType === "image.generate" ? "Concept generation"
+            : nextJob.jobType === "hunyuan.generate" ? "3D generation"
+            : nextJob.jobType === "model3d.processing" ? "Blender optimization"
+            : "Generation";
+          const detail = nextJob.errorMessage || "The provider did not respond. Check that the provider is running and try again.";
+          setError(`${stage} failed: ${detail}`);
+          setFactoryStep("prompt");
+          return;
         }
 
         // When Blender processing completes
@@ -560,9 +670,10 @@ export function HunyuanGeneratorPage({
             negativePrompt: request.negativePrompt,
             sourceAssetId: request.sourceAssetId,
             profile: HUNYUAN_GENERATION_PROFILE_ID,
-            quality: HUNYUAN_QUALITY,
+            quality: quality,
             seed: randomSeed ? null : request.seed,
             outputFormat: HUNYUAN_OUTPUT_FORMAT,
+            generateTexture: request.generateTexture !== false,
           },
           providerId: "local.hunyuan",
         });
@@ -586,9 +697,10 @@ export function HunyuanGeneratorPage({
             negativePrompt: request.negativePrompt,
             sourceAssetId: null,
             profile: HUNYUAN_GENERATION_PROFILE_ID,
-            quality: HUNYUAN_QUALITY,
+            quality: quality,
             seed: randomSeed ? null : request.seed,
             outputFormat: HUNYUAN_OUTPUT_FORMAT,
+            generateTexture: request.generateTexture !== false,
           },
           providerId: "local.hunyuan",
         });
@@ -644,9 +756,10 @@ export function HunyuanGeneratorPage({
           negativePrompt: request.negativePrompt,
           sourceAssetId: conceptImageAssetId,
           profile: HUNYUAN_GENERATION_PROFILE_ID,
-          quality: HUNYUAN_QUALITY,
+          quality: quality,
           seed: randomSeed ? null : request.seed,
           outputFormat: HUNYUAN_OUTPUT_FORMAT,
+          generateTexture: request.generateTexture !== false,
         },
         providerId: "local.hunyuan",
       });
@@ -662,17 +775,29 @@ export function HunyuanGeneratorPage({
   // User Deploys to Unity (Checkpoint B)
   const handleDeployToUnity = async () => {
     const targetAssetId = processed3dAssetId || selectedAssetIdForViewer;
-    if (!targetAssetId || !unityProjectRoot || !final3dApproved) return;
-    
+    if (!targetAssetId || !final3dApproved) return;
+
     setActionLoading("deploy");
     setError("");
     try {
-      const val = await validateUnityProject(unityProjectRoot);
+      // Fall back to auto-discovery (and persist what we find) when the
+      // target field was never populated - e.g. discovery raced the page
+      // mount or the pipeline view was re-entered after approval.
+      let projectRoot = unityProjectRoot.trim();
+      if (!projectRoot) {
+        const discovered = await discoverUnityProject().catch(() => null);
+        if (!discovered) {
+          throw new Error("No Unity project directory set. Enter the target project path above.");
+        }
+        projectRoot = discovered;
+        setUnityProjectRoot(discovered);
+      }
+      const val = await validateUnityProject(projectRoot);
       setUnityValidation(val);
       if (!val.isValid) {
         throw new Error(val.errorMessage || "Invalid Unity project path. Must contain Assets/ and ProjectSettings/");
       }
-      const res = await deployModel3dToUnity(targetAssetId, "default-unity-target", unityCategory);
+      const res = await deployModel3dToUnity(targetAssetId, projectRoot, unityCategory);
       setDeploymentResult(res);
       setFactoryStep("completed");
       const nextAssets = await listAssets();
@@ -881,7 +1006,20 @@ export function HunyuanGeneratorPage({
         throw new Error(val.errorMessage || "Invalid Unity project path");
       }
       const assetId = reviewJobResult.assetIds[0];
-      const result = await deployModel3dToUnity(assetId, "default-unity-target", unityCategory);
+      // The backend interprets targetId as the Unity project ROOT path when
+      // non-empty (empty triggers auto-discovery). The old literal
+      // "default-unity-target" was treated as a relative path and made every
+      // deploy from this panel fail validation.
+      let deployRoot = unityProjectRoot.trim();
+      if (!deployRoot) {
+        const discovered = await discoverUnityProject().catch(() => null);
+        if (!discovered) {
+          throw new Error("No Unity project directory set. Enter the target project path above.");
+        }
+        deployRoot = discovered;
+        setUnityProjectRoot(discovered);
+      }
+      const result = await deployModel3dToUnity(assetId, deployRoot, unityCategory);
       setReviewDeploymentResult(result);
       setReviewDeploymentSuccess(true);
       const nextAssets = await listAssets();
@@ -1066,7 +1204,7 @@ export function HunyuanGeneratorPage({
         </div>
       </div>
 
-      {error && <div className="error-banner" role="alert">{error}</div>}
+      {error && <div className="error-banner" role="alert" ref={errorBannerRef}>{error}</div>}
 
       {/* Real-time Pipeline Visualizer */}
       <div className="factory-pipeline-tracker" aria-label="Pipeline Stages">
@@ -1212,6 +1350,82 @@ export function HunyuanGeneratorPage({
                     </button>
                   ))}
                 </div>
+              </div>
+
+              <div className="studio-field" style={{ marginTop: 16 }}>
+                <label className="form-field-label" htmlFor="hunyuan-quality-select">Generation Quality</label>
+                <select
+                  id="hunyuan-quality-select"
+                  className="studio-select"
+                  value={quality}
+                  onChange={(e) => setQuality(e.target.value as HunyuanGenerationQuality)}
+                >
+                  {HUNYUAN_QUALITY_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+                <small className="form-field-hint">{HUNYUAN_QUALITY_HINTS[quality]}</small>
+              </div>
+
+              {/* Overnight Batch Queue */}
+              <div className="studio-field" style={{ marginTop: 20, borderTop: "1px solid rgba(128,140,160,0.2)", paddingTop: 16 }}>
+                <label className="form-field-label">Overnight Batch Queue (one prompt per line)</label>
+                <textarea
+                  className="studio-textarea"
+                  rows={4}
+                  value={batchPrompts}
+                  onChange={(e) => setBatchPrompts(e.target.value)}
+                  placeholder={"futuristic neon sports car...\nrugged cyberpunk muscle car...\nsleek electric hypercar..."}
+                  disabled={batch?.status === "running"}
+                />
+                <small className="form-field-hint">
+                  Generates every prompt at {quality} quality, one after another, and survives app restarts —
+                  the queue resumes where it stopped. A1111 is parked automatically for the duration.
+                </small>
+                <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+                  {(!batch || batch.status === "completed" || batch.status === "cancelled") && (
+                    <button className="btn btn--primary" type="button" disabled={batchBusy || !batchPrompts.trim()} onClick={() => void startBatch()}>
+                      ⚡ Start Batch Queue
+                    </button>
+                  )}
+                  {batch?.status === "running" && (
+                    <button className="btn" type="button" disabled={batchBusy} onClick={() => void batchAction(pauseBatchQueue)}>
+                      ⏸ Pause
+                    </button>
+                  )}
+                  {batch?.status === "paused" && (
+                    <button className="btn btn--primary" type="button" disabled={batchBusy} onClick={() => void batchAction(resumeBatchQueue)}>
+                      ▶ Resume Queue
+                    </button>
+                  )}
+                  {(batch?.status === "running" || batch?.status === "paused") && (
+                    <button className="btn" type="button" disabled={batchBusy} onClick={() => void batchAction(cancelBatchQueue)}>
+                      ✖ Cancel Queue
+                    </button>
+                  )}
+                  {batch && (batch.status === "completed" || batch.status === "cancelled") && (
+                    <button className="btn" type="button" disabled={batchBusy} onClick={() => void batchAction(async () => { await clearActiveBatchQueue(); setBatch(null); return batch; })}>
+                      Clear Finished Queue
+                    </button>
+                  )}
+                </div>
+                {batch && (
+                  <div style={{ marginTop: 10 }}>
+                    <div className="image-provider-state" role="status">
+                      Queue {summarizeBatch(batch)} · status: {batch.status}
+                      {batch.note ? ` — ${batch.note}` : ""}
+                    </div>
+                    <div style={{ marginTop: 6, fontSize: 12.5, color: "#8b96a5" }}>
+                      {batch.items.map((item, index) => (
+                        <div key={index} title={item.error ?? undefined}>
+                          {item.status === "completed" ? "✅" : item.status === "failed" ? "❌" : item.status === "running" ? "⏳" : "•"}{" "}
+                          {item.prompt.length > 70 ? `${item.prompt.slice(0, 70)}…` : item.prompt}
+                          {item.error ? ` — ${item.error}` : ""}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
 
               <div className="unity-meta-info-grid" style={{ marginTop: 16 }}>
@@ -1378,6 +1592,7 @@ export function HunyuanGeneratorPage({
                   assetIds: processed3dAssetId ? [processed3dAssetId] : [],
                   processingStage: "complete",
                   progress: 100,
+                  pbrStats: null,
                   outputMasterPath: null,
                   lod0Path: null,
                   lod1Path: null,
@@ -1430,7 +1645,7 @@ export function HunyuanGeneratorPage({
                 <button
                   className="btn btn--primary"
                   type="button"
-                  disabled={actionLoading === "deploy" || !unityProjectRoot || !final3dApproved}
+                  disabled={actionLoading === "deploy" || !final3dApproved}
                   onClick={() => void handleDeployToUnity()}
                 >
                   {actionLoading === "deploy" ? "🚀 Exporting..." : "🚀 Deploy Approved Asset"}

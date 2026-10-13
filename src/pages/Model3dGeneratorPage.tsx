@@ -17,7 +17,8 @@ import { formatCapability, listProviders, presentFit, presentHealth } from "../s
 import {
   MODEL3D_GENERATION_PROFILE_ID,
   MODEL3D_OUTPUT_FORMAT,
-  MODEL3D_QUALITY,
+  MODEL3D_GENERATION_QUALITIES,
+  MODEL3D_DEFAULT_QUALITY,
   type AssetInfo,
   type JobInfo,
   type Model3dGenerationMode,
@@ -37,7 +38,7 @@ const initialRequest: Model3dGenerationRequest = {
   negativePrompt: null,
   sourceAssetId: null,
   profile: MODEL3D_GENERATION_PROFILE_ID,
-  quality: MODEL3D_QUALITY,
+  quality: MODEL3D_DEFAULT_QUALITY,
   seed: null,
   outputFormat: MODEL3D_OUTPUT_FORMAT,
 };
@@ -361,7 +362,9 @@ export function Model3dGeneratorPage({
           {request.mode === "image_to_3d" && <label style={{ marginTop: 14 }}>Managed source image<select value={request.sourceAssetId ?? ""} onChange={(event) => setRequest({ ...request, sourceAssetId: event.currentTarget.value || null })} required><option value="">Select a READY image</option>{sourceImages.map((asset) => <option value={asset.assetId} key={asset.assetId}>{asset.originalFilename} [{asset.assetId.slice(0, 8)}]</option>)}</select></label>}
           <div className="image-form-grid" style={{ marginTop: 14 }}>
             <label>Profile<input value={request.profile} readOnly /></label>
-            <label>Quality<input value={request.quality} readOnly /></label>
+            <label>Quality<select value={request.quality} onChange={(event) => setRequest({ ...request, quality: event.currentTarget.value as Model3dGenerationRequest["quality"] })}>
+              {MODEL3D_GENERATION_QUALITIES.map((quality) => <option key={quality} value={quality}>{quality === "high" ? "AAA (high)" : quality === "standard" ? "Standard" : "Draft (fast)"}</option>)}
+            </select></label>
             <label>Output<input value={request.outputFormat.toUpperCase()} readOnly /></label>
             <label>Seed<input type="number" min="0" step="1" disabled={randomSeed} value={request.seed ?? 0} onChange={(event) => setRequest({ ...request, seed: event.currentTarget.valueAsNumber })} /></label>
           </div>

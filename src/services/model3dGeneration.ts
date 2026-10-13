@@ -8,7 +8,11 @@ import type {
   Model3dGenerationResult,
   ProviderView,
 } from "../types/core";
-import { MODEL3D_GENERATION_PROFILE_ID, MODEL3D_OUTPUT_FORMAT, MODEL3D_QUALITY } from "../types/core";
+import {
+  MODEL3D_GENERATION_PROFILE_ID,
+  MODEL3D_OUTPUT_FORMAT,
+  MODEL3D_GENERATION_QUALITIES,
+} from "../types/core";
 
 const MANAGED_ASSET_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
@@ -33,7 +37,7 @@ export const validateModel3dGenerationRequest = (request: Model3dGenerationReque
   if (negativePromptLength > 2000) errors.push("Negative prompt must not exceed 2000 characters after trimming.");
   if (request.seed !== null && (!Number.isSafeInteger(request.seed) || request.seed < 0)) errors.push("Seed must be a nonnegative whole number or random.");
   if (request.profile !== MODEL3D_GENERATION_PROFILE_ID) errors.push(`Generation profile must be ${MODEL3D_GENERATION_PROFILE_ID}.`);
-  if (request.quality !== MODEL3D_QUALITY) errors.push(`Quality must be ${MODEL3D_QUALITY}.`);
+  if (!MODEL3D_GENERATION_QUALITIES.includes(request.quality)) errors.push(`Quality must be one of ${MODEL3D_GENERATION_QUALITIES.join(", ")}.`);
   if (request.outputFormat !== MODEL3D_OUTPUT_FORMAT) errors.push(`Output format must be ${MODEL3D_OUTPUT_FORMAT}.`);
   const sourceId = request.sourceAssetId ?? "";
   if (sourceId && !MANAGED_ASSET_ID.test(sourceId)) errors.push("Source asset ID must be a managed UUID, not a path.");

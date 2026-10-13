@@ -15,6 +15,79 @@ use uuid::Uuid;
 use crate::{project::ProjectState, providers::LicenseMetadata};
 
 pub const PROVIDER_ID: &str = "local.a1111";
+pub const CLOUD_PROVIDER_ID: &str = "cloud.gemini";
+/// Preferred Gemini image model (REST `generateContent`). Model availability
+/// varies by API key, so cloud jobs resolve this preference against Models.list.
+pub const CLOUD_DEFAULT_MODEL: &str = "gemini-nano-banana-2.1";
+const CLOUD_IMAGE_MODEL_FALLBACKS: &[&str] = &[
+    "gemini-nano-banana-2.1",
+    "gemini-3.1-flash-image",
+    "gemini-3-pro-image",
+    "gemini-3.1-flash-lite-image",
+    "gemini-2.5-flash-image",
+];
+pub const CLOUD_BASE_URL: &str = "https://generativelanguage.googleapis.com";
+/// An image job may take a while on the free tier; 300 s is the config cap.
+pub const CLOUD_TIMEOUT_SECONDS: u64 = 300;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiModelsResponse {
+    #[serde(default)]
+    models: Vec<GeminiModel>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiModel {
+    name: String,
+    #[serde(default)]
+    supported_generation_methods: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct GeminiApiErrorEnvelope {
+    error: Option<GeminiApiError>,
+}
+
+#[derive(Deserialize)]
+struct GeminiApiError {
+    message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GeminiImageResponse {
+    #[serde(default)]
+    candidates: Vec<GeminiCandidate>,
+}
+
+#[derive(Deserialize)]
+struct GeminiCandidate {
+    #[serde(default)]
+    content: Option<GeminiContent>,
+}
+
+#[derive(Deserialize)]
+struct GeminiContent {
+    #[serde(default)]
+    parts: Vec<GeminiPart>,
+}
+
+#[derive(Deserialize)]
+struct GeminiPart {
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(rename = "inlineData", alias = "inline_data")]
+    inline_data: Option<GeminiInlineData>,
+}
+
+#[derive(Deserialize)]
+struct GeminiInlineData {
+    #[serde(rename = "mimeType", alias = "mime_type", default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    data: String,
+}
 pub const PROVIDER_VERSION: &str = "1.0.0";
 pub const IMAGE_JOB_TYPE: &str = "image.generate";
 const CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -30,6 +103,13 @@ pub struct ImageProviderConfig {
     pub provider_id: String,
     pub base_url: String,
     pub timeout_seconds: u64,
+    /// AI Studio key for the cloud Gemini (Nano Banana) image provider.
+    /// Present only when that provider is active; local.a1111 ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gemini_api_key: Option<String>,
+    /// Image model id for the cloud provider (e.g. "gemini-nano-banana-2.1").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gemini_model: Option<String>,
 }
 
 impl Default for ImageProviderConfig {
@@ -40,6 +120,8 @@ impl Default for ImageProviderConfig {
             provider_id: PROVIDER_ID.into(),
             base_url: "http://127.0.0.1:7860".into(),
             timeout_seconds: 60,
+            gemini_api_key: None,
+            gemini_model: None,
         }
     }
 }
@@ -155,6 +237,11 @@ pub struct ImageJobPayload {
     pub provider_version: String,
     pub provider_license: LicenseMetadata,
     pub request: ImageGenerationRequest,
+    /// Cloud-only: AI Studio key captured at job creation so the worker
+    /// thread can call generateContent without reading the LLM config.
+    /// None for local.a1111 jobs; never serialized to the UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gemini_api_key: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -180,14 +267,20 @@ pub enum ImageError {
     InvalidConfig(String),
     #[error("invalid image generation request: {0}")]
     InvalidRequest(String),
-    #[error("local image provider unavailable: {0}")]
+    #[error("image provider unavailable: {0}")]
     Unavailable(String),
-    #[error("local image provider timed out")]
+    #[error("image provider timed out")]
     Timeout,
-    #[error("local image provider returned retryable status {0}")]
+    #[error("image provider returned retryable status {0}")]
     Server(u16),
+    #[error("generated concept was cropped (subject touches the image edge); retrying with a fresh seed")]
+    CroppedComposition,
+    #[error("generated concept still failed the 3D-safety gate after all retries (subject too large in frame or cropped)")]
+    CompositionRejected,
     #[error("local image provider rejected request with status {0}")]
     Rejected(u16),
+    #[error("Gemini image provider rejected request (HTTP {status}): {message}")]
+    CloudRejected { status: u16, message: String },
     #[error("malformed local image provider output: {0}")]
     Malformed(String),
     #[error("io error: {0}")]
@@ -200,7 +293,18 @@ pub enum ImageError {
 
 impl ImageError {
     pub fn retryable(&self) -> bool {
-        matches!(self, Self::Unavailable(_) | Self::Timeout | Self::Server(_))
+        matches!(
+            self,
+            Self::Unavailable(_) | Self::Timeout | Self::Server(_) | Self::CroppedComposition
+        )
+    }
+
+    /// True when the request payload should be mutated before the next
+    /// attempt. Cropped compositions get a fresh seed (an unchanged requeue
+    /// would reproduce the identical framing) and an escalated CFG, which
+    /// pushes the composition away from the model's close-up prior.
+    pub fn needs_reseed(&self) -> bool {
+        matches!(self, Self::CroppedComposition)
     }
 }
 
@@ -221,6 +325,26 @@ fn endpoint(config: &ImageProviderConfig, path: &str) -> Result<Url, ImageError>
 }
 
 pub fn health(config: &ImageProviderConfig) -> Result<(), ImageError> {
+    if config.gemini_api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
+        // Cloud Gemini: the key itself is the only requirement. A cheap
+        // models.list call proves the key actually works.
+        if !config.enabled {
+            return Err(ImageError::Unavailable(
+                "provider is not configured or enabled".into(),
+            ));
+        }
+        let url = format!("{}/v1/models", crate::image_generation::CLOUD_BASE_URL);
+        let response = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .map_err(|error| ImageError::Http(error.to_string()))?
+            .get(&url)
+            .header("x-goog-api-key", config.gemini_api_key.clone().unwrap_or_default())
+            .send()
+            .map_err(classify_transport)?;
+        return classify_status(response.status());
+    }
     if !config.enabled {
         return Err(ImageError::Unavailable(
             "provider is not configured or enabled".into(),
@@ -239,10 +363,39 @@ pub fn execute_http(
     config: &ImageProviderConfig,
 ) -> Result<Vec<u8>, ImageError> {
     validate_payload(payload)?;
+    let request = &payload.request;
+    if payload.provider_id == CLOUD_PROVIDER_ID {
+        // Cloud jobs carry their own key and must not depend on the separate
+        // local A1111 provider toggle being enabled.
+        return execute_cloud(request, config, payload.gemini_api_key.as_deref());
+    }
     if !config.enabled {
         return Err(ImageError::Unavailable("provider is disabled".into()));
     }
-    let request = &payload.request;
+    #[cfg(not(test))]
+    {
+        // A long-running A1111 instance can wedge: the API answers but every
+        // txt2img returns 500 (observed on 4GB GPUs sharing VRAM with
+        // Hunyuan3D). Probe with a tiny generation first; on failure, wait
+        // and probe once more before the real request so a transient wedge
+        // clears without failing the job (the job-level retry then only
+        // handles genuine failures).
+        let probe = serde_json::json!({
+            "prompt": "health probe", "width": 64, "height": 64, "steps": 1,
+            "seed": 0, "batch_size": 1, "n_iter": 1, "send_images": false, "save_images": false
+        });
+        let probe_client = client(config)?;
+        for attempt in 0..2 {
+            let endpoint = endpoint(config, "/sdapi/v1/txt2img")?;
+            match probe_client.post(endpoint).json(&probe).send() {
+                Ok(response) if response.status().is_success() => break,
+                _ if attempt == 0 => {
+                    std::thread::sleep(Duration::from_secs(8));
+                }
+                _ => {}
+            }
+        }
+    }
     let body = serde_json::json!({
         "prompt": request.prompt,
         "negative_prompt": request.negative_prompt.as_deref().unwrap_or(""),
@@ -272,6 +425,183 @@ pub fn execute_http(
         return Err(ImageError::Malformed("response exceeds 40 MiB".into()));
     }
     Ok(bytes)
+}
+
+/// Cloud Gemini (Nano Banana) text-to-image. Returns raw JSON so the
+/// existing parse path can stage/promote outputs unchanged.
+fn execute_cloud(
+    request: &ImageGenerationRequest,
+    config: &ImageProviderConfig,
+    payload_key: Option<&str>,
+) -> Result<Vec<u8>, ImageError> {
+    execute_cloud_at(request, config, payload_key, CLOUD_BASE_URL)
+}
+
+fn execute_cloud_at(
+    request: &ImageGenerationRequest,
+    config: &ImageProviderConfig,
+    payload_key: Option<&str>,
+    base_url: &str,
+) -> Result<Vec<u8>, ImageError> {
+    let key = payload_key
+        .or_else(|| config.gemini_api_key.as_deref())
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| {
+            ImageError::InvalidConfig("geminiApiKey missing for cloud.gemini job".into())
+        })?;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(CLOUD_TIMEOUT_SECONDS))
+        .build()
+        .map_err(|error| ImageError::Http(error.to_string()))?;
+    let models_url = format!("{}/v1/models", base_url.trim_end_matches('/'));
+    let mut models_response = client
+        .get(&models_url)
+        .header("x-goog-api-key", key)
+        .send()
+        .map_err(classify_transport)?;
+    classify_cloud_status(&mut models_response)?;
+    let mut models_bytes = Vec::new();
+    models_response
+        .by_ref()
+        .take(MAX_RESPONSE_BYTES + 1)
+        .read_to_end(&mut models_bytes)
+        .map_err(classify_body_io)?;
+    if models_bytes.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err(ImageError::Malformed("Gemini model list exceeds 40 MiB".into()));
+    }
+    let models: GeminiModelsResponse = serde_json::from_slice(&models_bytes)
+        .map_err(|_| ImageError::Malformed("invalid Gemini model-list JSON".into()))?;
+    let preferred_model = config
+        .gemini_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .unwrap_or(CLOUD_DEFAULT_MODEL);
+    let model = resolve_cloud_image_model(&models, preferred_model)?;
+    let url = format!(
+        "{}/v1/models/{}:generateContent",
+        base_url.trim_end_matches('/'), model
+    );
+    // When two variants are requested we ask twice — Nano Banana always
+    // returns exactly one image per call.
+    let mut encoded = Vec::new();
+    for index in 0..request.output_count {
+        if index > 0 {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        let body = serde_json::json!({
+            "contents": [{
+                "role": "user",
+                "parts": [{"text": request.prompt}]
+            }],
+            "generationConfig": {
+                "responseModalities": ["TEXT", "IMAGE"]
+            }
+        });
+        let mut response = client
+            .post(&url)
+            .header("x-goog-api-key", key)
+            .json(&body)
+            .send()
+            .map_err(classify_transport)?;
+        classify_cloud_status(&mut response)?;
+        let mut bytes = Vec::new();
+        response
+            .by_ref()
+            .take(MAX_RESPONSE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(classify_body_io)?;
+        if bytes.len() as u64 > MAX_RESPONSE_BYTES {
+            return Err(ImageError::Malformed("response exceeds 40 MiB".into()));
+        }
+        let parsed: GeminiImageResponse = serde_json::from_slice(&bytes)
+            .map_err(|_| ImageError::Malformed("invalid Gemini response JSON".into()))?;
+        let data = parsed
+            .candidates
+            .iter()
+            .filter_map(|c| c.content.as_ref())
+            .flat_map(|c| c.parts.iter())
+            .find_map(|p| p.inline_data.as_ref())
+            .ok_or_else(|| {
+                ImageError::Malformed("no image data in Gemini response".into())
+            })?;
+        encoded.push(data.data.clone());
+    }
+    // A1111-style wrapper: parse_response reads images[] + optional info.
+    let wrapper = serde_json::json!({
+        "images": encoded,
+        "info": serde_json::json!({ "model": model })
+    })
+    .to_string()
+    .into_bytes();
+    Ok(wrapper)
+}
+
+fn resolve_cloud_image_model(
+    models: &GeminiModelsResponse,
+    preferred_model: &str,
+) -> Result<String, ImageError> {
+    let has_generate_content = |model_id: &str| {
+        models.models.iter().any(|model| {
+            model.name.strip_prefix("models/").unwrap_or(&model.name) == model_id
+                && model
+                    .supported_generation_methods
+                    .iter()
+                    .any(|method| method == "generateContent")
+        })
+    };
+
+    if has_generate_content(preferred_model) {
+        return Ok(preferred_model.to_string());
+    }
+    CLOUD_IMAGE_MODEL_FALLBACKS
+        .iter()
+        .copied()
+        .find(|model_id| has_generate_content(model_id))
+        .map(str::to_string)
+        .ok_or_else(|| {
+            ImageError::InvalidConfig(
+                "this Gemini API key has no supported image-generation model; enable Gemini image generation for the key in Google AI Studio".into(),
+            )
+        })
+}
+
+fn classify_cloud_status(response: &mut reqwest::blocking::Response) -> Result<(), ImageError> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    if status.is_server_error()
+        || status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+    {
+        return classify_status(status);
+    }
+
+    const MAX_ERROR_BYTES: u64 = 8 * 1024;
+    let mut bytes = Vec::new();
+    response
+        .by_ref()
+        .take(MAX_ERROR_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(classify_body_io)?;
+    let message = if bytes.len() as u64 > MAX_ERROR_BYTES {
+        "provider error details exceeded the size limit".to_string()
+    } else {
+        serde_json::from_slice::<GeminiApiErrorEnvelope>(&bytes)
+            .ok()
+            .and_then(|body| body.error)
+            .and_then(|error| error.message)
+            .map(|message| message.chars().take(500).collect::<String>())
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or_else(|| "the model or request is not available to this API key".into())
+    };
+    Err(ImageError::CloudRejected {
+        status: status.as_u16(),
+        message,
+    })
 }
 
 fn classify_body_io(error: std::io::Error) -> ImageError {
@@ -429,7 +759,7 @@ fn output_seeds(
 }
 
 pub fn validate_payload(payload: &ImageJobPayload) -> Result<(), ImageError> {
-    if payload.provider_id != PROVIDER_ID
+    if !matches!(payload.provider_id.as_str(), PROVIDER_ID | CLOUD_PROVIDER_ID)
         || payload.provider_version != PROVIDER_VERSION
         || payload.request.seed.is_none()
     {
@@ -605,6 +935,8 @@ pub struct ImageGenerationResult {
     pub job_id: String,
     pub status: String,
     pub asset_ids: Vec<String>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
 }
 
 pub fn get_result(
@@ -613,11 +945,11 @@ pub fn get_result(
 ) -> Result<ImageGenerationResult, ImageError> {
     Uuid::parse_str(job_id).map_err(|_| ImageError::InvalidRequest("invalid job id".into()))?;
     let db = project.db.lock().unwrap();
-    let status: String = db
+    let (status, error_code, error_message): (String, Option<String>, Option<String>) = db
         .query_row(
-            "SELECT status FROM jobs WHERE job_id=?1 AND job_type='image.generate'",
+            "SELECT status, error_code, error_message FROM jobs WHERE job_id=?1 AND job_type='image.generate'",
             [job_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|error| ImageError::InvalidRequest(error.to_string()))?;
     let mut statement = db
@@ -634,6 +966,8 @@ pub fn get_result(
         job_id: job_id.into(),
         status,
         asset_ids,
+        error_code,
+        error_message,
     })
 }
 
@@ -701,41 +1035,48 @@ mod tests {
                 source_reference: None,
             },
             request: request(1),
+            gemini_api_key: None,
         }
     }
 
     fn http_fixture(response: Vec<u8>) -> (String, mpsc::Receiver<Vec<u8>>) {
+        http_fixture_sequence(vec![response])
+    }
+
+    fn http_fixture_sequence(responses: Vec<Vec<u8>>) -> (String, mpsc::Receiver<Vec<u8>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 4096];
-            loop {
-                let count = stream.read(&mut buffer).unwrap();
-                request.extend_from_slice(&buffer[..count]);
-                let header_end = request.windows(4).position(|value| value == b"\r\n\r\n");
-                if let Some(header_end) = header_end {
-                    let headers = String::from_utf8_lossy(&request[..header_end]);
-                    let content_length = headers
-                        .lines()
-                        .find_map(|line| {
-                            line.to_ascii_lowercase()
-                                .strip_prefix("content-length: ")
-                                .and_then(|value| value.parse::<usize>().ok())
-                        })
-                        .unwrap_or(0);
-                    if request.len() >= header_end + 4 + content_length {
-                        break;
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let count = stream.read(&mut buffer).unwrap();
+                    request.extend_from_slice(&buffer[..count]);
+                    let header_end = request.windows(4).position(|value| value == b"\r\n\r\n");
+                    if let Some(header_end) = header_end {
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .and_then(|value| value.parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= header_end + 4 + content_length {
+                            break;
+                        }
                     }
                 }
+                sender.send(request).unwrap();
+                stream.write_all(&response).unwrap();
             }
-            let _ = sender.send(request);
-            stream.write_all(&response).unwrap();
         });
         (format!("http://{address}"), receiver)
     }
@@ -886,6 +1227,83 @@ mod tests {
         assert!(ImageError::Timeout.retryable());
         assert!(ImageError::Unavailable("offline".into()).retryable());
         assert!(!ImageError::Malformed("bad image".into()).retryable());
+    }    #[test]
+    fn cloud_image_job_discovers_key_available_model_and_works_when_local_provider_is_disabled() {
+        let image_data = encoded(ImageFormat::Png);
+        let models = serde_json::to_vec(&serde_json::json!({
+            "models": [
+                {"name": "models/gemini-2.5-flash-image", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-3.1-flash-image", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-nano-banana-2.1", "supportedGenerationMethods": ["countTokens"]}
+            ]
+        })).unwrap();
+        let generated = serde_json::to_vec(&serde_json::json!({
+            "candidates": [{"content": {"parts": [
+                {"text": "A test image"},
+                {"inlineData": {"mimeType": "image/png", "data": image_data}}
+            ]}}]
+        })).unwrap();
+        let (base_url, captured) = http_fixture_sequence(vec![
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", models.len())
+                .into_bytes().into_iter().chain(models).collect(),
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", generated.len())
+                .into_bytes().into_iter().chain(generated).collect(),
+        ]);
+        let config = ImageProviderConfig {
+            enabled: false,
+            gemini_model: Some(CLOUD_DEFAULT_MODEL.into()),
+            ..ImageProviderConfig::default()
+        };
+        let mut cloud_payload = payload();
+        cloud_payload.provider_id = CLOUD_PROVIDER_ID.into();
+        cloud_payload.gemini_api_key = Some("test-api-key".into());
+        let bytes = execute_cloud_at(&cloud_payload.request, &config, cloud_payload.gemini_api_key.as_deref(), &base_url).unwrap();
+        let wrapper: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(wrapper["info"]["model"], "gemini-3.1-flash-image");
+        assert_eq!(wrapper["images"].as_array().unwrap().len(), 1);
+
+        let list_request = String::from_utf8(captured.recv().unwrap()).unwrap();
+        assert!(list_request.starts_with("GET /v1/models HTTP/1.1"));
+        assert!(list_request.to_ascii_lowercase().contains("x-goog-api-key: test-api-key"));
+        let generate_request = String::from_utf8(captured.recv().unwrap()).unwrap();
+        assert!(generate_request.starts_with("POST /v1/models/gemini-3.1-flash-image:generateContent HTTP/1.1"));
+        let request_json: serde_json::Value = serde_json::from_str(generate_request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(request_json["contents"][0]["parts"][0]["text"], "fixture");
+    }
+
+    #[test]
+    fn cloud_model_selection_prefers_configured_available_model_and_requires_generation_method() {
+        let models: GeminiModelsResponse = serde_json::from_value(serde_json::json!({
+            "models": [
+                {"name": "models/custom-image-model", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-3.1-flash-image", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-nano-banana-2.1", "supportedGenerationMethods": ["countTokens"]}
+            ]
+        })).unwrap();
+        assert_eq!(resolve_cloud_image_model(&models, "custom-image-model").unwrap(), "custom-image-model");
+        assert_eq!(resolve_cloud_image_model(&models, CLOUD_DEFAULT_MODEL).unwrap(), "gemini-3.1-flash-image");
+        let unavailable = GeminiModelsResponse { models: vec![] };
+        assert!(matches!(resolve_cloud_image_model(&unavailable, CLOUD_DEFAULT_MODEL), Err(ImageError::InvalidConfig(message)) if message.contains("no supported image-generation model")));
+    }
+
+    #[test]
+    fn cloud_errors_preserve_google_reason_without_retrying_permanent_404s() {
+        // Content-Length must match the real body size — a lying header would
+        // make reqwest short-read and lose the parsed error message.
+        let body = b"{\"error\":{\"message\":\"Not found.\"}}".to_vec();
+        let (base_url, _captured) = http_fixture(
+            format!("HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
+                .into_bytes()
+                .into_iter()
+                .chain(body)
+                .collect(),
+        );
+        let client = Client::builder().no_proxy().build().unwrap();
+        let mut response = client.get(format!("{base_url}/missing")).send().unwrap();
+        let error = classify_cloud_status(&mut response).unwrap_err();
+        assert!(matches!(error, ImageError::CloudRejected { status: 404, ref message } if message.contains("Not found")));
+        assert!(!error.retryable());
+        assert!(error.to_string().contains("Gemini image provider"));
     }
 
     #[test]
@@ -919,7 +1337,7 @@ mod tests {
         assert_eq!(json["seed"], 7);
         assert_eq!(json["save_images"], false);
 
-        let (base_url, _) = http_fixture(
+        let (base_url, _captured) = http_fixture(
             b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/elsewhere\r\nContent-Length: 0\r\n\r\n".to_vec(),
         );
         let config = ImageProviderConfig {

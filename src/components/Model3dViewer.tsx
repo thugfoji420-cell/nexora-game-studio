@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import * as THREE from "three";
 import { GLTFLoader, OrbitControls } from "three-stdlib";
 
@@ -108,7 +109,9 @@ export function Model3dViewer({ assetId, presetView = "perspective", onLoad, onE
 
         // Load GLB
         const loader = new GLTFLoader();
-        const url = `nexora-media://${assetId}`;
+        // convertFileSrc maps to the scheme URL WebView2 can actually fetch
+        // (http://<scheme>.localhost/<id> on Windows); a raw nexora-media:// URL fails.
+        const url = convertFileSrc(assetId, "nexora-media");
         
         const gltf = await loader.loadAsync(url);
         
@@ -240,8 +243,9 @@ export function Model3dViewer({ assetId, presetView = "perspective", onLoad, onE
           const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
           for (const mat of mats) {
             Object.values(mat).forEach((value) => {
-              if (value && typeof value === "object" && "dispose" in value) {
-                (value as any).dispose?.();
+              const candidate = value as { dispose?: unknown } | null;
+              if (candidate && typeof candidate.dispose === "function") {
+                (candidate.dispose as () => void)();
               }
             });
           }

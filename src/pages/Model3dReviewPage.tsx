@@ -50,7 +50,7 @@ export function Model3dReviewPage() {
   // Unity Deployment State
   const [unityProjectRoot, setUnityProjectRoot] = useState<string>("");
   const [unityCategory, setUnityCategory] = useState<string>("Vehicle");
-  const [unityValidation, setUnityValidation] = useState<{ isValid: boolean; unityVersion: string | null; error?: string | null } | null>(null);
+  const [unityValidation, setUnityValidation] = useState<{ isValid: boolean; unityVersion: string | null; errorMessage?: string | null } | null>(null);
   const [deploying, setDeploying] = useState(false);
   const [deploymentResult, setDeploymentResult] = useState<UnityDeploymentDto | null>(null);
   const [deploymentSuccess, setDeploymentSuccess] = useState(false);
@@ -82,10 +82,9 @@ export function Model3dReviewPage() {
         }
       }
       
-      // Auto-select the most recent READY_FOR_REVIEW or NEEDS_REVIEW job
-      const reviewJobs = processingJobs.filter((j: JobInfo) => 
-        j.status === "completed" && (j.errorCode === "READY_FOR_REVIEW" || j.errorCode === "NEEDS_REVIEW")
-      );
+      // Auto-select the most recent completed processing job. The per-asset
+      // approvalStatus (not job error_code) drives the Approve/Deploy gates.
+      const reviewJobs = processingJobs.filter((j: JobInfo) => j.status === "completed");
       if (reviewJobs.length > 0 && !selectedJobId) {
         reviewJobs.sort((a: JobInfo, b: JobInfo) => b.createdAtMs - a.createdAtMs);
         setSelectedJobId(reviewJobs[0].jobId);
@@ -123,9 +122,7 @@ export function Model3dReviewPage() {
           }
         }
         
-        const reviewJobs = processingJobs.filter((j: JobInfo) => 
-          j.status === "completed" && (j.errorCode === "READY_FOR_REVIEW" || j.errorCode === "NEEDS_REVIEW")
-        );
+        const reviewJobs = processingJobs.filter((j: JobInfo) => j.status === "completed");
         if (reviewJobs.length > 0 && !selectedJobId) {
           reviewJobs.sort((a: JobInfo, b: JobInfo) => b.createdAtMs - a.createdAtMs);
           setSelectedJobId(reviewJobs[0].jobId);
@@ -200,13 +197,13 @@ export function Model3dReviewPage() {
       const val = await validateUnityProject(path);
       setUnityValidation(val);
     } catch (e) {
-      setUnityValidation({ isValid: false, unityVersion: null, error: String(e) });
+      setUnityValidation({ isValid: false, unityVersion: null, errorMessage: String(e) });
     }
   };
 
   const handleDeployToUnity = async () => {
     const approved = jobResult?.assetIds[0] && assets.find((asset) => asset.assetId === jobResult.assetIds[0])?.approvalStatus === "approved";
-    if (!jobResult || jobResult.assetIds.length === 0 || !unityProjectRoot || !approved) {
+    if (!jobResult || jobResult.assetIds.length === 0 || !approved) {
       setError("Approve the cleaned 3D asset before deploying it to an engine.");
       return;
     }
@@ -214,13 +211,24 @@ export function Model3dReviewPage() {
     setError("");
     setDeploymentSuccess(false);
     try {
-      const val = await validateUnityProject(unityProjectRoot);
+      // Fall back to auto-discovery when the target field was never
+      // populated; the backend also discovers when given an empty target.
+      let projectRoot = unityProjectRoot.trim();
+      if (!projectRoot) {
+        const discovered = await discoverUnityProject().catch(() => null);
+        if (!discovered) {
+          throw new Error("No Unity project directory set. Enter the target project path.");
+        }
+        projectRoot = discovered;
+        setUnityProjectRoot(discovered);
+      }
+      const val = await validateUnityProject(projectRoot);
       setUnityValidation(val);
       if (!val.isValid) {
         throw new Error(val.errorMessage || "Invalid Unity project path");
       }
       const assetId = jobResult.assetIds[0];
-      const result = await deployModel3dToUnity(assetId, "default-unity-target", unityCategory);
+      const result = await deployModel3dToUnity(assetId, projectRoot, unityCategory);
       setDeploymentResult(result);
       setDeploymentSuccess(true);
       const nextAssets = await listAssets();
@@ -376,6 +384,23 @@ export function Model3dReviewPage() {
                   <span className={`review-stage ${jobResult.processingStage ? "review-stage--complete" : ""}`}>
                     {jobResult.processingStage || "Complete"}
                   </span>
+                  {jobResult.pbrStats && ((jobResult.pbrStats.normal_maps_created ?? 0) > 0 || (jobResult.pbrStats.quality_score ?? 0) >= 75) && (
+                    <span
+                      className="review-stage review-stage--complete"
+                      title={`PBR upgrade: ${[
+                        jobResult.pbrStats.quality_score != null ? `${jobResult.pbrStats.quality_score}/100 ${jobResult.pbrStats.quality_rating ?? ""}`.trim() : null,
+                        jobResult.pbrStats.segmentation_classes?.length ? `materials: ${jobResult.pbrStats.segmentation_classes.join(", ")}` : null,
+                        (jobResult.pbrStats.normal_maps_created ?? 0) > 0 ? `${jobResult.pbrStats.normal_maps_created}x normal map` : null,
+                        (jobResult.pbrStats.roughness_maps_created ?? 0) > 0 ? `${jobResult.pbrStats.roughness_maps_created}x roughness map` : null,
+                        jobResult.pbrStats.ao_baked ? "AO baked" : null,
+                        (jobResult.pbrStats.metallic_clamped ?? 0) > 0 ? `${jobResult.pbrStats.metallic_clamped}x metallic clamped to dielectric` : null,
+                      ].filter(Boolean).join(", ")}`}
+                    >
+                      {jobResult.pbrStats.quality_score != null
+                        ? `${jobResult.pbrStats.quality_score >= 90 ? "AAA" : "QA"} ${jobResult.pbrStats.quality_score}/100`
+                        : "PBR ✓"}
+                    </span>
+                  )}
                 </div>
               </header>
 
@@ -483,7 +508,7 @@ export function Model3dReviewPage() {
                       <div className={`unity-validation-tag ${unityValidation.isValid ? "unity-validation--valid" : "unity-validation--invalid"}`}>
                         {unityValidation.isValid
                           ? `✅ Valid Unity Project (${unityValidation.unityVersion || "Version detected"})`
-                          : `⚠️ Unity Project Check Failed: ${unityValidation.error || "Missing Assets/ or ProjectSettings/"}`}
+                          : `⚠️ Unity Project Check Failed: ${unityValidation.errorMessage || "Missing Assets/ or ProjectSettings/"}`}
                       </div>
                     )}
 
@@ -510,7 +535,7 @@ export function Model3dReviewPage() {
                     <button
                       className="btn btn--primary btn--large unity-deploy-btn"
                       type="button"
-                      disabled={deploying || !selectedAssetApproved || !unityProjectRoot || !unityValidation?.isValid || jobResult.assetIds.length === 0}
+                      disabled={deploying || !selectedAssetApproved || jobResult.assetIds.length === 0}
                       onClick={handleDeployToUnity}
                     >
                       {deploying ? "📦 Deploying..." : selectedAssetApproved ? "🚀 Deploy Approved Asset" : "🔒 Approve Asset to Deploy"}

@@ -254,13 +254,23 @@ impl ProjectState {
         db.pragma_update(None, "foreign_keys", true)?;
         let foreign_key_error = db
             .prepare("PRAGMA foreign_key_check")?
-            .query_map([], |_| Ok(()))?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                ))
+            })?
             .next()
             .transpose()?;
-        if foreign_key_error.is_some() {
-            return Err(ProjectError::Manifest(
-                "database foreign key check failed after migration".into(),
-            ));
+        if let Some((table, rowid)) = foreign_key_error {
+            // Orphaned rows (e.g. events referencing a deleted job) must not
+            // brick the project: delete the offending row and continue.
+            let deleted = db.execute(&format!("DELETE FROM {table} WHERE rowid=?1"), [rowid])?;
+            if deleted == 0 {
+                return Err(ProjectError::Manifest(format!(
+                    "database foreign key violation in {table} row {rowid} could not be repaired"
+                )));
+            }
         }
 
         // Migration 9: unity_delivery
@@ -319,6 +329,16 @@ impl ProjectState {
         })?;
         if version < 13 {
             let migration = db.execute_batch(include_str!("../migrations/013_material_status_widen.sql"));
+            db.pragma_update(None, "foreign_keys", true)?;
+            migration?;
+        }
+
+        // Migration 14: code agent audit trail (runs / steps / file writes).
+        let version: u32 = db.query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+            row.get(0)
+        })?;
+        if version < 14 {
+            let migration = db.execute_batch(include_str!("../migrations/014_code_agent_runs.sql"));
             db.pragma_update(None, "foreign_keys", true)?;
             migration?;
         }
@@ -812,7 +832,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             (assets, jobs, events, version, source.as_str()),
-            (1, 0, 0, 13, "imported")
+            (1, 0, 0, 14, "imported")
         );
     }
 
@@ -845,7 +865,7 @@ mod tests {
             db.query_row("SELECT COUNT(*) FROM job_events WHERE job_id='job-1'", [], |row| row.get(0))?,
             db.query_row("SELECT MAX(version) FROM schema_version", [], |row| row.get(0))?,
         ))).unwrap();
-        assert_eq!(preserved, (1, 1, 1, 13));
+        assert_eq!(preserved, (1, 1, 1, 14));
         project.with_db(|db| {
             db.execute("INSERT INTO jobs (job_id, job_type, status, payload_json, created_at_ms, updated_at_ms, max_attempts) VALUES ('job-2', 'provider.diagnostic', 'queued', '{}', 3, 3, 1)", [])?;
             Ok(())
@@ -884,7 +904,7 @@ mod tests {
             db.query_row("SELECT media_width FROM assets WHERE asset_id='image-asset'", [], |row| row.get(0))?,
             db.query_row("SELECT MAX(version) FROM schema_version", [], |row| row.get(0))?,
         ))).unwrap();
-        assert_eq!(preserved, (1, 1, 1, "image".into(), Some(64), 13));
+        assert_eq!(preserved, (1, 1, 1, "image".into(), Some(64), 14));
     }
 
     #[test]

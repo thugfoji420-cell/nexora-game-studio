@@ -56,7 +56,7 @@ impl Model3dGenerationRequest {
                 .as_ref()
                 .is_some_and(|value| value.chars().count() > MAX_PROMPT_CHARS)
             || self.profile != PROFILE_ID
-            || self.quality != "standard"
+            || !matches!(self.quality.as_str(), "draft" | "standard" | "high")
             || self.seed.is_some_and(|seed| seed < 0)
             || self.output_format != "glb"
         {
@@ -421,6 +421,18 @@ mod tests {
             serde_json::to_string(&crate::providers::Capability::Model3dImageTo3d).unwrap(),
             "\"model3d.image_to_3d\""
         );
+    }
+
+    #[test]
+    fn quality_presets_are_accepted_and_unknown_rejected() {
+        for quality in ["draft", "standard", "high"] {
+            let mut value = request(None);
+            value.quality = quality.into();
+            assert!(value.normalize().is_ok(), "{quality} must be accepted");
+        }
+        let mut value = request(None);
+        value.quality = "ultra".into();
+        assert!(value.normalize().is_err());
     }
 
     #[test]

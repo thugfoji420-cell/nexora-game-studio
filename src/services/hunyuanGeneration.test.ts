@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { JobInfo, HunyuanGenerationRequest, ProviderView } from "../types/core";
-import { HUNYUAN_GENERATION_PROFILE_ID, HUNYUAN_OUTPUT_FORMAT, HUNYUAN_QUALITY } from "../types/core";
+import {
+  HUNYUAN_GENERATION_PROFILE_ID,
+  HUNYUAN_OUTPUT_FORMAT,
+  HUNYUAN_GENERATION_QUALITIES,
+  HUNYUAN_DEFAULT_QUALITY,
+} from "../types/core";
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
@@ -24,7 +29,7 @@ const request = (overrides: Partial<HunyuanGenerationRequest> = {}): HunyuanGene
   negativePrompt: null,
   sourceAssetId: null,
   profile: HUNYUAN_GENERATION_PROFILE_ID,
-  quality: HUNYUAN_QUALITY,
+  quality: HUNYUAN_DEFAULT_QUALITY,
   seed: null,
   outputFormat: HUNYUAN_OUTPUT_FORMAT,
   ...overrides,
@@ -106,7 +111,10 @@ describe("Hunyuan generation service", () => {
     expect(validateHunyuanGenerationRequest(request({ seed: -1 }))).toContain("Seed must be a nonnegative whole number or random.");
     expect(validateHunyuanGenerationRequest(request({ seed: 1.5 }))).toContain("Seed must be a nonnegative whole number or random.");
     expect(validateHunyuanGenerationRequest(request({ profile: "other" as typeof HUNYUAN_GENERATION_PROFILE_ID }))).not.toEqual([]);
-    expect(validateHunyuanGenerationRequest(request({ quality: "draft" as typeof HUNYUAN_QUALITY }))).not.toEqual([]);
+    for (const quality of HUNYUAN_GENERATION_QUALITIES) {
+      expect(validateHunyuanGenerationRequest(request({ quality }))).toEqual([]);
+    }
+    expect(validateHunyuanGenerationRequest(request({ quality: "ultra" as (typeof HUNYUAN_GENERATION_QUALITIES)[number] }))).toContain("Quality must be one of draft, standard, high.");
     expect(validateHunyuanGenerationRequest(request({ outputFormat: "gltf" as typeof HUNYUAN_OUTPUT_FORMAT }))).not.toEqual([]);
     expect(validateHunyuanGenerationRequest(request({ prompt: " ", negativePrompt: "x".repeat(2001) }))).toHaveLength(2);
     expect(validateHunyuanGenerationRequest({ ...request(), schemaVersion: 2 as 1, mode: "mesh" as "text_to_3d" })).toHaveLength(2);

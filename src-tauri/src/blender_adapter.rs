@@ -61,6 +61,14 @@ pub fn resolve_script_path(configured: Option<&Path>) -> Result<PathBuf, Blender
                     return Ok(full);
                 }
             }
+            // Installed layout: the script is bundled as a Tauri resource at
+            // <exe_dir>/blender/nexora_mesh_processor.py. The relative
+            // candidates above already cover "blender/nexora_mesh_processor.py"
+            // under exe_dir, but try an explicit resources layout too.
+            let resource = parent.join("resources").join("blender").join("nexora_mesh_processor.py");
+            if resource.exists() {
+                return Ok(resource);
+            }
         }
     }
     for candidate in &candidates {
@@ -104,6 +112,10 @@ impl BlenderAdapter {
         Ok(Self { config })
     }
 
+    /// Runs `blender --version` and reports the resolved executable + version.
+    /// Not part of the hot pipeline (the adapter only needs the executable to
+    /// exist); kept for the diagnostics surface.
+    #[allow(dead_code)]
     pub fn validate(&self) -> Result<BlenderInfo, BlenderAdapterError> {
         let mut cmd = Command::new(&self.config.blender_executable);
         cmd.arg("--version");
@@ -214,6 +226,18 @@ impl BlenderAdapter {
             .arg(&*log_path.to_string_lossy())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        // Debug: persist the exact invocation next to the log so failures like
+        // "the following arguments are required" can be diagnosed from disk.
+        {
+            let debug_path = job_output_dir.join("invocation.txt");
+            let debug_line = format!(
+                "exe={}\nscript={}\nargs={:?}\n",
+                self.config.blender_executable.display(),
+                script_path.display(),
+                cmd,
+            );
+            let _ = fs::write(&debug_path, debug_line);
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -271,6 +295,12 @@ impl BlenderAdapter {
             job_id: job_id.to_string(),
             status: status.to_string(),
             asset_ids,
+            pbr_stats: report
+                .get("stages")
+                .and_then(|s| s.get("pbr_materials"))
+                .and_then(|s| s.get("stats"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
             processing_stage: report["stages"]
                 .get("complete")
                 .and_then(|v| v["status"].as_str())

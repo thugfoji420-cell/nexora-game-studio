@@ -17,7 +17,7 @@ import type {
   ProcessingReport,
 } from "../types/model3dProcessing";
 import type { EngineTargetInfo } from "../types/core";
-import { MODEL3D_GENERATION_PROFILE_ID, MODEL3D_OUTPUT_FORMAT, MODEL3D_QUALITY } from "../types/core";
+import { MODEL3D_GENERATION_PROFILE_ID, MODEL3D_OUTPUT_FORMAT } from "../types/core";
 
 export const createModel3dProcessingJob = (input: CreateModel3dProcessingJobInput): Promise<CreateModel3dProcessingJobResult> =>
   invoke<CreateModel3dProcessingJobResult>("create_model3d_processing_job", { input });

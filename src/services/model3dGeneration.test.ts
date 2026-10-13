@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { JobInfo, Model3dGenerationRequest, ProviderView } from "../types/core";
-import { MODEL3D_GENERATION_PROFILE_ID, MODEL3D_OUTPUT_FORMAT, MODEL3D_QUALITY } from "../types/core";
+import {
+  MODEL3D_GENERATION_PROFILE_ID,
+  MODEL3D_OUTPUT_FORMAT,
+  MODEL3D_GENERATION_QUALITIES,
+  MODEL3D_DEFAULT_QUALITY,
+} from "../types/core";
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
@@ -18,7 +23,7 @@ import {
 const sourceAssetId = "123e4567-e89b-42d3-a456-426614174000";
 const request = (overrides: Partial<Model3dGenerationRequest> = {}): Model3dGenerationRequest => ({
   schemaVersion: 1, mode: "text_to_3d", prompt: "A modular stone arch", negativePrompt: null, sourceAssetId: null,
-  profile: MODEL3D_GENERATION_PROFILE_ID, quality: MODEL3D_QUALITY, seed: null, outputFormat: MODEL3D_OUTPUT_FORMAT, ...overrides,
+  profile: MODEL3D_GENERATION_PROFILE_ID, quality: MODEL3D_DEFAULT_QUALITY, seed: null, outputFormat: MODEL3D_OUTPUT_FORMAT, ...overrides,
 });
 const provider = (): ProviderView => ({
   manifest: { schemaVersion: 1, providerId: "local.model3d", displayName: "3D Provider", version: "1", providerType: "threeDProcessing", executionMode: "localHttp", classification: "local", nature: "real", enabled: true, capabilities: ["model3d.text_to_3d", "model3d.image_to_3d"], healthCheck: "localHttp", requirements: { minRamMib: null, recommendedRamMib: null, minVramMib: null, recommendedVramMib: null, gpuRequired: false, supportedGpuVendors: [], cpuFallback: false, minDiskMib: null, exclusive: false, resourceClass: "heavy" }, license: { status: "unknown", name: null, modelLicense: null, commercialUseAllowed: null, sourceReference: null }, permissions: [] },
@@ -53,7 +58,10 @@ describe("3D generation service", () => {
     expect(validateModel3dGenerationRequest(request({ seed: -1 }))).toContain("Seed must be a nonnegative whole number or random.");
     expect(validateModel3dGenerationRequest(request({ seed: 1.5 }))).toContain("Seed must be a nonnegative whole number or random.");
     expect(validateModel3dGenerationRequest(request({ profile: "other" as typeof MODEL3D_GENERATION_PROFILE_ID }))).not.toEqual([]);
-    expect(validateModel3dGenerationRequest(request({ quality: "draft" as typeof MODEL3D_QUALITY }))).not.toEqual([]);
+    for (const quality of MODEL3D_GENERATION_QUALITIES) {
+      expect(validateModel3dGenerationRequest(request({ quality }))).toEqual([]);
+    }
+    expect(validateModel3dGenerationRequest(request({ quality: "ultra" as (typeof MODEL3D_GENERATION_QUALITIES)[number] }))).toContain("Quality must be one of draft, standard, high.");
     expect(validateModel3dGenerationRequest(request({ outputFormat: "gltf" as typeof MODEL3D_OUTPUT_FORMAT }))).not.toEqual([]);
     expect(validateModel3dGenerationRequest(request({ prompt: " ", negativePrompt: "x".repeat(2001) }))).toHaveLength(2);
     expect(validateModel3dGenerationRequest({ ...request(), schemaVersion: 2 as 1, mode: "mesh" as "text_to_3d" })).toHaveLength(2);

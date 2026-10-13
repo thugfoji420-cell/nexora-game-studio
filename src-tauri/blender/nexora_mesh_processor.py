@@ -385,8 +385,568 @@ def stage_repair():
         bpy.ops.object.mode_set(mode='OBJECT')
     
     stats = get_scene_stats()
+    # Honest post-repair topology recount (grade the delivered asset,
+    # not the raw generator output)
+    non_man_after = 0
+    for obj in get_scene_mesh_objects():
+        bm_tmp = bmesh.new()
+        bm_tmp.from_mesh(obj.data)
+        non_man_after += sum(1 for e in bm_tmp.edges if len(e.link_faces) != 2)
+        bm_tmp.free()
+    stats["non_manifold_after"] = non_man_after
     log(f"Repair complete: {stats}")
     return stats
+
+# ============================================================================
+# PBR Material Readiness Stages (AAA standard)
+# ============================================================================
+
+def _find_basecolor_image(mat):
+    """Return (image_node, image) feeding Principled Base Color, if any."""
+    if not mat.use_nodes:
+        return None, None
+    bsdf = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    if not bsdf:
+        return None, None
+    inp = bsdf.inputs.get('Base Color')
+    if inp and inp.is_linked:
+        node = inp.links[0].from_node
+        if node.type == 'TEX_IMAGE' and node.image:
+            return node, node.image
+    return None, None
+
+
+def _derive_normal_map(img, strength=0.55):
+    """Sobel the albedo luminance into a tangent-space OpenGL normal map."""
+    import numpy as np
+    w, h = img.size
+    if w == 0 or h == 0:
+        return None
+    px = np.array(img.pixels[:], dtype=np.float32).reshape(h, w, 4)
+    lum = 0.2126 * px[:, :, 0] + 0.7152 * px[:, :, 1] + 0.0722 * px[:, :, 2]
+    lum = (lum - lum.min()) / max(1e-6, (lum.max() - lum.min()))
+    p = np.pad(lum, 1, mode='edge')
+    gx = (p[:-2, 2:] + 2 * p[1:-1, 2:] + p[2:, 2:]) - (p[:-2, :-2] + 2 * p[1:-1, :-2] + p[2:, :-2])
+    gy = (p[2:, :-2] + 2 * p[2:, 1:-1] + p[2:, 2:]) - (p[:-2, :-2] + 2 * p[:-2, 1:-1] + p[:-2, 2:])
+    nx, ny, nz = -gx * strength * 8.0, -gy * strength * 8.0, np.ones_like(lum)
+    ln = np.sqrt(nx * nx + ny * ny + nz * nz)
+    out = np.zeros((h, w, 4), dtype=np.float32)
+    out[:, :, 0] = nx / ln * 0.5 + 0.5
+    out[:, :, 1] = ny / ln * 0.5 + 0.5
+    out[:, :, 2] = nz / ln * 0.5 + 0.5
+    out[:, :, 3] = 1.0
+    nrm = bpy.data.images.new("Nexora_Normal", width=w, height=h, alpha=False)
+    nrm.pixels = out.ravel().tolist()
+    return nrm
+
+
+def _derive_roughness_map(img):
+    """Roughness from inverted albedo luminance, mean-normalized around 0.5."""
+    import numpy as np
+    w, h = img.size
+    if w == 0 or h == 0:
+        return None
+    px = np.array(img.pixels[:], dtype=np.float32).reshape(h, w, 4)
+    lum = 0.2126 * px[:, :, 0] + 0.7152 * px[:, :, 1] + 0.0722 * px[:, :, 2]
+    lum = (lum - lum.min()) / max(1e-6, (lum.max() - lum.min()))
+    rough = np.clip(1.0 - lum, 0.05, 1.0)
+    rough = np.clip(0.5 + (rough - rough.mean()), 0.05, 1.0)
+    out = np.zeros((h, w, 4), dtype=np.float32)
+    out[:, :, 0] = out[:, :, 1] = out[:, :, 2] = rough
+    out[:, :, 3] = 1.0
+    rgh = bpy.data.images.new("Nexora_Roughness", width=w, height=h, alpha=False)
+    rgh.pixels = out.ravel().tolist()
+    return rgh
+
+
+def _try_bake_ao(objs, img_size=1024, samples=32):
+    """Cycles AO bake into a new image. Best-effort: returns None on failure."""
+    try:
+        scene = bpy.context.scene
+        scene.render.engine = 'CYCLES'
+        scene.cycles.samples = samples
+        try:
+            scene.cycles.device = 'CPU'
+        except Exception:
+            pass
+        ao_img = bpy.data.images.new("Nexora_AO", width=img_size, height=img_size, alpha=False)
+        for obj in objs:
+            obj.select_set(True)
+        bpy.context.view_layer.objects.active = objs[0]
+        for obj in objs:
+            if not obj.data.uv_layers:
+                return None
+        bpy.ops.object.bake(type='AO', use_clear=True, margin=8, pass_filter={'COLOR'})
+        for obj in objs:
+            for slot in obj.material_slots:
+                mat = slot.material
+                if not (mat and mat.use_nodes):
+                    continue
+                tex = mat.node_tree.nodes.new('ShaderNodeTexImage')
+                tex.image = ao_img
+                tex.location = (-600, -500)
+        return ao_img
+    except Exception as exc:
+        log(f"AO bake skipped: {exc}", "WARN")
+        return None
+
+
+def stage_pbr_materials(segmentation=None):
+    """Stage: enforce dielectric PBR values and derive normal/roughness maps.
+
+    When semantic segmentation produced class materials, this is a light
+    finishing pass only: per-class roughness/metallic/clearcoat values are
+    already set, the global luminance-derived roughness map is intentionally
+    NOT applied (it makes glass/trim matte), and only the paint class keeps
+    the derived detail normal map."""
+    log("Finishing PBR materials...")
+    seg_classes = (segmentation or {}).get("classes", []) if segmentation else []
+    segmented = bool(seg_classes)
+    stats = {"materials_processed": 0, "normal_maps_created": 0,
+             "roughness_maps_created": 0, "ao_baked": False,
+             "metallic_clamped": 0, "roughness_clamped": 0,
+             "segmented": segmented, "segmentation_classes": seg_classes}
+    if segmented:
+        # Class params are semantically set (glass glossy, rubber matte,
+        # chrome metallic, paint clearcoat) - verify only, never clamp them.
+        stats["normal_maps_created"] = (segmentation or {}).get("normal_maps_created", 0)
+        for mat in bpy.data.materials:
+            if not mat.name.startswith("Nexora_"):
+                continue
+            if not mat.use_nodes:
+                mat.use_nodes = True
+            bsdf = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+            if bsdf is None:
+                continue
+            stats["materials_processed"] += 1
+        stats["sanity_verified"] = stats["materials_processed"] > 0
+        log(f"PBR finish (segmented, params preserved) complete: {stats}")
+        return stats
+    for mat in bpy.data.materials:
+        if not mat.use_nodes:
+            mat.use_nodes = True
+        nt = mat.node_tree
+        bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+        if not bsdf:
+            continue
+        met = bsdf.inputs.get('Metallic')
+        rgh = bsdf.inputs.get('Roughness')
+        if met and not met.is_linked and met.default_value > 0.15:
+            met.default_value = 0.0
+            stats["metallic_clamped"] += 1
+        if rgh and not rgh.is_linked and rgh.default_value < 0.45:
+            rgh.default_value = 0.6
+            stats["roughness_clamped"] += 1
+        _tex_node, image = _find_basecolor_image(mat)
+        if image is None:
+            continue
+        if any(n.type == 'NORMAL_MAP' for n in nt.nodes):
+            continue  # already has a normal map
+        normal_img = _derive_normal_map(image)
+        rough_img = _derive_roughness_map(image)
+        has_ao = any(n.type == 'TEX_IMAGE' and n.image and n.image.name.startswith('Nexora_AO') for n in nt.nodes)
+        if not has_ao:
+            ao_img = _try_bake_ao(get_scene_mesh_objects())
+            if ao_img:
+                # glTF exporters carry AO through the Principled Occlusion socket;
+                # newer Blender builds removed that socket, so only count AO as
+                # baked when it is actually wired into the shader.
+                occl = bsdf.inputs.get('Occlusion')
+                if occl is not None:
+                    ao_tex = next((n for n in nt.nodes if n.type == 'TEX_IMAGE' and n.image and n.image.name.startswith('Nexora_AO')), None)
+                    if ao_tex is not None:
+                        nt.links.new(ao_tex.outputs['Color'], occl)
+                        ao_img.pack()
+                        stats["ao_baked"] = True
+        if normal_img:
+            nm_node = nt.nodes.new('ShaderNodeNormalMap')
+            nm_node.location = (-500, -300)
+            nm_node.inputs['Strength'].default_value = 0.6
+            tex = nt.nodes.new('ShaderNodeTexImage')
+            tex.image = normal_img
+            tex.location = (-800, -300)
+            nt.links.new(tex.outputs['Color'], nm_node.inputs['Color'])
+            nt.links.new(nm_node.outputs['Normal'], bsdf.inputs['Normal'])
+            normal_img.pack()
+            stats["normal_maps_created"] += 1
+        if rough_img:
+            tex = nt.nodes.new('ShaderNodeTexImage')
+            tex.image = rough_img
+            tex.location = (-800, -600)
+            nt.links.new(tex.outputs['Color'], rgh)
+            rough_img.pack()
+            stats["roughness_maps_created"] += 1
+        stats["materials_processed"] += 1
+    log(f"PBR upgrade complete: {stats}")
+    return stats
+
+
+
+# ============================================================================
+# AAA Material Segmentation, Shading & Baked Maps
+# ============================================================================
+
+VEHICLE_CLASS_PARAMS = {
+    "paint":  {"metallic": 0.0, "roughness": 0.38, "coat_weight": 1.0, "coat_roughness": 0.06, "normal_strength": 0.35},
+    "glass":  {"metallic": 0.0, "roughness": 0.06, "coat_weight": 0.0, "coat_roughness": 0.03, "normal_strength": 0.0},
+    "rubber": {"metallic": 0.0, "roughness": 0.92, "coat_weight": 0.0, "coat_roughness": 0.50, "normal_strength": 0.0},
+    "chrome": {"metallic": 1.0, "roughness": 0.18, "coat_weight": 0.0, "coat_roughness": 0.10, "normal_strength": 0.0},
+}
+
+
+def _find_dominant_albedo():
+    """Return (material, tex_node, image) for the largest albedo texture actually
+    assigned to scene mesh objects, or (None, None, None)."""
+    used_mats = set()
+    for obj in get_scene_mesh_objects():
+        for slot in obj.material_slots:
+            if slot.material:
+                used_mats.add(slot.material)
+    best = (None, None, None)
+    best_area = 0
+    for mat in used_mats:
+        node, image = _find_basecolor_image(mat)
+        if image is not None and image.size[0] > 0:
+            area = image.size[0] * image.size[1]
+            if area > best_area:
+                best = (mat, node, image)
+                best_area = area
+    return best
+
+
+def _sample_face_albedo(obj, arr):
+    """Per-face (area, r, g, b, z_world) sampled from albedo at the UV centroid."""
+    import numpy as np
+    mesh = obj.data
+    if not mesh.uv_layers or len(mesh.polygons) == 0:
+        return None
+    uv = mesh.uv_layers[0].data
+    h, w = arr.shape[:2]
+    rows = []
+    mw = obj.matrix_world
+    verts = mesh.vertices
+    for poly in mesh.polygons:
+        loops = range(poly.loop_start, poly.loop_start + poly.loop_total)
+        u = 0.0
+        v = 0.0
+        n = 0
+        for li in loops:
+            u += uv[li].uv[0]
+            v += uv[li].uv[1]
+            n += 1
+        u = max(0.0, min(1.0, u / max(1, n)))
+        v = max(0.0, min(1.0, v / max(1, n)))
+        x = min(w - 1, int(u * w))
+        y = min(h - 1, int((1.0 - v) * (h - 1)))
+        r, g, b = (float(arr[y, x][0]), float(arr[y, x][1]), float(arr[y, x][2]))
+        zc = 0.0
+        for vi in poly.vertices:
+            zc += (mw @ verts[vi].co).z
+        zc /= len(poly.vertices)
+        rows.append((float(poly.area), r, g, b, zc))
+    return rows
+
+
+def _classify_vehicle_faces(rows, bounds_z):
+    """Assign each face to paint/glass/rubber/chrome using relative albedo
+    thresholds + height heuristics. Returns list of class names per face."""
+    import numpy as np
+    import colorsys
+    n = len(rows)
+    area = np.array([r[0] for r in rows], dtype=np.float64)
+    rgb = np.array([[r[1], r[2], r[3]] for r in rows], dtype=np.float64)
+    z = np.array([r[4] for r in rows], dtype=np.float64)
+    lum = 0.2126 * rgb[:, 0] + 0.7152 * rgb[:, 1] + 0.0722 * rgb[:, 2]
+    cmax = rgb.max(axis=1)
+    cmin = rgb.min(axis=1)
+    sat = np.where(cmax > 1e-5, (cmax - cmin) / np.maximum(cmax, 1e-5), 0.0)
+    zmin, zmax = bounds_z
+    zn = (z - zmin) / max(1e-6, (zmax - zmin))
+
+    lum_p85 = float(np.percentile(lum, 85))
+    dark = lum < max(0.15, 0.35 * lum_p85)
+    # Dominant (paint) color stats from non-dark faces
+    nd = ~dark
+    if not nd.any():
+        nd = np.ones(n, dtype=bool)
+        dark = np.zeros(n, dtype=bool)
+    paint_sat = float(np.median(sat[nd]))
+    paint_lum = float(np.median(lum[nd]))
+    # Rescue shadowed body panels: a dark but paint-hued saturated face is a
+    # shadow baked into the albedo, not glass.
+    hue_rescue = np.zeros(n, dtype=bool)
+    if paint_sat > 0.30:
+        import colorsys as _cs
+        med_rgb = np.median(rgb[nd], axis=0)
+        ph, _ps, _pv = _cs.rgb_to_hsv(*np.clip(med_rgb, 0, 1))
+        fh = np.array([_cs.rgb_to_hsv(min(1.0, max(0.0, r)), min(1.0, max(0.0, g)), min(1.0, max(0.0, b)))[0]
+                       for r, g, b in rgb])
+        dh = np.abs(fh - ph)
+        dh = np.minimum(dh, 1.0 - dh)
+        hue_rescue = dark & (sat > 0.30) & (dh < 0.06)
+        dark = dark & ~hue_rescue
+    # Chrome/trim only makes sense when the paint itself is colorful:
+    bright_desat = (~dark) & (sat < 0.15) & (lum > max(0.72, paint_lum * 1.05))
+    chrome = bright_desat & (paint_sat > 0.30) & (bright_desat.sum() < 0.5 * n)
+    rubber = dark & (zn < 0.42)
+    glass = dark & (zn >= 0.42) & (zn <= 0.88)
+    paint = ~(rubber | glass | chrome)
+    classes = []
+    for i in range(n):
+        if rubber[i]:
+            classes.append("rubber")
+        elif glass[i]:
+            classes.append("glass")
+        elif chrome[i]:
+            classes.append("chrome")
+        else:
+            classes.append("paint")
+    return classes
+
+
+def _build_class_material(base_mat, base_image, cls, normal_image=None):
+    """Create a PBR material for a semantic class, sharing the albedo texture."""
+    params = VEHICLE_CLASS_PARAMS[cls]
+    mat = bpy.data.materials.new(f"Nexora_{cls.capitalize()}")
+    mat.use_nodes = True
+    nt = mat.node_tree
+    bsdf = nt.nodes.get("Principled BSDF")
+    if bsdf is None:
+        bsdf = next(n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED')
+    if base_image is not None:
+        tex = nt.nodes.new('ShaderNodeTexImage')
+        tex.image = base_image
+        tex.location = (-800, 0)
+        nt.links.new(tex.outputs['Color'], bsdf.inputs['Base Color'])
+        tex.interpolation = 'Smart'
+    bsdf.inputs['Metallic'].default_value = params["metallic"]
+    bsdf.inputs['Roughness'].default_value = params["roughness"]
+    coat_w = bsdf.inputs.get('Coat Weight')
+    coat_r = bsdf.inputs.get('Coat Roughness')
+    if coat_w is not None and params["coat_weight"] > 0:
+        coat_w.default_value = params["coat_weight"]
+        if coat_r is not None:
+            coat_r.default_value = params["coat_roughness"]
+    if params["normal_strength"] > 0 and normal_image is not None:
+        tex = nt.nodes.new('ShaderNodeTexImage')
+        tex.image = normal_image
+        tex.location = (-800, -400)
+        nm = nt.nodes.new('ShaderNodeNormalMap')
+        nm.location = (-500, -400)
+        nm.inputs['Strength'].default_value = params["normal_strength"]
+        nt.links.new(tex.outputs['Color'], nm.inputs['Color'])
+        nt.links.new(nm.outputs['Normal'], bsdf.inputs['Normal'])
+    # Explicit dielectric specular sanity (avoid artist-free sparkle)
+    spec = bsdf.inputs.get('Specular IOR Level')
+    if spec is not None and not spec.is_linked:
+        spec.default_value = 0.5
+    return mat
+
+
+def stage_material_segmentation(profile):
+    """Split the single baked Hunyuan material into semantic PBR classes
+    (paint / glass / rubber / chrome) so each part shades correctly."""
+    log("Segmenting materials into semantic PBR classes...")
+    stats = {"attempted": False, "classes": [], "face_counts": {},
+             "objects_segmented": 0, "skipped_reason": None}
+    if profile != "vehicle":
+        stats["skipped_reason"] = "non-vehicle profile"
+        log(f"Segmentation skipped: {stats['skipped_reason']}", "WARN")
+        return stats
+    base_mat, _tex_node, base_image = _find_dominant_albedo()
+    if base_image is None:
+        stats["skipped_reason"] = "no albedo texture"
+        log(f"Segmentation skipped: {stats['skipped_reason']}", "WARN")
+        return stats
+    import numpy as np
+    arr = np.array(base_image.pixels[:], dtype=np.float32).reshape(
+        base_image.size[1], base_image.size[0], 4)
+    stats["attempted"] = True
+
+    # Scene z-bounds for normalized height
+    zmin, zmax = 1e9, -1e9
+    for obj in get_scene_mesh_objects():
+        for corner in obj.bound_box:
+            zc = (obj.matrix_world @ Vector(corner)).z
+            zmin = min(zmin, zc)
+            zmax = max(zmax, zc)
+
+    # Derive the detail normal map up front so the paint class can use it
+    # (segmentation runs before the PBR finish pass).
+    normal_image = None
+    try:
+        normal_image = _derive_normal_map(base_image, strength=0.5)
+        if normal_image is not None:
+            normal_image.pack()
+            stats["normal_maps_created"] = 1
+    except Exception as exc:
+        log(f"normal map derivation skipped: {exc}", "WARN")
+
+    class_counts = {"paint": 0, "glass": 0, "rubber": 0, "chrome": 0}
+    made_mats = {}
+
+    for obj in get_scene_mesh_objects():
+        slots = [s.material for s in obj.material_slots]
+        if len(slots) != 1 or slots[0] is None:
+            continue
+        rows = _sample_face_albedo(obj, arr)
+        if not rows:
+            continue
+        classes = _classify_vehicle_faces(rows, (zmin, zmax))
+        present = sorted(set(classes))
+        if len(present) < 2:
+            continue  # single-class object gains nothing from segmentation
+        # Create one material per present class
+        for cls in present:
+            if cls not in made_mats:
+                made_mats[cls] = _build_class_material(
+                    slots[0], base_image, cls, normal_image)
+        # Deterministic slot layout: first class replaces slot 0, rest are
+        # appended. No pop()/reindex tricks - those scramble indices.
+        index_of = {}
+        for i, cls in enumerate(present):
+            if i == 0:
+                obj.data.materials[0] = made_mats[cls]
+            else:
+                obj.data.materials.append(made_mats[cls])
+            index_of[cls] = i
+        for poly, cls in zip(obj.data.polygons, classes):
+            poly.material_index = index_of[cls]
+        for cls in classes:
+            class_counts[cls] += 1
+        stats["objects_segmented"] += 1
+
+    present = [c for c in ("paint", "glass", "rubber", "chrome") if class_counts[c] > 0]
+    stats["classes"] = present
+    stats["face_counts"] = {k: v for k, v in class_counts.items() if v > 0}
+    log(f"Segmentation complete: classes={present} faces={stats['face_counts']}")
+    if len(present) < 2:
+        stats["skipped_reason"] = "classification found a single class"
+    return stats
+
+
+def stage_shading(angle_deg=35.0):
+    """Smooth shading with hard edges above the angle threshold so hard-surface
+    panel lines read crisply instead of mushy."""
+    log(f"Applying smooth-by-angle shading ({angle_deg} deg)...")
+    stats = {"objects": 0, "hard_edges": 0, "faces_smoothed": 0}
+    threshold = math.radians(angle_deg)
+    for obj in get_scene_mesh_objects():
+        bm = bmesh.new()
+        bm.from_mesh(obj.data)
+        for f in bm.faces:
+            f.smooth = True
+            stats["faces_smoothed"] += 1
+        for e in bm.edges:
+            if len(e.link_faces) == 2:
+                try:
+                    if e.calc_face_angle() > threshold:
+                        e.smooth = False
+                        stats["hard_edges"] += 1
+                except ValueError:
+                    continue
+        bm.to_mesh(obj.data)
+        bm.free()
+        stats["objects"] += 1
+    log(f"Shading complete: {stats}")
+    return stats
+
+
+def stage_bake_ao_artifact(output_dir, img_size=1024, samples=48):
+    """Bake an ambient-occlusion map using the non-overlapping lightmap UV and
+    save it as ao.png next to the GLB. Unity does not auto-consume glTF
+    occlusion textures, so we ship the PNG as an artist-ready artifact and do
+    NOT claim it is wired into the material."""
+    stats = {"attempted": True, "baked": False, "saved": None, "reason": None}
+    try:
+        objs = get_scene_mesh_objects()
+        if not objs:
+            stats["reason"] = "no mesh objects"
+            return stats
+        for obj in objs:
+            lm = obj.data.uv_layers.get("lightmap") or (obj.data.uv_layers[1] if len(obj.data.uv_layers) > 1 else None)
+            if lm is None:
+                stats["reason"] = "no non-overlapping UV channel"
+                return stats
+        scene = bpy.context.scene
+        scene.render.engine = 'CYCLES'
+        scene.cycles.samples = samples
+        scene.cycles.device = 'CPU'
+        ao_img = bpy.data.images.new("Nexora_AO", width=img_size, height=img_size, alpha=False)
+        for obj in objs:
+            obj.select_set(True)
+        bpy.context.view_layer.objects.active = objs[0]
+        # Bake with the lightmap UV active for render/baking
+        for obj in objs:
+            lm = obj.data.uv_layers.get("lightmap") or obj.data.uv_layers[1]
+            lm.active_render = True
+        bpy.ops.object.bake(type='AO', use_clear=True, margin=8, pass_filter={'COLOR'})
+        for obj in objs:
+            lm = obj.data.uv_layers.get("lightmap") or obj.data.uv_layers[1]
+            lm.active_render = False
+        out_path = Path(output_dir) / "ao.png"
+        ao_img.filepath_raw = str(out_path)
+        ao_img.file_format = 'PNG'
+        ao_img.save()
+        ao_img.pack()
+        stats["baked"] = True
+        stats["saved"] = str(out_path)
+        log(f"AO artifact baked: {out_path}")
+    except Exception as exc:
+        stats["reason"] = str(exc)
+        log(f"AO bake skipped: {exc}", "WARN")
+    return stats
+
+
+def _purge_orphan_materials():
+    """Remove materials with zero users (Hunyuan leftovers like 'Dots Stroke')."""
+    removed = []
+    for mat in list(bpy.data.materials):
+        if mat.users == 0:
+            removed.append(mat.name)
+            bpy.data.materials.remove(mat)
+    if removed:
+        log(f"Purged orphan materials: {removed}")
+    return {"removed": removed}
+
+def stage_lightmap_uvs():
+    """Stage: ensure UV0 exists and add a non-overlapping UV1 for lightmaps."""
+    log("Ensuring lightmap UV channel (UV1)...")
+    stats = {"objects": 0, "uv1_created": 0, "uv1_failed": 0}
+    for obj in get_scene_mesh_objects():
+        stats["objects"] += 1
+        uvs = obj.data.uv_layers
+        if not uvs:
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='SELECT')
+            bpy.ops.uv.cube_project(cube_size=1.0)
+            bpy.ops.object.mode_set(mode='OBJECT')
+            uvs = obj.data.uv_layers
+        if not uvs:
+            stats["uv1_failed"] += 1
+            continue
+        if len(uvs) == 1:
+            uvs[0].name = "UVMap"
+        if "lightmap" in uvs:
+            continue
+        try:
+            uvs.new(name="lightmap")
+            lm = uvs["lightmap"]
+            uvs.active = lm
+            lm.active_render = False
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='SELECT')
+            bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.005)
+            bpy.ops.object.mode_set(mode='OBJECT')
+            stats["uv1_created"] += 1
+        except Exception as exc:
+            log(f"lightmap UV failed on {obj.name}: {exc}", "WARN")
+            stats["uv1_failed"] += 1
+    log(f"Lightmap UV complete: {stats}")
+    return stats
+
 
 def stage_optimize(quality, target_tris):
     """Stage 6: Target decimation."""
@@ -797,37 +1357,80 @@ def calculate_quality_score(report, final_stats):
     score = 0
     breakdown = {}
     
-    # 1. Topology & Geometry Cleanliness (25 pts)
+    # 1. Topology & Geometry Cleanliness (15 pts)
     degen = report["stages"].get("analyze", {}).get("analysis", {}).get("degenerate_faces", 0)
-    non_man = report["stages"].get("analyze", {}).get("analysis", {}).get("non_manifold_edges", 0)
-    topo_score = 25
-    if degen > 0: topo_score -= min(10, degen)
-    if non_man > 50: topo_score -= 10
-    elif non_man > 10: topo_score -= 5
-    score += max(10, topo_score)
-    breakdown["topology"] = max(10, topo_score)
-    
-    # 2. Normal Consistency & Coordinate Normalization (25 pts)
-    norm_score = 25
-    if report["stages"].get("repair", {}).get("status") == "completed":
-        norm_score = 25
+    non_man = report["stages"].get("repair", {}).get("stats", {}).get(
+        "non_manifold_after",
+        report["stages"].get("analyze", {}).get("analysis", {}).get("non_manifold_edges", 0))
+    topo_score = 15
+    if degen > 0: topo_score -= min(6, degen)
+    if non_man > 50: topo_score -= 6
+    elif non_man > 10: topo_score -= 3
+    score += max(6, topo_score)
+    breakdown["topology"] = max(6, topo_score)
+
+    # 2. Normal Consistency & Coordinate Normalization (10 pts)
+    norm_score = 10 if report["stages"].get("repair", {}).get("status") == "completed" else 0
     score += norm_score
     breakdown["normals_and_transforms"] = norm_score
-    
-    # 3. LOD0/LOD1/LOD2 Hierarchy (20 pts)
-    lod_score = 20 if "lod_generation" in report["stages"] else 0
+
+    # 3. Smooth-by-angle shading (10 pts) - hard-surface edge readability
+    shade = report["stages"].get("shading", {}).get("stats", {})
+    shade_score = 0
+    if shade.get("objects", 0) > 0:
+        shade_score = 4
+        if shade.get("hard_edges", 0) > 50:
+            shade_score = 10  # real panel lines detected
+        elif shade.get("hard_edges", 0) > 10:
+            shade_score = 7
+    score += shade_score
+    breakdown["shading"] = shade_score
+
+    # 4. LOD0/LOD1/LOD2 Hierarchy (15 pts)
+    lod_score = 15 if "lod_generation" in report["stages"] else 0
     score += lod_score
     breakdown["lod_hierarchy"] = lod_score
-    
-    # 4. Simplified Collision Geometry (15 pts)
-    col_score = 15 if report["stages"].get("collision", {}).get("generated") else 0
+
+    # 5. Simplified Collision Geometry (10 pts)
+    col_score = 10 if report["stages"].get("collision", {}).get("generated") else 0
     score += col_score
     breakdown["collision_mesh"] = col_score
-    
-    # 5. PBR Material Readiness (15 pts)
-    mat_score = 15 if final_stats.get("material_count", 0) > 0 else 10
-    score += mat_score
-    breakdown["materials"] = mat_score
+
+    # 6. PBR Material Readiness (30 pts) - graded on real semantic content
+    seg = report["stages"].get("material_segmentation", {}).get("stats", {})
+    pbr = report["stages"].get("pbr_materials", {}).get("stats", {})
+    mat_score = 0
+    if final_stats.get("material_count", 0) > 0:
+        mat_score += 3
+    classes = seg.get("classes", [])
+    if len(classes) >= 4:
+        mat_score += 12  # paint/glass/rubber/chrome all present
+    elif len(classes) == 3:
+        mat_score += 9
+    elif len(classes) == 2:
+        mat_score += 6
+    if "paint" in classes and final_stats.get("material_count", 0) > 1:
+        mat_score += 4  # clearcoat car paint assigned
+    if pbr.get("normal_maps_created", 0) > 0:
+        mat_score += 5
+    if pbr.get("roughness_maps_created", 0) > 0 and not seg.get("classes"):
+        mat_score += 4  # legacy single-material path only
+    if pbr.get("sanity_verified") or pbr.get("metallic_clamped", 0) > 0:
+        mat_score += 2
+    score += min(30, mat_score)
+    breakdown["materials"] = min(30, mat_score)
+
+    # 7. Lightmap UV1 (5 pts)
+    lm = report["stages"].get("lightmap_uvs", {}).get("stats", {})
+    lm_score = 5 if lm.get("uv1_created", 0) > 0 else 0
+    score += lm_score
+    breakdown["lightmap_uvs"] = lm_score
+
+    # 8. AO artifact (5 pts) - honest: artifact only, not shader-wired
+    ao = report["stages"].get("ao_bake", {}).get("stats", {})
+    ao_score = 5 if ao.get("baked") else 0
+    score += ao_score
+    breakdown["ao_artifact"] = ao_score
     
     # 6. Category-Specific Readiness (bonus/penalty, not part of base 100)
     cat_bonus = 0
@@ -841,6 +1444,8 @@ def calculate_quality_score(report, final_stats):
     # Clamp to 100
     final_score = min(100, max(0, score + cat_bonus))
     rating = "AAA_GAME_READY" if final_score >= 90 else "PRODUCTION_READY" if final_score >= 75 else "NEEDS_REVIEW"
+    if final_score >= 90 and len(report.get("stages", {}).get("material_segmentation", {}).get("stats", {}).get("classes", [])) < 3:
+        rating = "PRODUCTION_READY"  # AAA requires semantic material classes
     return final_score, rating, breakdown
 
 # ============================================================================
@@ -913,6 +1518,30 @@ def main():
         # 5. Repair
         stats_repair = stage_repair()
         report["stages"]["repair"] = {"status": "completed", "stats": stats_repair}
+
+        # 5b. Semantic material segmentation (paint/glass/rubber/chrome)
+        seg_stats = stage_material_segmentation(args.profile)
+        report["stages"]["material_segmentation"] = {"status": "completed", "stats": seg_stats}
+
+        # 5c. PBR material finish (normal/roughness + dielectric sanity)
+        pbr_stats = stage_pbr_materials(segmentation=seg_stats)
+        report["stages"]["pbr_materials"] = {"status": "completed", "stats": pbr_stats}
+
+        # 5d. Smooth-by-angle shading for crisp hard-surface edges
+        shade_stats = stage_shading()
+        report["stages"]["shading"] = {"status": "completed", "stats": shade_stats}
+
+        # 5e. Lightmap UV channel (UV1) for baked GI in-engine
+        lm_stats = stage_lightmap_uvs()
+        report["stages"]["lightmap_uvs"] = {"status": "completed", "stats": lm_stats}
+
+        # 5f. AO bake artifact (saved as ao.png using the lightmap UV)
+        ao_stats = stage_bake_ao_artifact(output_dir)
+        report["stages"]["ao_bake"] = {"status": "completed", "stats": ao_stats}
+
+        # 5g. Purge orphan materials left by generation
+        purge_stats = _purge_orphan_materials()
+        report["stages"]["purge_orphans"] = {"status": "completed", "stats": purge_stats}
         
         # 6. Optimize
         target_tris = QUALITY_TRIANGLE_TARGETS.get(args.quality, 50000)

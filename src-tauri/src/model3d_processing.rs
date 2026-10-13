@@ -5,21 +5,6 @@ use std::fs;
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const MODEL3D_PROCESSING_PROFILE_ID: &str = "foundation.processing.v1";
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProcessingQuality {
-    #[serde(rename = "master")]
-    Master,
-    #[serde(rename = "mobile_high")]
-    MobileHigh,
-    #[serde(rename = "mobile_balanced")]
-    MobileBalanced,
-    #[serde(rename = "mobile_low")]
-    MobileLow,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Model3dProcessingResult {
@@ -36,6 +21,11 @@ pub struct Model3dProcessingResult {
     pub material_status: Option<String>,
     pub pre_analysis_report: Option<ProcessingReport>,
     pub post_analysis_report: Option<ProcessingReport>,
+    /// PBR upgrade stage stats from the processor report (normal/roughness maps,
+    /// AO bake, metallic clamping). Present for jobs processed after the
+    /// game-readiness upgrade; older reports yield an empty default.
+    #[serde(default)]
+    pub pbr_stats: serde_json::Value,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
 }
@@ -192,6 +182,10 @@ pub fn get_result(
         None
     };
 
+    // Pull the PBR upgrade stats out of the stored processor report so the UI
+    // can show what material data the asset actually carries.
+    let pbr_stats = read_report_and_extract_pbr(&db, job_id);
+
     Ok(Model3dProcessingResult {
         job_id: job_id.into(),
         status,
@@ -206,6 +200,7 @@ pub fn get_result(
         material_status,
         pre_analysis_report: pre_report,
         post_analysis_report: post_report,
+        pbr_stats: pbr_stats,
         error_code,
         error_message,
     })
@@ -216,6 +211,44 @@ fn read_report(path: &str) -> Option<ProcessingReport> {
     serde_json::from_slice(&data).ok()
 }
 
+/// Reads the processor report for a job and extracts `stages.pbr_materials.stats`.
+/// Returns Null for jobs processed before the PBR upgrade (no stage in report).
+fn read_report_and_extract_pbr(db: &rusqlite::Connection, job_id: &str) -> serde_json::Value {
+    let path: Option<String> = db
+        .query_row(
+            "SELECT post_analysis_report_path FROM model3d_processing_jobs WHERE job_id=?1",
+            rusqlite::params![job_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten();
+    let Some(path) = path else {
+        return serde_json::Value::Null;
+    };
+    fs::read(&path)
+        .ok()
+        .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
+        .and_then(|report| {
+            let mut stats = report
+                .get("stages")
+                .and_then(|s| s.get("pbr_materials"))
+                .and_then(|s| s.get("stats"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            // Surface the honest AAA readiness verdict alongside the map stats
+            if let serde_json::Value::Object(ref mut map) = stats {
+                if let Some(score) = report.get("quality_score").cloned() {
+                    map.insert("quality_score".to_string(), score);
+                }
+                if let Some(rating) = report.get("quality_rating").cloned() {
+                    map.insert("quality_rating".to_string(), rating);
+                }
+            }
+            Some(stats)
+        })
+        .unwrap_or(serde_json::Value::Null)
+}
+
 fn valid_uuid(value: &str) -> bool {
     Uuid::parse_str(value).is_ok_and(|uuid| uuid.to_string() == value)
 }
@@ -224,8 +257,6 @@ fn valid_uuid(value: &str) -> bool {
 pub enum Model3dProcessingError {
     #[error("invalid model3d processing request: {0}")]
     InvalidRequest(String),
-    #[error("model3d processing unavailable: {0}")]
-    Unavailable(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]

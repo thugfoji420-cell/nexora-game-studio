@@ -15,9 +15,6 @@ const MAX_PROMPT_CHARS: usize = 2000;
 const MAX_SOURCE_BYTES: u64 = 40 * 1024 * 1024;
 const MAX_SOURCE_PIXELS: u64 = 64 * 1024 * 1024;
 
-#[cfg(test)]
-const FIXTURE_MODEL_IDENTIFIER: &str = "test.fixture.hunyuan.v1";
-
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HunyuanMode {
@@ -39,6 +36,7 @@ pub struct HunyuanGenerationRequest {
     pub quality: String,
     pub seed: Option<i64>,
     pub output_format: String,
+    pub generate_texture: Option<bool>,
 }
 
 impl HunyuanGenerationRequest {
@@ -58,7 +56,7 @@ impl HunyuanGenerationRequest {
                 .as_ref()
                 .is_some_and(|value| value.chars().count() > MAX_PROMPT_CHARS)
             || self.profile != HUNYUAN_PROFILE_ID
-            || self.quality != "standard"
+            || !matches!(self.quality.as_str(), "draft" | "standard" | "high")
             || self.seed.is_some_and(|seed| seed < 0)
             || self.output_format != "glb"
         {
@@ -67,6 +65,26 @@ impl HunyuanGenerationRequest {
             ));
         }
         Ok(self)
+    }
+
+    /// Whether the caller asked for texture generation. Defaults to true so
+    /// Hunyuan paints the mesh with the concept image; explicit false turns
+    /// painting off (e.g. geometry-only iteration).
+    pub fn texture_requested(&self) -> Option<bool> {
+        self.generate_texture
+    }
+}
+
+/// Quality presets mapped onto the Hunyuan3D server's shape parameters
+/// (octree_resolution, num_inference_steps, guidance_scale, face_count).
+/// The server defaults (128 octree, 5 steps) produce loose blobby geometry;
+/// `high` is what AAA-grade output requires and is much slower on low-VRAM
+/// GPUs (roughly 30-45 minutes for a 20-step job on 4 GB).
+pub fn quality_params(quality: &str) -> (u32, u32, f64, u32) {
+    match quality {
+        "draft" => (128, 5, 5.0, 30_000),
+        "high" => (256, 20, 5.5, 50_000),
+        _ => (192, 10, 5.0, 40_000),
     }
 }
 
@@ -196,11 +214,6 @@ pub fn get_result(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn fixture_output() -> Vec<u8> {
-    crate::model3d_validation::tests::fixture_glb()
-}
-
 fn valid_uuid(value: &str) -> bool {
     Uuid::parse_str(value).is_ok_and(|uuid| uuid.to_string() == value)
 }
@@ -212,16 +225,15 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-fn database(error: rusqlite::Error) -> HunyuanError {
-    HunyuanError::InvalidRequest(error.to_string())
-}
-
 pub fn run_hunyuan_generation(
     project: &ProjectState,
     job_id: &str,
     owner: &str,
     payload: &HunyuanJobPayload,
 ) -> Result<HunyuanGenerationResult, HunyuanError> {
+    // Park A1111 for the duration (the guard nests inside batch-level guards
+    // and relaunches A1111 when the last generation finishes).
+    let _gpu_guard = crate::gpu_guard::GenerationGuard::acquire();
     // Resolve source image if needed
     if let HunyuanMode::ImageTo3d = payload.request.mode {
         resolve_source(project, &payload.request)?;
@@ -265,15 +277,32 @@ pub fn run_hunyuan_generation(
     // socket read, freezing the job at its last progress step.
     let client = Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(15 * 60))
+        // 30 min: texture painting (delight + 6-view multiview + bake) on a
+        // 4 GB GPU with CPU offload can exceed the previous 15 min limit.
+        .timeout(std::time::Duration::from_secs(30 * 60))
         .build()
         .map_err(|e| HunyuanError::InvalidRequest(format!("http client: {e}")))?;
     let mut request_json = serde_json::json!({
         "text": payload.request.prompt,
     });
+    // Hunyuan3DPaintPipeline projects the concept image onto the mesh when
+    // texture generation is enabled server-side (--enable_tex) and requested
+    // here. Falls back to painted output; explicit false = geometry-only.
+    if payload.request.generate_texture != Some(false) {
+        request_json["texture"] = serde_json::Value::Bool(true);
+    }
     if let Some(seed) = payload.request.seed {
         request_json["seed"] = serde_json::Value::Number(seed.into());
     }
+    // Quality presets flow straight into the server's shape pipeline. Without
+    // them the server falls back to 128 octree / 5 steps, which is the root
+    // cause of unusable blobby geometry.
+    let (octree_resolution, num_inference_steps, guidance_scale, face_count) =
+        quality_params(&payload.request.quality);
+    request_json["octree_resolution"] = serde_json::json!(octree_resolution);
+    request_json["num_inference_steps"] = serde_json::json!(num_inference_steps);
+    request_json["guidance_scale"] = serde_json::json!(guidance_scale);
+    request_json["face_count"] = serde_json::json!(face_count);
 
     if let Some(path) = input_path_buf {
         let image_bytes = fs::read(&path)?;
@@ -509,6 +538,7 @@ mod tests {
             quality: "standard".into(),
             seed: None,
             output_format: "glb".into(),
+            generate_texture: None,
         }
     }
 
@@ -531,6 +561,24 @@ mod tests {
             serde_json::to_string(&crate::providers::Capability::HunyuanImageTo3d).unwrap(),
             "\"hunyuan.image_to_3d\""
         );
+    }
+
+    #[test]
+    fn quality_presets_map_to_aaa_grade_server_params() {
+        assert_eq!(quality_params("draft"), (128, 5, 5.0, 30_000));
+        assert_eq!(quality_params("standard"), (192, 10, 5.0, 40_000));
+        assert_eq!(quality_params("high"), (256, 20, 5.5, 50_000));
+        // Unknown values fall back to the safe standard preset.
+        assert_eq!(quality_params("ultra"), (192, 10, 5.0, 40_000));
+
+        for quality in ["draft", "standard", "high"] {
+            let mut value = request(None);
+            value.quality = quality.into();
+            assert!(value.normalize().is_ok(), "{quality} must be accepted");
+        }
+        let mut value = request(None);
+        value.quality = "ultra".into();
+        assert!(value.normalize().is_err());
     }
 
     #[test]

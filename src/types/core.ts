@@ -1,6 +1,5 @@
 export type ThemePreference = "dark" | "system";
 
-import type { MaskedOpenRouterConfig } from "./providers";
 
 export interface BlenderConfig {
   executablePath: string | null;
@@ -47,18 +46,6 @@ export interface UnityProjectTarget {
   updatedAtMs: number;
 }
 
-export interface OpenRouterConfig {
-  schemaVersion: number;
-  enabled: boolean;
-  providerId: string;
-  baseUrl: string;
-  apiKey: string;
-  referer: string;
-  title: string;
-  defaultModel: string;
-  timeoutSeconds: number;
-}
-
 export interface UnityProjectValidation {
   isValid: boolean;
   unityVersion: string | null;
@@ -76,7 +63,6 @@ export interface AppSettings {
   blender: BlenderConfig;
   unityTargets: Record<string, UnityProjectTarget>;
   activeUnityTarget: string | null;
-  openrouter: MaskedOpenRouterConfig;
   skipRuntimeStartupOnLaunch: boolean;
 }
 
@@ -102,8 +88,20 @@ export type {
   VideoGenerationResult,
   VideoProviderConfig,
 } from "./videoGeneration";
-export { MODEL3D_GENERATION_PROFILE_ID, MODEL3D_OUTPUT_FORMAT, MODEL3D_QUALITY } from "./model3dGeneration";
-export { HUNYUAN_GENERATION_PROFILE_ID, HUNYUAN_OUTPUT_FORMAT, HUNYUAN_QUALITY } from "./hunyuanGeneration";
+export {
+  MODEL3D_GENERATION_PROFILE_ID,
+  MODEL3D_OUTPUT_FORMAT,
+  MODEL3D_GENERATION_QUALITIES,
+  MODEL3D_DEFAULT_QUALITY,
+} from "./model3dGeneration";
+export type { Model3dGenerationQuality } from "./model3dGeneration";
+export {
+  HUNYUAN_GENERATION_PROFILE_ID,
+  HUNYUAN_OUTPUT_FORMAT,
+  HUNYUAN_GENERATION_QUALITIES,
+  HUNYUAN_DEFAULT_QUALITY,
+} from "./hunyuanGeneration";
+export type { HunyuanGenerationQuality } from "./hunyuanGeneration";
 export {
   MODEL3D_PROCESSING_PROFILE_ID,
   type Model3dProcessingProfile,
@@ -167,13 +165,6 @@ export type {
   RuntimeKind,
   RuntimeConfig,
   RuntimeState,
-  MaskedOpenRouterConfig,
-  OpenRouterChatChoice,
-  OpenRouterChatMessage,
-  OpenRouterChatRequest,
-  OpenRouterChatResponse,
-  OpenRouterChatUsage,
-  OpenRouterModel,
 } from "./providers";
 
 export interface AppInfo {
@@ -220,3 +211,14 @@ export interface CreateProjectResult {
   project: ProjectInfo;
   recent: RecentProjectInfo[];
 }
+
+// ---- OpenRouter re-exports (AI Design page) — restored after merge ----
+export type {
+  MaskedOpenRouterConfig,
+  OpenRouterChatChoice,
+  OpenRouterChatMessage,
+  OpenRouterChatRequest,
+  OpenRouterChatResponse,
+  OpenRouterChatUsage,
+  OpenRouterModel,
+} from "./providers";

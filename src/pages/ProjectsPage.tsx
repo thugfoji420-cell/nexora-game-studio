@@ -10,6 +10,8 @@ interface ProjectsPageProps {
   onOpen: (root: string, scope?: EngineProjectScope) => Promise<void>;
   onClose: () => Promise<void>;
   onDelete: (root: string) => Promise<void>;
+  /** List-only remove: keeps the folder on disk. */
+  onRemove: (root: string) => Promise<void>;
 }
 
 const ENGINE_OPTIONS: { value: EngineProjectScope; label: string }[] = [
@@ -26,7 +28,7 @@ function engineLabel(scope: EngineProjectScope | null): string {
   return "Unassigned engine";
 }
 
-export function ProjectsPage({ currentProject, recentProjects, onCreate, onOpen, onClose, onDelete }: ProjectsPageProps) {
+export function ProjectsPage({ currentProject, recentProjects, onCreate, onOpen, onClose, onDelete, onRemove }: ProjectsPageProps) {
   const [createRoot, setCreateRoot] = useState("");
   const [name, setName] = useState("");
   const [createScope, setCreateScope] = useState<EngineProjectScope>("3d");
@@ -61,9 +63,29 @@ export function ProjectsPage({ currentProject, recentProjects, onCreate, onOpen,
     void run(() => onOpen(root, openScope === "auto" ? undefined : openScope), "Project opened.");
   };
 
-  const handleDelete = (recent: RecentProjectInfo) => {
-    if (!window.confirm(`Delete "${recent.manifest.name}" and all files in this project folder from your PC? This cannot be undone.`)) return;
-    void run(() => onDelete(recent.root), `Deleted ${recent.manifest.name} from this PC.`);
+  // Removal dialog state — mirrors the Open Project window's flow:
+  // choice first (list-only vs permanent), then a typed confirm for the
+  // destructive path so nothing disappears by accident.
+  const [removeTarget, setRemoveTarget] = useState<RecentProjectInfo | null>(null);
+  const [removeMode, setRemoveMode] = useState<"list" | "permanent">("list");
+  const [removeConfirmText, setRemoveConfirmText] = useState("");
+
+  const askRemove = (recent: RecentProjectInfo) => {
+    setRemoveMode("list");
+    setRemoveConfirmText("");
+    setRemoveTarget(recent);
+  };
+
+  const removeListOnly = async (root: string, name: string) => {
+    setRemoveTarget(null);
+    await run(() => onRemove(root), `Removed ${name} from the Nexora list — folder kept on disk.`);
+  };
+
+  const removePermanently = async (root: string, name: string, confirmText: string) => {
+    // PROTECTIVE: only the exact typed command passes; anything else aborts.
+    if (confirmText !== "delete_every_file") return;
+    setRemoveTarget(null);
+    await run(() => onDelete(root), `Deleted ${name} from this PC.`);
   };
 
   const browseForCreateFolder = async () => {
@@ -182,7 +204,7 @@ export function ProjectsPage({ currentProject, recentProjects, onCreate, onOpen,
                         ))}
                       </>
                     )}
-                    <button className="btn btn--secondary" disabled={busy} onClick={() => handleDelete(recent)} type="button">Delete project</button>
+                    <button className="btn btn--secondary" disabled={busy} onClick={() => askRemove(recent)} type="button">Remove</button>
                   </div>
                 </article>
               );
@@ -190,6 +212,57 @@ export function ProjectsPage({ currentProject, recentProjects, onCreate, onOpen,
           </div>
         )}
       </section>
+
+      {removeTarget && (
+        <div className="modal-overlay" onClick={() => setRemoveTarget(null)}>
+          <div className="modal" style={{ maxWidth: 460 }} onClick={(e) => e.stopPropagation()}>
+            <div className="modal__header">
+              <h2 className="modal__title">Remove &quot;{removeTarget.manifest.name}&quot;?</h2>
+              <button className="modal__close" onClick={() => setRemoveTarget(null)} type="button">✕</button>
+            </div>
+            <div className="modal__body">
+              {removeMode === "list" ? (
+                <>
+                  <p>Is project ko Nexora ki list se hata dein, ya iske saare files PC se permanently delete kar dein?</p>
+                  <p className="muted" style={{ marginTop: 6 }}>Remove from list: folder <code>{removeTarget.root}</code> disk par mehfooz rahega — baad mein dobara Open kar sakte hain.</p>
+                  <div style={{ display: "flex", gap: 10, marginTop: 14, flexWrap: "wrap" }}>
+                    <button className="btn btn--primary" type="button" disabled={busy} onClick={() => void removeListOnly(removeTarget.root, removeTarget.manifest.name)}>
+                      Remove from Nexora only
+                    </button>
+                    <button className="btn btn--danger" type="button" disabled={busy} onClick={() => setRemoveMode("permanent")}>
+                      Delete permanently
+                    </button>
+                    <button className="btn btn--ghost" type="button" onClick={() => setRemoveTarget(null)}>Cancel</button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <p><strong>{removeTarget.manifest.name}</strong> ka poora folder disk se delete ho jayega:</p>
+                  <code style={{ display: "block", margin: "8px 0", fontSize: 12 }}>{removeTarget.root}</code>
+                  <p className="muted">Folder Recycle Bin mein jayega — restore kar sakte hain. Confirm karne ke liye neeche <code>delete_every_file</code> type karein.</p>
+                  <input
+                    value={removeConfirmText}
+                    onChange={(e) => setRemoveConfirmText(e.target.value)}
+                    placeholder="delete_every_file"
+                    style={{ width: "100%", marginTop: 8 }}
+                  />
+                  <div style={{ display: "flex", gap: 10, marginTop: 14, flexWrap: "wrap" }}>
+                    <button
+                      className="btn btn--danger"
+                      type="button"
+                      disabled={busy || removeConfirmText !== "delete_every_file"}
+                      onClick={() => void removePermanently(removeTarget.root, removeTarget.manifest.name, removeConfirmText)}
+                    >
+                      {busy ? "Deleting..." : "Yes, delete every file"}
+                    </button>
+                    <button className="btn btn--ghost" type="button" onClick={() => setRemoveTarget(null)}>Cancel</button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -19,6 +19,40 @@ export const listAssets = (): Promise<AssetInfo[]> =>
 export const searchAssets = (query: string): Promise<AssetInfo[]> =>
   invoke<AssetInfo[]>("search_assets", { query });
 
+export interface DeleteAssetResult {
+  assetId: string;
+  deletedRows: {
+    assets: number;
+    approvals: number;
+    provenance: number;
+    processingJobs: number;
+    unityDeliveries: number;
+  };
+  deletedFiles: string[];
+  skippedFiles: string[];
+}
+
+/** Permanently deletes an asset: DB rows, master file, preview and job
+ *  directories only it used. Rejected for assets already delivered to Unity. */
+export const deleteAsset = (assetId: string): Promise<DeleteAssetResult> =>
+  invoke<DeleteAssetResult>("delete_asset", { assetId });
+
+export interface FailedAssetDelete {
+  assetId: string;
+  error: string;
+}
+
+export interface DeleteAssetsResult {
+  requested: number;
+  deleted: DeleteAssetResult[];
+  failed: FailedAssetDelete[];
+}
+
+/** Bulk delete: each asset is attempted independently; Unity-delivered and
+ *  missing assets come back in `failed` with their reason. */
+export const deleteAssets = (assetIds: string[]): Promise<DeleteAssetsResult> =>
+  invoke<DeleteAssetsResult>("delete_assets", { assetIds });
+
 export const isDuplicateError = (error: unknown): boolean => {
   if (typeof error === "string") {
     return error.includes("duplicate asset detected");

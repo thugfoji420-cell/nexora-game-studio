@@ -199,6 +199,8 @@ export interface HunyuanConfig {
   textureGeneration: boolean;
 }
 
+
+// ---- OpenRouter (AI Design page + openrouter service) — restored after merge ----
 export interface OpenRouterModel {
   id: string;
   name: string;

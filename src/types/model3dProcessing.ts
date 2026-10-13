@@ -93,6 +93,19 @@ export interface Model3dProcessingResult {
   materialStatus: string | null;
   preAnalysisReport: ProcessingReport | null;
   postAnalysisReport: ProcessingReport | null;
+  /** PBR upgrade stats (normal/roughness/AO/metallic clamp counts) from the processor. */
+  pbrStats: {
+    materials_processed?: number;
+    normal_maps_created?: number;
+    roughness_maps_created?: number;
+    ao_baked?: boolean;
+    metallic_clamped?: number;
+    roughness_clamped?: number;
+    segmented?: boolean;
+    segmentation_classes?: string[];
+    quality_score?: number;
+    quality_rating?: string;
+  } | null;
   errorCode: string | null;
   errorMessage: string | null;
 }
