@@ -85,16 +85,21 @@ npm install
 # TypeScript type checking
 npm run typecheck
 
-# Frontend unit tests (66 tests)
+# All tests: vitest (66) then patched Rust suite via the test:rust wrapper
 npm test
 
 # Rust backend checks
-cd src-tauri
-cargo check        # Compile check (warnings expected for unused items)
-cargo test         # 144 backend tests (2 ignored = require live AI runtimes)
+cd src-tauri && cargo check   # warnings expected for unused items
+cd ..
+# IMPORTANT (Windows): never run bare `cargo test` — the test-harness exes
+# crash at load without the embedded SxS manifest (0xc0000139). The npm
+# wrapper compiles, patches every harness exe with mt.exe, then runs cargo
+# test. It is wired into `npm test` and `npm run ci`, so automation never
+# touches bare cargo directly.
+npm run test:rust             # patched `cargo test --lib` (255 unit tests)
+npm run test:rust:all         # patched full `cargo test` (+ integration tests)
 
 # Development server (hot reload)
-cd ..
 npm run tauri dev
 
 # Production build
@@ -106,12 +111,14 @@ npm run tauri build
 | Command | Description |
 |---------|-------------|
 | `npm run typecheck` | Strict TypeScript compilation (no emit) |
-| `npm test` | Vitest unit tests (headless) |
+| `npm test` | Vitest unit tests, then auto-patched Rust suite (`test:rust`) |
+| `npm run test:js` | Vitest only (skip Rust when iterating on the frontend) |
 | `npm run build` | TypeScript + Vite production build |
 | `npm run tauri dev` | Tauri dev mode with Vite HMR |
 | `npm run tauri build` | Full MSI/NSIS installer build |
 | `cargo check` | Rust compile check (fast) |
-| `cargo test` | Rust unit/integration tests |
+| `npm run test:rust` | `fix_test_manifest.py --run -- --lib`: compile + mt.exe patch + `cargo test --lib` |
+| `npm run test:rust:all` | Same wrapper, full `cargo test` (integration included) |
 | `cargo clippy` | Linting (pedantic/nursery) |
 
 ## Architecture Overview
@@ -181,7 +188,8 @@ We welcome contributions! Please read our guidelines:
 2. **Run checks** before PR:
    ```powershell
    npm run typecheck && npm test
-   cd src-tauri && cargo check && cargo test
+   cd src-tauri && cargo check
+   npm run test:rust:all   # bare `cargo test` crashes on Windows without the mt.exe patch
    ```
 3. **Follow conventions**:
    - Rust: `cargo fmt`, `cargo clippy -- -D warnings` (warnings allowed for WIP)
