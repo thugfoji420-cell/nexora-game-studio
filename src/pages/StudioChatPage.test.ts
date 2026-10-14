@@ -9,12 +9,14 @@ import {
   invokeChatGuarded,
   isRestorableModeModel,
   parseModeModels,
+  presentImageJobFailure,
   readModeModels,
   stripFileCitations,
   withModeModel,
   writeModeModel,
 } from "./StudioChatPage";
 import type { ModeModelMap } from "./StudioChatPage";
+import type { JobInfo } from "../types/core";
 
 const reply = (content: string) => ({
   content,
@@ -22,6 +24,56 @@ const reply = (content: string) => ({
   provider: "gemini",
   tokensUsed: 10,
   finishReason: "STOP",
+});
+
+describe("presentImageJobFailure (real backend error in the chat bubble)", () => {
+  const imageJob = (overrides: Partial<JobInfo> = {}): JobInfo => ({
+    jobId: "job-1",
+    jobType: "image.generate",
+    status: "failed",
+    createdAtMs: 1,
+    updatedAtMs: 2,
+    startedAtMs: 1,
+    completedAtMs: 2,
+    progress: 100,
+    attemptCount: 1,
+    maxAttempts: 2,
+    errorCode: "IMAGE_REJECTED",
+    errorMessage: "Gemini image provider rejected the request (403): Quota exceeded for this key.",
+    cancellationRequested: false,
+    payloadVersion: 1,
+    retryable: true,
+    ...overrides,
+  });
+
+  it("surfaces the job's real error code and backend message for failed jobs", () => {
+    expect(presentImageJobFailure("failed", imageJob())).toBe(
+      "IMAGE_REJECTED: Gemini image provider rejected the request (403): Quota exceeded for this key.",
+    );
+    expect(presentImageJobFailure("failed", imageJob({ errorCode: null }))).toBe(
+      "Gemini image provider rejected the request (403): Quota exceeded for this key.",
+    );
+  });
+
+  it("falls back to a no-details line only when the job carries no error", () => {
+    // A job record without details keeps the shared jobs presenter's wording
+    // (same string the Jobs page shows); only a missing record uses the
+    // chat-specific fallback.
+    expect(presentImageJobFailure("failed", imageJob({ errorCode: null, errorMessage: null }))).toBe(
+      "Job failed without error details.",
+    );
+    expect(presentImageJobFailure("failed", null)).toBe("The image job failed without error details.");
+  });
+
+  it("describes cancelled and empty-output results distinctly", () => {
+    expect(presentImageJobFailure("cancelled", imageJob({ status: "cancelled" }))).toBe(
+      "image job cancelled before completion",
+    );
+    expect(presentImageJobFailure("completed", imageJob({ status: "completed" }))).toBe(
+      "image job completed without any output asset",
+    );
+    expect(presentImageJobFailure("queued", imageJob({ status: "queued" }))).toBe("image job queued");
+  });
 });
 
 describe("invokeChatGuarded (empty-content guard)", () => {

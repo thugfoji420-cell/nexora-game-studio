@@ -38,11 +38,13 @@ import {
   updateChatHistory,
   clearChatHistory,
 } from "../services/chatHistory";
+import { getJobDetails, presentJobFailure, retryJob } from "../services/jobs";
 import type { ChatMessage, LlmConfig, LlmProviderConfig, LlmProviderId, ChatResponse } from "../types/llm";
 import {
   HUNYUAN_GENERATION_PROFILE_ID,
   HUNYUAN_OUTPUT_FORMAT,
   type EngineProjectScope,
+  type JobInfo,
   type ProjectInfo,
 } from "../types/core";
 import {
@@ -71,6 +73,16 @@ interface AgentPlan {
   planIsFallback?: boolean;
 }
 
+/** Retry-now context for a failed image job (chat error bubble). */
+interface ImageRetryContext {
+  /** The exact plan the failed job ran with — a retry re-runs it unchanged. */
+  plan: AgentPlan;
+  /** Last failed job id: an eligible job goes through the real `retry_job` re-queue. */
+  jobId?: string;
+  /** Which success continuation to restore once the retry completes. */
+  mode: "agent" | "midjourney";
+}
+
 interface ResultCard {
   kind: "image" | "video" | "model3d" | "code";
   status: "working" | "ready" | "approved" | "deployed" | "error";
@@ -85,6 +97,8 @@ interface ResultCard {
   content?: string;
   error?: string;
   busy?: boolean;
+  /** error cards: re-run the failed image job (Retry now button). */
+  retry?: ImageRetryContext;
 }
 
 type WorkStepStatus = "running" | "done" | "error";
@@ -132,6 +146,26 @@ function formatClock(time: number): string {
   } catch {
     return "";
   }
+}
+
+/**
+ * Real backend error message for a non-successful image job: the job's own
+ * error_code/error_message (e.g. the provider's rejection reason) instead of a
+ * generic "image job failed" line.
+ */
+export function presentImageJobFailure(status: string, job: JobInfo | null): string {
+  if (status === "failed") {
+    return (job ? presentJobFailure(job) : null) ?? "The image job failed without error details.";
+  }
+  if (status === "cancelled") return "image job cancelled before completion";
+  if (status === "completed") return "image job completed without any output asset";
+  return `image job ${status}`;
+}
+
+/** Job id carried by an image-job failure — enables the Retry now button. */
+function imageJobIdOf(error: unknown): string | undefined {
+  const jobId = (error as { jobId?: unknown } | null)?.jobId;
+  return typeof jobId === "string" && jobId ? jobId : undefined;
 }
 
 function MdSpans({ spans }: { spans: MdSpan[] }) {
@@ -857,32 +891,42 @@ export function StudioChatPage({
     }
   };
 
-  const runImage = async (plan: AgentPlan, msgId: string, jobHolder: { jobId?: string }) => {
+  const runImage = async (plan: AgentPlan, msgId: string, jobHolder: { jobId?: string }, retryJobId?: string) => {
     const stepId = addWorkStep(msgId, "run", `Generating image (${QUALITY_LABEL[plan.quality]}, ${plan.count} variant)`, "image job — creating");
     updateMsg(msgId, { text: `Generating image (${QUALITY_LABEL[plan.quality]}, ${plan.count} variant)...` });
-    const created = await createImageGenerationJob({
-      request: {
-        schemaVersion: 1,
-        prompt: plan.subject,
-        negativePrompt: plan.negativePrompt ?? "",
-        width: 768,
-        height: 768,
-        seed: null,
-        steps: plan.quality === "high" ? 34 : plan.quality === "standard" ? 26 : 18,
-        guidance: 7.5,
-        outputCount: plan.count,
-      },
-      providerId: "local.a1111",
-    });
-    jobHolder.jobId = created.job.jobId;
-    setStepCommand(msgId, stepId, `image job ${created.job.jobId.slice(0, 8)}… — running`);
+    // Retry now: an eligible failed job goes through the real backend re-queue
+    // (attempt bookkeeping preserved); anything else starts a fresh job.
+    const requeued = retryJobId ? await retryJob(retryJobId).catch(() => null) : null;
+    const jobId = requeued?.jobId
+      ?? (await createImageGenerationJob({
+        request: {
+          schemaVersion: 1,
+          prompt: plan.subject,
+          negativePrompt: plan.negativePrompt ?? "",
+          width: 768,
+          height: 768,
+          seed: null,
+          steps: plan.quality === "high" ? 34 : plan.quality === "standard" ? 26 : 18,
+          guidance: 7.5,
+          outputCount: plan.count,
+        },
+        providerId: "local.a1111",
+      })).job.jobId;
+    jobHolder.jobId = jobId;
+    setStepCommand(msgId, stepId, `image job ${jobId.slice(0, 8)}… — running`);
     const result = await pollJob(
-      () => getImageGenerationResult(created.job.jobId),
+      () => getImageGenerationResult(jobId),
       (r) => r.status,
       20 * 60 * 1000,
-    );
+    ).catch((err) => {
+      // Carry the job id so the error bubble can offer Retry now.
+      throw Object.assign(err instanceof Error ? err : new Error(String(err)), { jobId });
+    });
     if (result.status !== "completed" || !result.assetIds.length) {
-      throw new Error(`image job ${result.status}`);
+      // Surface the job's real backend error (e.g. the provider's rejection
+      // reason) — the old generic `image job failed` told users nothing.
+      const details = await getJobDetails(jobId).catch(() => null);
+      throw Object.assign(new Error(presentImageJobFailure(result.status, details)), { jobId });
     }
     const assetId = result.assetIds[0];
     const previewUrl = await getAssetPreview(assetId).catch(() => undefined);
@@ -1170,6 +1214,7 @@ export function StudioChatPage({
       });
       return;
     }
+    let executedPlan: AgentPlan | null = null;
     try {
       const mjId = addWorkStep(msgId, "think", "Crafting your Midjourney prompt", "llm_chat_command — prompt engineer");
       updateMsg(msgId, { text: "Crafting your Midjourney prompt..." });
@@ -1208,11 +1253,8 @@ export function StudioChatPage({
         text: `**Midjourney prompt:**\n> ${mjPrompt}\n\nGenerating the image now...`,
       });
 
-      const { assetId, previewUrl } = await runImage(
-        { ...plan, subject: mjPrompt, count: 1 },
-        msgId,
-        {},
-      );
+      executedPlan = { ...plan, subject: mjPrompt, count: 1 };
+      const { assetId, previewUrl } = await runImage(executedPlan, msgId, {});
       updateMsg(msgId, {
         text: `Image ready ✓ from the Midjourney prompt:\n> ${mjPrompt}\n\nApprove it, or turn it into a 3D asset.`,
         card: {
@@ -1225,10 +1267,21 @@ export function StudioChatPage({
         },
       });
     } catch (err) {
-      failRunningSteps(msgId, err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      failRunningSteps(msgId, message);
       updateMsg(msgId, {
-        text: `Midjourney image job failed: ${err instanceof Error ? err.message : String(err)}`,
-        card: undefined,
+        text: `Midjourney image job failed: ${message}`,
+        card: {
+          kind: "image",
+          status: "error",
+          label: executedPlan?.subject || plan.subject || originalPrompt,
+          error: message,
+          retry: {
+            plan: executedPlan ?? { ...plan, subject: plan.subject || originalPrompt, count: 1 },
+            jobId: imageJobIdOf(err),
+            mode: "midjourney",
+          },
+        },
       });
     }
   };
@@ -1459,7 +1512,19 @@ export function StudioChatPage({
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       failRunningSteps(msgId, message);
-      updateMsg(msgId, { text: `Hit a snag: ${message}`, card: small ? undefined : { ...cardBase, status: "error", error: message } });
+      updateMsg(msgId, {
+        text: `Hit a snag: ${message}`,
+        card: small
+          ? undefined
+          : {
+              ...cardBase,
+              status: "error",
+              error: message,
+              ...(plan.intent === "image"
+                ? { retry: { plan, jobId: imageJobIdOf(err), mode: "agent" as const } }
+                : {}),
+            },
+      });
     }
   };
 
@@ -1586,6 +1651,44 @@ export function StudioChatPage({
     const prompt = input.trim();
     if (!prompt || busy) return;
     await runAgent(prompt);
+  };
+
+  /** Retry now in an image error bubble: re-run the failed job's exact plan. */
+  const handleRetryImage = async (msgId: string, card: ResultCard) => {
+    const retry = card.retry;
+    if (!retry || card.busy) return;
+    updateMsg(msgId, {
+      text: "Retrying the image job...",
+      card: { ...card, status: "working", error: undefined, busy: true, previewUrl: undefined },
+    });
+    try {
+      const holder: { jobId?: string } = {};
+      const { assetId, previewUrl } = await runImage(retry.plan, msgId, holder, retry.jobId);
+      if (retry.mode === "midjourney") {
+        updateMsg(msgId, {
+          text: `Image ready ✓ from the Midjourney prompt:\n> ${retry.plan.subject}\n\nApprove it, or turn it into a 3D asset.`,
+          card: { kind: "image", status: "ready", label: retry.plan.subject, assetId, previewUrl },
+        });
+      } else {
+        updateMsg(msgId, {
+          text: "Image ready ✓ — approve it, or turn this concept into a 3D asset.",
+          card: { ...card, status: "ready", assetId, previewUrl, error: undefined, busy: false, retry: undefined },
+        });
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      failRunningSteps(msgId, message);
+      updateMsg(msgId, {
+        text: `Hit a snag: ${message}`,
+        card: {
+          ...card,
+          status: "error",
+          error: message,
+          busy: false,
+          retry: { ...retry, jobId: imageJobIdOf(err) ?? retry.jobId },
+        },
+      });
+    }
   };
 
   const handleApproveImage = async (msgId: string, card: ResultCard) => {
@@ -1771,6 +1874,11 @@ export function StudioChatPage({
                 🎮 Send to Unity
               </button>
             </>
+          )}
+          {card.status === "error" && card.retry && (
+            <button className="btn btn--primary" disabled={card.busy} onClick={() => void handleRetryImage(msg.id, card)}>
+              🔁 Retry now
+            </button>
           )}
         </div>
       </div>
