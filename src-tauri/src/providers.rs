@@ -1017,7 +1017,7 @@ fn resource_rank(class: ResourceClass) -> u8 {
     }
 }
 
-fn unknown_license() -> LicenseMetadata {
+pub(crate) fn unknown_license() -> LicenseMetadata {
     LicenseMetadata {
         status: LicenseStatus::Unknown,
         name: None,

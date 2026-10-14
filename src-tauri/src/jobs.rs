@@ -1283,7 +1283,14 @@ pub fn tick_with_configs(
         let thread_payload = payload.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         thread::spawn(move || {
-            let _ = sender.send(image_generation::execute_http(&thread_payload, &config));
+            // Auto provider fallback: a cloud.gemini 429 (quota) runs the
+            // offline local.a1111 command inside the same attempt instead of
+            // spending it on the cloud quota window. Non-429 errors fall
+            // through unchanged (see FailoverCommandExecutor).
+            let _ = sender.send(
+                image_generation::FailoverCommandExecutor::for_payload(&thread_payload)
+                    .execute(&config),
+            );
         });
         let mut last_heartbeat = Instant::now();
         let response = loop {
@@ -1318,15 +1325,18 @@ pub fn tick_with_configs(
         if !project.execution_enabled() {
             return Ok(true);
         }
-        let result = response.and_then(|bytes| {
-            update_image_progress_for_project(
-                project,
-                &job,
-                owner,
-                60,
-                "provider response received",
-            )
-            .map_err(|error| image_generation::ImageError::Http(error.to_string()))?;
+        let result = response.and_then(|outcome| {
+            let image_generation::FailoverOutcome {
+                payload: ran_with,
+                bytes,
+                failed_over_from,
+            } = outcome;
+            let received = match &failed_over_from {
+                Some(trail) => format!("provider response received — failed over: {trail}"),
+                None => "provider response received".to_string(),
+            };
+            update_image_progress_for_project(project, &job, owner, 60, &received)
+                .map_err(|error| image_generation::ImageError::Http(error.to_string()))?;
             if image_cancelled(project, &job.job_id, owner).unwrap_or(true) {
                 return Err(image_generation::ImageError::Unavailable(
                     "execution session retired".into(),
@@ -1400,10 +1410,10 @@ pub fn tick_with_configs(
                 )
                 .map_err(|error| image_generation::ImageError::Http(error.to_string()))?;
             }
-            Ok(result)
+            Ok((ran_with, result))
         });
         match result {
-            Ok(result) => {
+            Ok((ran_with, result)) => {
                 if !project.execution_enabled() || image_cancelled(project, &job.job_id, owner)? {
                     image_generation::purge_staging(project, &job.job_id);
                     if project.execution_enabled() {
@@ -1422,8 +1432,11 @@ pub fn tick_with_configs(
                     90,
                     "promoting validated output",
                 )?;
+                // Provenance records the provider that actually generated
+                // the output — the offline fallback's payload after a
+                // failover, not the chain's primary.
                 let promotion =
-                    image_generation::promote(project, &job.job_id, owner, &payload, &result);
+                    image_generation::promote(project, &job.job_id, owner, &ran_with, &result);
                 image_generation::purge_staging(project, &job.job_id);
                 if let Err(error) = promotion {
                     finish_image_registration_error(project, &job, &error)?;
@@ -2032,7 +2045,13 @@ fn finish_image_error(
     // instant re-queue just burns attempts back-to-back (observed live:
     // five retries within a second, all 429). Back off before the next
     // try so the quota window gets a chance to reset.
-    if matches!(error, image_generation::ImageError::Server(429)) {
+    // An exhausted failover chain was entered through a 429 as well, so it
+    // needs the same backoff before the next attempt.
+    if matches!(
+        error,
+        image_generation::ImageError::Server(429)
+            | image_generation::ImageError::FailoverExhausted { .. }
+    ) {
         // Sleep outside the DB lock so no other tick sees a stuck mutex.
         thread::sleep(Duration::from_secs(2 * u64::from(job.attempt_count)));
     }
@@ -3791,19 +3810,171 @@ mod tests {
     }
 
     #[test]
+    fn crop_rejection_reseeds_and_escalates_guidance_only_when_needed() {
+        // Regression guard (docs/notes/image-fallback-failure-patterns.md,
+        // pattern 3): a crop rejection must never requeue identical framing —
+        // the seed is baked into the stored payload, so finish_image_error
+        // re-seeds and escalates CFG (+2.5 per retry, capped at 13) only for
+        // needs_reseed() errors. Any other transient error keeps the payload
+        // untouched because the request itself was fine. Unit-level for the
+        // same reason as the 429 backoff test: drive finish_image_error
+        // directly instead of racing the HTTP worker on loopback.
+        let (_dir, project) = project();
+        let job = image_job(&project);
+        let read_payload =
+            |project: &ProjectState, job_id: &str| -> image_generation::ImageJobPayload {
+                let json: String = project
+                    .with_db(|db| {
+                        db.query_row(
+                            "SELECT payload_json FROM jobs WHERE job_id=?1",
+                            [job_id],
+                            |row| row.get(0),
+                        )
+                    })
+                    .unwrap();
+                serde_json::from_str(&json).unwrap()
+            };
+        // Classification contract: crop rejections drive the payload
+        // mutation, and nothing else does.
+        assert!(image_generation::ImageError::CroppedComposition.retryable());
+        assert!(image_generation::ImageError::CroppedComposition.needs_reseed());
+        for error in [
+            image_generation::ImageError::Timeout,
+            image_generation::ImageError::Server(500),
+            image_generation::ImageError::Unavailable("offline".into()),
+        ] {
+            assert!(!error.needs_reseed(), "{} must keep its payload", error);
+        }
+
+        let mut previous_seed = read_payload(&project, &job.job_id).request.seed;
+        assert_eq!(previous_seed, Some(7), "fixture seed");
+        let mut expected_guidance = 7.0_f32;
+        // Three crop rejections: a fresh seed every time and guidance
+        // 7 -> 9.5 -> 12 -> 13 (capped).
+        for round in 1..=3 {
+            project
+                .with_db(|db| {
+                    db.execute(
+                        "UPDATE jobs SET status='running', owner_token='worker', attempt_count=1 WHERE job_id=?1",
+                        [&job.job_id],
+                    )
+                    .map(|_| ())
+                })
+                .unwrap();
+            let payload_json: String = project
+                .with_db(|db| {
+                    db.query_row(
+                        "SELECT payload_json FROM jobs WHERE job_id=?1",
+                        [&job.job_id],
+                        |row| row.get(0),
+                    )
+                })
+                .unwrap();
+            let claimed = ClaimedJob {
+                job_id: job.job_id.clone(),
+                job_type: IMAGE_GENERATION_JOB_TYPE.into(),
+                payload_json,
+                started_at_ms: now_ms(),
+                attempt_count: 1,
+                max_attempts: 5,
+                payload_version: 1,
+            };
+            finish_image_error(
+                &project,
+                &claimed,
+                &image_generation::ImageError::CroppedComposition,
+            )
+            .unwrap();
+            let info = get(&project, &job.job_id).unwrap();
+            assert_eq!(info.status, "queued", "round {round} must auto-retry");
+            assert_eq!(
+                info.error_code.as_deref(),
+                Some("IMAGE_PROVIDER_TRANSIENT"),
+                "round {round} must stay on the transient path"
+            );
+            let payload = read_payload(&project, &job.job_id);
+            assert_ne!(
+                payload.request.seed, previous_seed,
+                "round {round} must not repeat the baked-in seed"
+            );
+            previous_seed = payload.request.seed;
+            expected_guidance = (expected_guidance + 2.5).min(13.0);
+            assert!(
+                (payload.request.guidance - expected_guidance).abs() < 1e-6,
+                "round {round} guidance must escalate to {expected_guidance}, got {}",
+                payload.request.guidance
+            );
+        }
+        assert_eq!(
+            expected_guidance, 13.0,
+            "guidance escalation must cap at 13"
+        );
+
+        // A plain transient error must not touch the payload: the request was
+        // fine and only the provider hiccuped.
+        project
+            .with_db(|db| {
+                db.execute(
+                    "UPDATE jobs SET status='running', owner_token='worker', attempt_count=1 WHERE job_id=?1",
+                    [&job.job_id],
+                )
+                .map(|_| ())
+            })
+            .unwrap();
+        let before: String = project
+            .with_db(|db| {
+                db.query_row(
+                    "SELECT payload_json FROM jobs WHERE job_id=?1",
+                    [&job.job_id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        let claimed = ClaimedJob {
+            job_id: job.job_id.clone(),
+            job_type: IMAGE_GENERATION_JOB_TYPE.into(),
+            payload_json: before.clone(),
+            started_at_ms: now_ms(),
+            attempt_count: 1,
+            max_attempts: 5,
+            payload_version: 1,
+        };
+        finish_image_error(&project, &claimed, &image_generation::ImageError::Timeout).unwrap();
+        let after: String = project
+            .with_db(|db| {
+                db.query_row(
+                    "SELECT payload_json FROM jobs WHERE job_id=?1",
+                    [&job.job_id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "non-reseed errors must keep the stored payload"
+        );
+        assert_eq!(
+            get(&project, &job.job_id).unwrap().status,
+            "queued",
+            "timeout must still auto-retry"
+        );
+    }
+
+    #[test]
     fn worker_stop_detaches_blocked_http_within_poll_interval() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        thread::spawn(move || {
-            let (_stream, _) = listener.accept().unwrap();
+        // Shared mock endpoint (see the test-support crate) that accepts one
+        // request and holds the connection open for 2s before closing it
+        // without a response.
+        let server = test_support::MockHttpServer::serve_with(1, |_, _| {
             thread::sleep(Duration::from_secs(2));
+            Vec::new()
         });
         let (_dir, project) = project();
         let project = Arc::new(project);
         image_job(&project);
         let config = image_generation::ImageProviderConfig {
             enabled: true,
-            base_url: format!("http://{address}"),
+            base_url: server.base_url().to_string(),
             timeout_seconds: 10,
             ..image_generation::ImageProviderConfig::default()
         };
@@ -3824,18 +3995,19 @@ mod tests {
 
     #[test]
     fn cancellation_interrupts_polling_of_stalled_http() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        thread::spawn(move || {
-            let (_stream, _) = listener.accept().unwrap();
+        // Shared mock endpoint (see the test-support crate) that accepts one
+        // request and holds the connection open for 2s before closing it
+        // without a response.
+        let server = test_support::MockHttpServer::serve_with(1, |_, _| {
             thread::sleep(Duration::from_secs(2));
+            Vec::new()
         });
         let (_dir, project) = project();
         let project = Arc::new(project);
         let created = image_job(&project);
         let config = image_generation::ImageProviderConfig {
             enabled: true,
-            base_url: format!("http://{address}"),
+            base_url: server.base_url().to_string(),
             timeout_seconds: 10,
             ..image_generation::ImageProviderConfig::default()
         };

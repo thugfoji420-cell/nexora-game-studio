@@ -12,7 +12,10 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{project::ProjectState, providers::LicenseMetadata};
+use crate::{
+    project::ProjectState,
+    providers::{unknown_license, LicenseMetadata},
+};
 
 pub const PROVIDER_ID: &str = "local.a1111";
 pub const CLOUD_PROVIDER_ID: &str = "cloud.gemini";
@@ -244,6 +247,22 @@ pub struct ImageJobPayload {
     pub gemini_api_key: Option<String>,
 }
 
+impl ImageJobPayload {
+    /// The same request as an offline `local.a1111` command: the failover
+    /// chain runs this when the cloud provider is rate limited. The API key
+    /// never travels to the local provider, and promotion records whichever
+    /// provider actually generated the output.
+    pub fn as_local_fallback(&self) -> ImageJobPayload {
+        ImageJobPayload {
+            provider_id: PROVIDER_ID.into(),
+            provider_version: PROVIDER_VERSION.into(),
+            provider_license: unknown_license(),
+            request: self.request.clone(),
+            gemini_api_key: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct GeneratedOutput {
     pub staging_path: PathBuf,
@@ -273,6 +292,11 @@ pub enum ImageError {
     Timeout,
     #[error("image provider returned retryable status {0}")]
     Server(u16),
+    /// Every command in the failover chain failed. `trail` lists each provider
+    /// with its reason in order, e.g. "cloud.gemini (429 rate limited) →
+    /// local.a1111 (image provider unavailable: ...)".
+    #[error("image provider failover exhausted: {trail}")]
+    FailoverExhausted { trail: String },
     #[error("generated concept was cropped (subject touches the image edge); retrying with a fresh seed")]
     CroppedComposition,
     #[error("generated concept still failed the 3D-safety gate after all retries (subject too large in frame or cropped)")]
@@ -295,7 +319,14 @@ impl ImageError {
     pub fn retryable(&self) -> bool {
         matches!(
             self,
-            Self::Unavailable(_) | Self::Timeout | Self::Server(_) | Self::CroppedComposition
+            Self::Unavailable(_)
+                | Self::Timeout
+                | Self::Server(_)
+                | Self::CroppedComposition
+                // A failover chain is only entered through a transient 429;
+                // a later attempt may find cloud quota restored or the
+                // offline fallback running.
+                | Self::FailoverExhausted { .. }
         )
     }
 
@@ -425,6 +456,116 @@ pub fn execute_http(
         return Err(ImageError::Malformed("response exceeds 40 MiB".into()));
     }
     Ok(bytes)
+}
+
+/// One provider attempt in a failover chain: `label` names the provider in
+/// the failover trail, `payload` is the command the provider executes.
+#[derive(Clone, Debug)]
+pub struct FailoverCommand {
+    pub label: &'static str,
+    pub payload: ImageJobPayload,
+}
+
+/// Success of a failover chain: the raw provider bytes plus the command that
+/// actually produced them — promotion must record THAT provider (provenance),
+/// not the chain's primary.
+#[derive(Clone, Debug)]
+pub struct FailoverOutcome {
+    pub payload: ImageJobPayload,
+    pub bytes: Vec<u8>,
+    /// Abandoned commands with their reasons, in order (None = no failover).
+    pub failed_over_from: Option<String>,
+}
+
+/// Executes image-generation commands in order and fails over to the next
+/// command when the current one is rate limited (HTTP 429). This is the auto
+/// provider fallback: a cloud.gemini quota hit runs the offline local.a1111
+/// command inside the SAME attempt instead of spending the attempt waiting
+/// out the cloud quota window.
+///
+/// Any non-429 error is terminal for the chain — permanent rejections are
+/// request-shaped (they reject on every provider) and other transient errors
+/// belong to the job-level auto-retry loop. When no failover happened the
+/// provider error is returned unchanged, so single-command chains keep their
+/// exact error classification.
+pub struct FailoverCommandExecutor {
+    commands: Vec<FailoverCommand>,
+}
+
+impl FailoverCommandExecutor {
+    pub fn new(command: FailoverCommand) -> Self {
+        Self {
+            commands: vec![command],
+        }
+    }
+
+    pub fn then(mut self, command: FailoverCommand) -> Self {
+        self.commands.push(command);
+        self
+    }
+
+    /// The standard image-job chain: the job's own provider first, with the
+    /// offline local.a1111 provider as rate-limit fallback for cloud jobs.
+    pub fn for_payload(payload: &ImageJobPayload) -> Self {
+        let primary = FailoverCommand {
+            label: if payload.provider_id == CLOUD_PROVIDER_ID {
+                "cloud.gemini"
+            } else {
+                "local.a1111"
+            },
+            payload: payload.clone(),
+        };
+        if payload.provider_id == CLOUD_PROVIDER_ID {
+            Self::new(primary).then(FailoverCommand {
+                label: "local.a1111 (offline fallback)",
+                payload: payload.as_local_fallback(),
+            })
+        } else {
+            Self::new(primary)
+        }
+    }
+
+    pub fn execute(self, config: &ImageProviderConfig) -> Result<FailoverOutcome, ImageError> {
+        self.execute_with(config, execute_http)
+    }
+
+    fn execute_with(
+        self,
+        config: &ImageProviderConfig,
+        run: impl Fn(&ImageJobPayload, &ImageProviderConfig) -> Result<Vec<u8>, ImageError>,
+    ) -> Result<FailoverOutcome, ImageError> {
+        let total = self.commands.len();
+        let mut commands = self.commands.into_iter();
+        let mut current = commands
+            .next()
+            .ok_or_else(|| ImageError::InvalidConfig("failover chain is empty".into()))?;
+        let mut trail: Vec<String> = Vec::new();
+        loop {
+            let last = trail.len() + 1 >= total;
+            match run(&current.payload, config) {
+                Ok(bytes) => {
+                    return Ok(FailoverOutcome {
+                        payload: current.payload,
+                        bytes,
+                        failed_over_from: (!trail.is_empty()).then(|| trail.join(" → ")),
+                    });
+                }
+                Err(error) if !last && matches!(error, ImageError::Server(429)) => {
+                    trail.push(format!("{} (429 rate limited)", current.label));
+                    current = commands.next().expect("chain length pre-checked");
+                }
+                Err(error) => {
+                    if trail.is_empty() {
+                        return Err(error);
+                    }
+                    trail.push(format!("{} ({error})", current.label));
+                    return Err(ImageError::FailoverExhausted {
+                        trail: trail.join(" → "),
+                    });
+                }
+            }
+        }
+    }
 }
 
 /// Cloud Gemini (Nano Banana) text-to-image. Returns raw JSON so the
@@ -976,13 +1117,9 @@ mod tests {
     use super::*;
     use crate::providers::{LicenseStatus, ProviderRegistry};
     use image::{DynamicImage, ImageBuffer, Rgb, Rgba};
-    use std::{
-        io::{Cursor, Read, Write},
-        net::TcpListener,
-        sync::mpsc,
-        thread,
-    };
+    use std::io::Cursor;
     use tempfile::tempdir;
+    use test_support::{ok_response, response, MockHttpServer};
 
     fn project() -> (tempfile::TempDir, ProjectState) {
         let dir = tempdir().unwrap();
@@ -1039,46 +1176,16 @@ mod tests {
         }
     }
 
-    fn http_fixture(response: Vec<u8>) -> (String, mpsc::Receiver<Vec<u8>>) {
-        http_fixture_sequence(vec![response])
+    // Thin adapters over the shared mock endpoint (see the test-support
+    // crate): canned raw responses, captured requests for assertions.
+    fn http_fixture(response: Vec<u8>) -> (String, MockHttpServer) {
+        let server = MockHttpServer::serve(vec![response]);
+        (server.base_url().to_string(), server)
     }
 
-    fn http_fixture_sequence(responses: Vec<Vec<u8>>) -> (String, mpsc::Receiver<Vec<u8>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            for response in responses {
-                let (mut stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                let mut request = Vec::new();
-                let mut buffer = [0_u8; 4096];
-                loop {
-                    let count = stream.read(&mut buffer).unwrap();
-                    request.extend_from_slice(&buffer[..count]);
-                    let header_end = request.windows(4).position(|value| value == b"\r\n\r\n");
-                    if let Some(header_end) = header_end {
-                        let headers = String::from_utf8_lossy(&request[..header_end]);
-                        let content_length = headers
-                            .lines()
-                            .find_map(|line| {
-                                line.to_ascii_lowercase()
-                                    .strip_prefix("content-length: ")
-                                    .and_then(|value| value.parse::<usize>().ok())
-                            })
-                            .unwrap_or(0);
-                        if request.len() >= header_end + 4 + content_length {
-                            break;
-                        }
-                    }
-                }
-                sender.send(request).unwrap();
-                stream.write_all(&response).unwrap();
-            }
-        });
-        (format!("http://{address}"), receiver)
+    fn http_fixture_sequence(responses: Vec<Vec<u8>>) -> (String, MockHttpServer) {
+        let server = MockHttpServer::serve(responses);
+        (server.base_url().to_string(), server)
     }
 
     #[test]
@@ -1243,12 +1350,8 @@ mod tests {
                 {"inlineData": {"mimeType": "image/png", "data": image_data}}
             ]}}]
         })).unwrap();
-        let (base_url, captured) = http_fixture_sequence(vec![
-            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", models.len())
-                .into_bytes().into_iter().chain(models).collect(),
-            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", generated.len())
-                .into_bytes().into_iter().chain(generated).collect(),
-        ]);
+        let (base_url, captured) =
+            http_fixture_sequence(vec![ok_response(&models), ok_response(&generated)]);
         let config = ImageProviderConfig {
             enabled: false,
             gemini_model: Some(CLOUD_DEFAULT_MODEL.into()),
@@ -1262,12 +1365,12 @@ mod tests {
         assert_eq!(wrapper["info"]["model"], "gemini-3.1-flash-image");
         assert_eq!(wrapper["images"].as_array().unwrap().len(), 1);
 
-        let list_request = String::from_utf8(captured.recv().unwrap()).unwrap();
-        assert!(list_request.starts_with("GET /v1/models HTTP/1.1"));
-        assert!(list_request.to_ascii_lowercase().contains("x-goog-api-key: test-api-key"));
-        let generate_request = String::from_utf8(captured.recv().unwrap()).unwrap();
-        assert!(generate_request.starts_with("POST /v1/models/gemini-3.1-flash-image:generateContent HTTP/1.1"));
-        let request_json: serde_json::Value = serde_json::from_str(generate_request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let list_request = captured.next_request();
+        assert!(list_request.head().starts_with("GET /v1/models HTTP/1.1"));
+        assert_eq!(list_request.header("x-goog-api-key"), Some("test-api-key"));
+        let generate_request = captured.next_request();
+        assert!(generate_request.head().starts_with("POST /v1/models/gemini-3.1-flash-image:generateContent HTTP/1.1"));
+        let request_json: serde_json::Value = serde_json::from_slice(generate_request.body()).unwrap();
         assert_eq!(request_json["contents"][0]["parts"][0]["text"], "fixture");
     }
 
@@ -1291,13 +1394,7 @@ mod tests {
         // Content-Length must match the real body size — a lying header would
         // make reqwest short-read and lose the parsed error message.
         let body = b"{\"error\":{\"message\":\"Not found.\"}}".to_vec();
-        let (base_url, _captured) = http_fixture(
-            format!("HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
-                .into_bytes()
-                .into_iter()
-                .chain(body)
-                .collect(),
-        );
+        let (base_url, _captured) = http_fixture(response("HTTP/1.1 404 Not Found", &[], &body));
         let client = Client::builder().no_proxy().build().unwrap();
         let mut response = client.get(format!("{base_url}/missing")).send().unwrap();
         let error = classify_cloud_status(&mut response).unwrap_err();
@@ -1307,21 +1404,185 @@ mod tests {
     }
 
     #[test]
+    fn cloud_model_fallback_skips_candidates_without_generate_content() {
+        // Regression guard (docs/notes/image-fallback-failure-patterns.md,
+        // pattern 1): the fallback walk must skip candidates whose
+        // supportedGenerationMethods lack generateContent and keep
+        // CLOUD_IMAGE_MODEL_FALLBACKS order. Accepting a countTokens-only
+        // model or reordering the list brings back "this Gemini API key has
+        // no supported image-generation model" failures for keys whose
+        // configured model is unavailable.
+        let models: GeminiModelsResponse = serde_json::from_value(serde_json::json!({
+            "models": [
+                {"name": "models/gemini-nano-banana-2.1", "supportedGenerationMethods": ["countTokens"]},
+                {"name": "models/gemini-3.1-flash-image", "supportedGenerationMethods": ["countTokens"]},
+                {"name": "models/gemini-3-pro-image", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-2.5-flash-image", "supportedGenerationMethods": ["generateContent"]}
+            ]
+        }))
+        .unwrap();
+        // Preferred and the first fallback are countTokens-only: the walk must
+        // skip both, then keep list order (3-pro before 2.5-flash).
+        assert_eq!(
+            resolve_cloud_image_model(&models, CLOUD_DEFAULT_MODEL).unwrap(),
+            "gemini-3-pro-image"
+        );
+    }
+
+    #[test]
+    fn cloud_client_errors_are_permanent_but_transient_statuses_stay_retryable() {
+        // Regression guard (docs/notes/image-fallback-failure-patterns.md,
+        // pattern 2): the cloud status split must stay exact — 5xx/408/429
+        // remain transient auto-retry material while every other rejection is
+        // permanent and keeps Google's reason so the user can act on it. A
+        // blanket "cloud errors are permanent" fix strands recoverable jobs;
+        // a blanket retryable fix burns attempts on permanent 403/404s.
+        let client = Client::builder().no_proxy().build().unwrap();
+        for status_line in [
+            "HTTP/1.1 500 Internal Server Error",
+            "HTTP/1.1 503 Service Unavailable",
+            "HTTP/1.1 408 Request Timeout",
+            "HTTP/1.1 429 Too Many Requests",
+        ] {
+            let (base_url, _captured) = http_fixture(response(status_line, &[], &[]));
+            let mut response = client.get(format!("{base_url}/models")).send().unwrap();
+            let error = classify_cloud_status(&mut response).unwrap_err();
+            assert!(
+                error.retryable(),
+                "{status_line} must stay retryable, got: {}",
+                error
+            );
+        }
+        // Client errors are permanent but must keep Google's reason verbatim.
+        let body = b"{\"error\":{\"message\":\"Quota exceeded for this key.\"}}".to_vec();
+        let (base_url, _captured) = http_fixture(response("HTTP/1.1 403 Forbidden", &[], &body));
+        let mut response = client.get(format!("{base_url}/models")).send().unwrap();
+        let error = classify_cloud_status(&mut response).unwrap_err();
+        assert!(matches!(
+            &error,
+            ImageError::CloudRejected { status: 403, message } if message.contains("Quota exceeded")
+        ));
+        assert!(!error.retryable(), "403 must be permanent, got: {}", error);
+    }
+
+    // ---- auto provider fallback (failover command executor) ----------------
+    // Contract: a 429 (rate limit) on the primary command runs the offline
+    // fallback command in the SAME attempt and returns ITS payload so
+    // promotion records the provider that actually generated the output;
+    // any other error stops the chain with the provider error unchanged.
+
+    fn cloud_payload() -> ImageJobPayload {
+        let mut payload = payload();
+        payload.provider_id = CLOUD_PROVIDER_ID.into();
+        payload.gemini_api_key = Some("test-api-key".into());
+        payload
+    }
+
+    #[test]
+    fn failover_chain_puts_offline_local_after_cloud_and_never_leaks_the_key() {
+        let chain = FailoverCommandExecutor::for_payload(&cloud_payload());
+        assert_eq!(chain.commands.len(), 2);
+        assert_eq!(chain.commands[0].label, "cloud.gemini");
+        assert_eq!(chain.commands[0].payload.provider_id, CLOUD_PROVIDER_ID);
+        let fallback = &chain.commands[1].payload;
+        assert_eq!(fallback.provider_id, PROVIDER_ID);
+        assert_eq!(fallback.provider_version, PROVIDER_VERSION);
+        assert!(fallback.gemini_api_key.is_none());
+        assert_eq!(fallback.request.seed, chain.commands[0].payload.request.seed);
+        // A local job is its own single command — no phantom fallback leg.
+        let local = FailoverCommandExecutor::for_payload(&payload());
+        assert_eq!(local.commands.len(), 1);
+        assert_eq!(local.commands[0].payload.provider_id, PROVIDER_ID);
+    }
+
+    #[test]
+    fn failover_executor_runs_offline_fallback_on_429_and_returns_its_payload() {
+        // Regression guard: the cloud 429 case must not burn the attempt on
+        // the quota window — the offline command runs immediately and its
+        // payload (not the cloud one) is what promotion records.
+        let bytes = b"generated".to_vec();
+        let calls = std::cell::RefCell::new(Vec::new());
+        let outcomes = std::cell::RefCell::new(vec![Err(ImageError::Server(429)), Ok(bytes.clone())]);
+        let executor = FailoverCommandExecutor::for_payload(&cloud_payload());
+        let outcome = executor
+            .execute_with(&ImageProviderConfig::default(), |command, _config| {
+                calls.borrow_mut().push(command.provider_id.clone());
+                outcomes.borrow_mut().remove(0)
+            })
+            .unwrap();
+        assert_eq!(
+            calls.into_inner(),
+            vec![CLOUD_PROVIDER_ID.to_string(), PROVIDER_ID.to_string()]
+        );
+        assert_eq!(outcome.payload.provider_id, PROVIDER_ID);
+        assert_eq!(outcome.bytes, bytes);
+        assert_eq!(
+            outcome.failed_over_from.as_deref(),
+            Some("cloud.gemini (429 rate limited)")
+        );
+    }
+
+    #[test]
+    fn failover_executor_stops_on_non_429_errors_without_running_the_fallback() {
+        // A permanent rejection is request-shaped — running it on the offline
+        // provider would only duplicate the failure and muddy the error.
+        let calls = std::cell::RefCell::new(Vec::new());
+        let executor = FailoverCommandExecutor::for_payload(&cloud_payload());
+        let error = executor
+            .execute_with(&ImageProviderConfig::default(), |command, _config| {
+                calls.borrow_mut().push(command.provider_id.clone());
+                Err(ImageError::Rejected(403))
+            })
+            .unwrap_err();
+        assert!(matches!(error, ImageError::Rejected(403)));
+        assert_eq!(calls.into_inner(), vec![CLOUD_PROVIDER_ID.to_string()]);
+    }
+
+    #[test]
+    fn failover_executor_reports_the_full_trail_and_stays_retryable() {
+        let executor = FailoverCommandExecutor::for_payload(&cloud_payload());
+        let outcomes = std::cell::RefCell::new(vec![
+            Err(ImageError::Server(429)),
+            Err(ImageError::Unavailable("provider is disabled".into())),
+        ]);
+        let error = executor
+            .execute_with(&ImageProviderConfig::default(), |_command, _config| {
+                outcomes.borrow_mut().remove(0)
+            })
+            .unwrap_err();
+        let ImageError::FailoverExhausted { trail } = &error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert!(trail.contains("cloud.gemini (429 rate limited)"), "{trail}");
+        assert!(trail.contains("local.a1111 (offline fallback)"), "{trail}");
+        assert!(trail.contains("provider is disabled"), "{trail}");
+        // The chain was entered through a transient 429 — retrying can find
+        // cloud quota restored or the offline provider running.
+        assert!(error.retryable(), "{error}");
+    }
+
+    #[test]
+    fn failover_executor_keeps_single_command_errors_verbatim() {
+        // A local-only job must keep its exact error classification: the
+        // finish path decides permanent vs transient from the variant.
+        let outcomes =
+            std::cell::RefCell::new(vec![Err(ImageError::Malformed("bad image".into()))]);
+        let error = FailoverCommandExecutor::for_payload(&payload())
+            .execute_with(&ImageProviderConfig::default(), |_command, _config| {
+                outcomes.borrow_mut().remove(0)
+            })
+            .unwrap_err();
+        assert!(matches!(error, ImageError::Malformed(_)), "{error:?}");
+    }
+
+    #[test]
     fn real_adapter_maps_request_and_refuses_redirects() {
         let body = serde_json::to_vec(&serde_json::json!({
             "images": [encoded(ImageFormat::Png)],
             "info": {"all_seeds": [7]}
         }))
         .unwrap();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .into_bytes()
-        .into_iter()
-        .chain(body)
-        .collect();
-        let (base_url, captured) = http_fixture(response);
+        let (base_url, captured) = http_fixture(ok_response(&body));
         let config = ImageProviderConfig {
             enabled: true,
             base_url,
@@ -1329,17 +1590,18 @@ mod tests {
         };
         let bytes = execute_http(&payload(), &config).unwrap();
         assert!(!bytes.is_empty());
-        let request = String::from_utf8(captured.recv().unwrap()).unwrap();
-        assert!(request.starts_with("POST /sdapi/v1/txt2img HTTP/1.1"));
-        let json: serde_json::Value =
-            serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let request = captured.next_request();
+        assert!(request.head().starts_with("POST /sdapi/v1/txt2img HTTP/1.1"));
+        let json: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
         assert_eq!(json["batch_size"], 1);
         assert_eq!(json["seed"], 7);
         assert_eq!(json["save_images"], false);
 
-        let (base_url, _captured) = http_fixture(
-            b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/elsewhere\r\nContent-Length: 0\r\n\r\n".to_vec(),
-        );
+        let (base_url, _captured) = http_fixture(response(
+            "HTTP/1.1 302 Found",
+            &[("Location", "http://127.0.0.1:1/elsewhere")],
+            &[],
+        ));
         let config = ImageProviderConfig {
             enabled: true,
             base_url,
