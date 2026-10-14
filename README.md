@@ -28,8 +28,8 @@ Prompt → Image Generation (A1111/ComfyUI) → Hunyuan3D (local) → Blender Cl
 | Area | Status | Details |
 |------|--------|---------|
 | **Tauri 2 + Rust Backend** | ✅ Complete | Native desktop shell, secure IPC, system dialogs |
-| **React 19 + TypeScript Frontend** | ✅ Complete | Vite, Three.js viewer, Vitest test suite (66 tests) |
-| **SQLite Project Architecture** | ✅ Complete | 10 migrations, WAL mode, project-scoped databases |
+| **React 19 + TypeScript Frontend** | ✅ Complete | Vite, Three.js viewer, Vitest test suite (117 tests) |
+| **SQLite Project Architecture** | ✅ Complete | 13 migrations, WAL mode, project-scoped databases |
 | **Automatic1111 Integration** | ✅ Complete | txt2img/img2img, loopback-only enforcement, strict validation |
 | **ComfyUI Integration** | ✅ Complete | Wan 2.1 video generation, history polling, managed asset promotion |
 | **Hunyuan3D Integration** | ✅ Complete | Local model execution via CLI, capability-based provider registry |
@@ -85,7 +85,7 @@ npm install
 # TypeScript type checking
 npm run typecheck
 
-# All tests: vitest (66) then patched Rust suite via the test:rust wrapper
+# All tests: vitest (117) then patched Rust suite via the test:rust wrapper
 npm test
 
 # Rust backend checks
@@ -96,7 +96,7 @@ cd ..
 # wrapper compiles, patches every harness exe with mt.exe, then runs cargo
 # test. It is wired into `npm test` and `npm run ci`, so automation never
 # touches bare cargo directly.
-npm run test:rust             # patched `cargo test --lib` (255 unit tests)
+npm run test:rust             # patched `cargo test --lib` (264 unit tests)
 npm run test:rust:all         # patched full `cargo test` (+ integration tests)
 
 # Development server (hot reload)
@@ -172,13 +172,15 @@ npm run tauri build
 | Tauri Shell | 2.8.x | Stable |
 | Frontend | React 19, Vite 7 | Stable |
 | Backend | Rust 2024, Tauri 2 | Stable |
-| Database Schema | 10 migrations | Stable |
-| Test Coverage | 66 FE + 144 BE tests | Comprehensive |
-| AI Provider Adapters | A1111, ComfyUI, Hunyuan3D | Functional |
+| Database Schema | 13 migrations | Stable |
+| Test Coverage | 117 FE + 264 BE tests | Comprehensive |
+| AI Provider Adapters | A1111, ComfyUI, Hunyuan3D, Gemini (cloud) | Functional |
+| Image Failover & Rate-Limit Backoff | `cloud.gemini` → `local.a1111`, `2s × attempt` backoff | Stable |
+| Studio Chat & Local Code Agent | LLM settings, Studio chat, llama.cpp code agent | Beta |
 | Blender Processor | Python 3.10+ | Functional |
 | Unity Delivery | File-system + manifest | Functional |
 
-**Version**: 0.1.0 (pre-1.0, active development)
+**Version**: 0.2.10 (pre-1.0, active development)
 
 ## Changelog
 
