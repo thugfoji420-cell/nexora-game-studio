@@ -1,0 +1,24 @@
+# Line endings: the repository stores LF and every checkout is LF, on every
+# platform, regardless of local core.autocrlf. Without this pin, machines
+# with autocrlf=true record CRLF stat sizes against LF files and git status
+# reports permanent phantom "modified" entries with zero content diff.
+* text=auto eol=lf
+
+# Binary files must never be line-ending converted.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.icns binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.wasm binary
+*.exe binary
+*.dll binary
