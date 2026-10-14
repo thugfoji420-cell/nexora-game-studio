@@ -180,6 +180,10 @@ npm run tauri build
 
 **Version**: 0.1.0 (pre-1.0, active development)
 
+## Changelog
+
+- **2026-10-14 — Rate-limit backoff fix (image jobs):** a provider 429 no longer burns retries back-to-back — attempts back off (`2s × attempt`) before re-queueing, and a `cloud.gemini` 429 now fails over to the offline `local.a1111` provider in the same attempt.
+
 ## Contributing
 
 We welcome contributions! Please read our guidelines:

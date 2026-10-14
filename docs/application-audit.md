@@ -134,3 +134,7 @@ Initial JS is approximately 68% smaller (64% smaller compressed). This is a bund
 - https://github.com/vitest-dev/vitest/releases/tag/v4.1.11
 - https://github.com/advisories/GHSA-85c8-ppgw-ccpr
 - https://github.com/advisories/GHSA-68fv-2mgg-jv7q
+
+## Changelog
+
+- **2026-10-14 — Rate-limit backoff fix (image jobs).** A provider 429 no longer burns retries back-to-back: failed attempts back off (`2s × attempt`) before re-queueing, and an exhausted failover chain backs off the same way ([jobs.rs](../src-tauri/src/jobs.rs) `finish_image_error`). As part of the same rate-limit handling, a `cloud.gemini` 429 now fails over to the offline `local.a1111` provider within the same attempt, with promotion recording the provider that actually generated the output ([image_generation.rs](../src-tauri/src/image_generation.rs) `FailoverCommandExecutor`).
