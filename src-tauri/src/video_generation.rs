@@ -1267,36 +1267,19 @@ mod tests {
 
     #[test]
     fn reachable_comfyui_without_owned_nodes_is_incompatible() {
-        use std::{
-            io::{Read, Write},
-            net::TcpListener,
-            thread,
-        };
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        thread::spawn(move || {
-            for _ in 0..3 {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0u8; 2048];
-                let count = stream.read(&mut request).unwrap();
-                let text = String::from_utf8_lossy(&request[..count]);
-                let body = if text.starts_with("GET /system_stats ") {
-                    r#"{"system":{},"devices":[]}"#
-                } else {
-                    "{}"
-                };
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                )
-                .unwrap();
-            }
+        // Shared mock endpoint (see the test-support crate), routed by
+        // request line exactly like the old inline stub.
+        let server = test_support::MockHttpServer::serve_with(3, |_index, request| {
+            let body = if request.request_line().starts_with("GET /system_stats ") {
+                r#"{"system":{},"devices":[]}"#
+            } else {
+                "{}"
+            };
+            test_support::ok_response(body.as_bytes())
         });
         let config = VideoProviderConfig {
             enabled: true,
-            base_url: format!("http://{address}"),
+            base_url: server.base_url().to_string(),
             ..VideoProviderConfig::default()
         };
         let state = provider_state(&config);
@@ -1372,94 +1355,55 @@ mod tests {
 
     #[test]
     fn comfyui_absent_history_submits_polls_and_downloads() {
-        use std::{
-            io::{Read, Write},
-            net::TcpListener,
-            thread,
-        };
         const PROMPT_ID: &str = "018f47d2-9b8c-7a11-8000-123456789abc";
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
         let video = crate::video_validation::structural_fixture();
         let expected_video = video.clone();
         let job_id = Uuid::now_v7().to_string();
         let expected_job_id = job_id.clone();
-        let server = thread::spawn(move || {
-            for request_number in 0..6 {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut request = Vec::new();
-                let mut buffer = [0u8; 4096];
-                loop {
-                    let count = stream.read(&mut buffer).unwrap();
-                    request.extend_from_slice(&buffer[..count]);
-                    if let Some(header_end) =
-                        request.windows(4).position(|value| value == b"\r\n\r\n")
-                    {
-                        let headers = String::from_utf8_lossy(&request[..header_end + 4]);
-                        let length = headers
-                            .lines()
-                            .find_map(|line| {
-                                line.to_ascii_lowercase()
-                                    .strip_prefix("content-length:")
-                                    .and_then(|value| value.trim().parse::<usize>().ok())
-                            })
-                            .unwrap_or(0);
-                        if request.len() >= header_end + 4 + length {
-                            break;
-                        }
-                    }
+        // Shared mock endpoint (see the test-support crate): one canned
+        // response per scripted ComfyUI call, with the same per-request
+        // assertions the old inline stub made.
+        let server = test_support::MockHttpServer::serve_with(6, move |request_number, request| {
+            let response = match request_number {
+                0 => {
+                    assert_eq!(request.request_line(), "GET /system_stats HTTP/1.1");
+                    br#"{"system":{},"devices":[]}"#.to_vec()
                 }
-                let header_end = request
-                    .windows(4)
-                    .position(|value| value == b"\r\n\r\n")
-                    .unwrap();
-                let head = String::from_utf8_lossy(&request[..header_end]);
-                let first = head.lines().next().unwrap();
-                let body = &request[header_end + 4..];
-                let response = match request_number {
-                    0 => {
-                        assert_eq!(first, "GET /system_stats HTTP/1.1");
-                        br#"{"system":{},"devices":[]}"#.to_vec()
-                    }
-                    1 => {
-                        assert_eq!(first, "GET /object_info HTTP/1.1");
-                        serde_json::to_vec(&object_info_fixture()).unwrap()
-                    }
-                    2 => {
-                        assert_eq!(first, "GET /history HTTP/1.1");
-                        b"{}".to_vec()
-                    }
-                    3 => {
-                        assert_eq!(first, "POST /prompt HTTP/1.1");
-                        let value: serde_json::Value = serde_json::from_slice(body).unwrap();
-                        assert_eq!(value["client_id"], expected_job_id);
-                        assert_eq!(value["prompt"], expected_graph(&expected_job_id));
-                        format!(r#"{{"prompt_id":"{PROMPT_ID}"}}"#).into_bytes()
-                    }
-                    4 => {
-                        assert_eq!(first, format!("GET /history/{PROMPT_ID} HTTP/1.1"));
-                        format!(r#"{{"{PROMPT_ID}":{{"status":{{"completed":true,"status_str":"success"}},"outputs":{{"11":{{"images":[{{"filename":"clip.mp4","subfolder":"nexora/jobs","type":"output"}}]}}}}}}}}"#).into_bytes()
-                    }
-                    _ => {
-                        assert_eq!(
-                            first,
-                            "GET /view?filename=clip.mp4&subfolder=nexora%2Fjobs&type=output HTTP/1.1"
-                        );
-                        expected_video.clone()
-                    }
-                };
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    response.len()
-                )
-                .unwrap();
-                stream.write_all(&response).unwrap();
-            }
+                1 => {
+                    assert_eq!(request.request_line(), "GET /object_info HTTP/1.1");
+                    serde_json::to_vec(&object_info_fixture()).unwrap()
+                }
+                2 => {
+                    assert_eq!(request.request_line(), "GET /history HTTP/1.1");
+                    b"{}".to_vec()
+                }
+                3 => {
+                    assert_eq!(request.request_line(), "POST /prompt HTTP/1.1");
+                    let value: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+                    assert_eq!(value["client_id"], expected_job_id);
+                    assert_eq!(value["prompt"], expected_graph(&expected_job_id));
+                    format!(r#"{{"prompt_id":"{PROMPT_ID}"}}"#).into_bytes()
+                }
+                4 => {
+                    assert_eq!(
+                        request.request_line(),
+                        format!("GET /history/{PROMPT_ID} HTTP/1.1")
+                    );
+                    format!(r#"{{"{PROMPT_ID}":{{"status":{{"completed":true,"status_str":"success"}},"outputs":{{"11":{{"images":[{{"filename":"clip.mp4","subfolder":"nexora/jobs","type":"output"}}]}}}}}}}}"#).into_bytes()
+                }
+                _ => {
+                    assert_eq!(
+                        request.request_line(),
+                        "GET /view?filename=clip.mp4&subfolder=nexora%2Fjobs&type=output HTTP/1.1"
+                    );
+                    expected_video.clone()
+                }
+            };
+            test_support::ok_response(&response)
         });
         let config = VideoProviderConfig {
             enabled: true,
-            base_url: format!("http://{address}"),
+            base_url: server.base_url().to_string(),
             timeout_seconds: 5,
             ..VideoProviderConfig::default()
         };
@@ -1471,81 +1415,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, video);
-        server.join().unwrap();
+        server.join();
     }
 
     #[test]
     fn comfyui_completed_matching_history_skips_submit_and_downloads() {
-        use std::{
-            io::{Read, Write},
-            net::TcpListener,
-            thread,
-        };
         const PROMPT_ID: &str = "6c6f528f-da84-4a47-a7d3-5c575b9dbc0a";
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
         let video = crate::video_validation::structural_fixture();
         let expected_video = video.clone();
         let job_id = "01a00019-98e0-7a40-be92-d64cc2f752f4".to_owned();
         let expected_job_id = job_id.clone();
-        let server = thread::spawn(move || {
-            for request_number in 0..4 {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut request = Vec::new();
-                let mut buffer = [0u8; 4096];
-                loop {
-                    let count = stream.read(&mut buffer).unwrap();
-                    request.extend_from_slice(&buffer[..count]);
-                    if request.windows(4).any(|value| value == b"\r\n\r\n") {
-                        break;
-                    }
+        // Shared mock endpoint (see the test-support crate): one canned
+        // response per scripted ComfyUI call, with the same per-request
+        // assertions the old inline stub made.
+        let server = test_support::MockHttpServer::serve_with(4, move |request_number, request| {
+            let response = match request_number {
+                0 => {
+                    assert_eq!(request.request_line(), "GET /system_stats HTTP/1.1");
+                    br#"{"system":{},"devices":[]}"#.to_vec()
                 }
-                let header_end = request
-                    .windows(4)
-                    .position(|value| value == b"\r\n\r\n")
-                    .unwrap();
-                let head = String::from_utf8_lossy(&request[..header_end]);
-                let first = head.lines().next().unwrap();
-                let response = match request_number {
-                    0 => {
-                        assert_eq!(first, "GET /system_stats HTTP/1.1");
-                        br#"{"system":{},"devices":[]}"#.to_vec()
-                    }
-                    1 => {
-                        assert_eq!(first, "GET /object_info HTTP/1.1");
-                        serde_json::to_vec(&object_info_fixture()).unwrap()
-                    }
-                    2 => {
-                        assert_eq!(first, "GET /history HTTP/1.1");
-                        serde_json::to_vec(&serde_json::json!({
-                            (PROMPT_ID): {
-                                "prompt": [17, PROMPT_ID, {}, {"client_id":expected_job_id}, [OUTPUT_NODE_ID]],
-                                "status":{"completed":true,"status_str":"success"},
-                                "outputs":{"11":{"images":[{"filename":"clip.mp4","subfolder":"","type":"output"}]}}
-                            }
-                        }))
-                        .unwrap()
-                    }
-                    _ => {
-                        assert_eq!(
-                            first,
-                            "GET /view?filename=clip.mp4&subfolder=&type=output HTTP/1.1"
-                        );
-                        expected_video.clone()
-                    }
-                };
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    response.len()
-                )
-                .unwrap();
-                stream.write_all(&response).unwrap();
-            }
+                1 => {
+                    assert_eq!(request.request_line(), "GET /object_info HTTP/1.1");
+                    serde_json::to_vec(&object_info_fixture()).unwrap()
+                }
+                2 => {
+                    assert_eq!(request.request_line(), "GET /history HTTP/1.1");
+                    serde_json::to_vec(&serde_json::json!({
+                        (PROMPT_ID): {
+                            "prompt": [17, PROMPT_ID, {}, {"client_id":expected_job_id}, [OUTPUT_NODE_ID]],
+                            "status":{"completed":true,"status_str":"success"},
+                            "outputs":{"11":{"images":[{"filename":"clip.mp4","subfolder":"","type":"output"}]}}
+                        }
+                    }))
+                    .unwrap()
+                }
+                _ => {
+                    assert_eq!(
+                        request.request_line(),
+                        "GET /view?filename=clip.mp4&subfolder=&type=output HTTP/1.1"
+                    );
+                    expected_video.clone()
+                }
+            };
+            test_support::ok_response(&response)
         });
         let config = VideoProviderConfig {
             enabled: true,
-            base_url: format!("http://{address}"),
+            base_url: server.base_url().to_string(),
             timeout_seconds: 5,
             ..VideoProviderConfig::default()
         };
@@ -1557,7 +1473,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, video);
-        server.join().unwrap();
+        server.join();
     }
 
     fn object_info_fixture() -> serde_json::Value {

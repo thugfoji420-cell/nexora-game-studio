@@ -1,0 +1,11 @@
+# Shared test helpers (mock loopback HTTP servers) for the test suites.
+# Wired in as a dev-dependency of nexora-game-studio, so it is compiled only
+# for tests and never linked into the shipped application binary.
+[package]
+name = "test-support"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"

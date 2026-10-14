@@ -1320,75 +1320,15 @@ mod tests {
         max_steps: u32,
         statuses: &[u16],
     ) -> (CodeAgentResult, tempfile::TempDir, Vec<String>) {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let url = format!("http://{}/v1", listener.local_addr().unwrap());
-        let outputs: Vec<(String, u16)> = outputs
+        // One canned JSON response per scripted output, in order, served by
+        // the shared mock endpoint (see the test-support crate): bounded
+        // accepts plus an accept deadline, so a run that never reaches the
+        // endpoint fails instead of hanging.
+        let responses: Vec<Vec<u8>> = outputs
             .iter()
             .enumerate()
-            .map(|(i, s)| {
-                (
-                    s.to_string(),
-                    statuses.get(i).copied().unwrap_or(200),
-                )
-            })
-            .collect();
-        let server = std::thread::spawn(move || {
-            let mut inputs = vec![];
-            for (output, status) in outputs {
-                let deadline = Instant::now() + Duration::from_secs(15);
-                let mut stream = loop {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            break stream;
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            assert!(
-                                Instant::now() < deadline,
-                                "agent never reached mock endpoint"
-                            );
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(e) => panic!("{e}"),
-                    }
-                };
-                // Non-blocking listeners hand the mode down to accepted
-                // sockets, so restore blocking reads before parsing the
-                // request (otherwise the first read returns WouldBlock).
-                stream
-                    .set_nonblocking(false)
-                    .unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut bytes = vec![];
-                let header_end = loop {
-                    let mut buf = [0; 4096];
-                    let n = stream.read(&mut buf).unwrap();
-                    assert!(n > 0);
-                    bytes.extend_from_slice(&buf[..n]);
-                    if let Some(i) = bytes.windows(4).position(|s| s == b"\r\n\r\n") {
-                        break i + 4;
-                    }
-                };
-                let headers = String::from_utf8_lossy(&bytes[..header_end]);
-                let len: usize = headers
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse().unwrap())
-                    })
-                    .unwrap();
-                while bytes.len() < header_end + len {
-                    let mut buf = [0; 4096];
-                    let n = stream.read(&mut buf).unwrap();
-                    assert!(n > 0);
-                    bytes.extend_from_slice(&buf[..n]);
-                }
-                inputs
-                    .push(String::from_utf8(bytes[header_end..header_end + len].to_vec()).unwrap());
+            .map(|(i, output)| {
+                let status = statuses.get(i).copied().unwrap_or(200);
                 let (body, reason) = if status == 200 {
                     (
                         serde_json::json!({"model":"mock-coder", "choices":[{"message":{"role":"assistant","content":output}, "finish_reason":"stop"}]}).to_string(),
@@ -1396,19 +1336,21 @@ mod tests {
                     )
                 } else if status == 429 {
                     (
-                        "{\"error\":{\"message\":\"rate limited by upstream\"}}".to_string(),
+                        serde_json::json!({"error":{"message":"rate limited by upstream"}})
+                            .to_string(),
                         "Too Many Requests",
                     )
                 } else {
                     (
-                        "{\"error\":{\"message\":\"upstream error\"}}".to_string(),
+                        serde_json::json!({"error":{"message":"upstream error"}}).to_string(),
                         "Error",
                     )
                 };
-                write!(stream, "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", status, reason, body.len(), body).unwrap();
-            }
-            inputs
-        });
+                test_support::json_response(status, reason, &body)
+            })
+            .collect();
+        let server = test_support::MockHttpServer::serve(responses);
+        let url = format!("{}/v1", server.base_url());
         let root = tempfile::tempdir().unwrap();
         let project =
             crate::project::ProjectState::create(&root.path().join("Project"), "Audit test")
@@ -1436,7 +1378,11 @@ mod tests {
             &mut receiver,
         ))
         .unwrap();
-        let inputs = server.join().unwrap();
+        let inputs = server
+            .requests()
+            .into_iter()
+            .map(|request| request.body_string())
+            .collect();
         drop(project);
         (result, root, inputs)
     }
